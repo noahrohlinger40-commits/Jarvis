@@ -75,6 +75,11 @@ internal sealed class RealtimeTranscriptionVoiceRuntime : IVoiceRuntime
     public static bool TryCreate(JarvisOptions options, out IVoiceRuntime? runtime, out string status)
     {
         runtime = null;
+        if (options.LocalAiOnly)
+        {
+            status = "Local-only AI mode uses local HTTP transcription or Windows speech; realtime cloud transcription is blocked.";
+            return false;
+        }
 
         if (string.IsNullOrWhiteSpace(options.SpeechRecognitionModel))
         {

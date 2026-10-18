@@ -673,9 +673,9 @@ public sealed partial class DesktopAutomationService
         return flattened.Length <= maxLength ? flattened : flattened[..maxLength] + "...";
     }
 
-    private string GetClipboardHistoryPath() => Path.Combine(_workspaceRoot, "data", "automation", "clipboard-history.json");
+    private string GetClipboardHistoryPath() => JarvisDataPaths.Resolve("data/automation/clipboard-history.json");
 
-    private string GetNotificationHistoryPath() => Path.Combine(_workspaceRoot, "data", "automation", "notifications.json");
+    private string GetNotificationHistoryPath() => JarvisDataPaths.Resolve("data/automation/notifications.json");
 }
 
 internal sealed record ClipboardHistoryRecord(

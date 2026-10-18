@@ -549,7 +549,7 @@ internal sealed partial class StructuredAssistantPlanner
         var toolText = string.Join(
             Environment.NewLine,
             toolResults.Select(result =>
-                $"- {result.ApiName}({result.Input}): purpose={result.Purpose}; expectedEvidence={result.ExpectedEvidence}; success={!result.IsError}; verificationStatus={result.VerificationStatus}; verificationSummary={result.VerificationSummary}; verification={result.Verification}; summary={result.Summary}; output={TrimForFeed(result.Output)}"));
+                $"- {result.ApiName}({result.Input}): purpose={result.Purpose}; expectedEvidence={result.ExpectedEvidence}; success={!result.IsError}; verificationStatus={result.VerificationStatus}; verificationSummary={result.VerificationSummary}; verification={result.Verification}; summary={result.Summary}; output={TrimToolOutput(result.ApiName, result.Output).ReplaceLineEndings(" ")}"));
 
         var messages = new[]
         {
@@ -603,7 +603,7 @@ internal sealed partial class StructuredAssistantPlanner
         var toolText = string.Join(
             Environment.NewLine,
             toolResults.TakeLast(Math.Max(1, _options.PlannerRecentToolResultCount)).Select(result =>
-                $"- tool={result.ApiName}; input={result.Input}; purpose={result.Purpose}; expectedEvidence={result.ExpectedEvidence}; success={!result.IsError}; verificationStatus={result.VerificationStatus}; verificationSummary={result.VerificationSummary}; verification={result.Verification}; summary={result.Summary}; output={TrimForFeed(result.Output)}"));
+                $"- tool={result.ApiName}; input={result.Input}; purpose={result.Purpose}; expectedEvidence={result.ExpectedEvidence}; success={!result.IsError}; verificationStatus={result.VerificationStatus}; verificationSummary={result.VerificationSummary}; verification={result.Verification}; summary={result.Summary}; output={TrimToolOutput(result.ApiName, result.Output).ReplaceLineEndings(" ")}"));
 
         var messages = new[]
         {

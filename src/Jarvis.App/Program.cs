@@ -1,4 +1,5 @@
 using Jarvis.App;
+using Jarvis.Core;
 using System.Text;
 
 ApplicationConfiguration.Initialize();
@@ -42,12 +43,8 @@ static class StartupCrashLog
     {
         try
         {
-            var root = ResolveRepositoryRoot();
-
-            var dataDirectory = Path.Combine(root, "data");
-            Directory.CreateDirectory(dataDirectory);
-
-            var logPath = Path.Combine(dataDirectory, "startup-error.log");
+            var logPath = JarvisDataPaths.Resolve("data/startup-error.log");
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
             var builder = new StringBuilder();
             builder.Append('[')
                 .Append(DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz"))
@@ -60,28 +57,5 @@ static class StartupCrashLog
         {
             // Best effort only.
         }
-    }
-
-    private static string ResolveRepositoryRoot()
-    {
-        var currentDirectory = Environment.CurrentDirectory;
-        if (Directory.Exists(Path.Combine(currentDirectory, "data")))
-        {
-            return currentDirectory;
-        }
-
-        var baseDirectory = AppContext.BaseDirectory;
-        if (Directory.Exists(Path.Combine(baseDirectory, "data")))
-        {
-            return baseDirectory;
-        }
-
-        var parentRoot = Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", ".."));
-        if (Directory.Exists(Path.Combine(parentRoot, "data")))
-        {
-            return parentRoot;
-        }
-
-        return currentDirectory;
     }
 }

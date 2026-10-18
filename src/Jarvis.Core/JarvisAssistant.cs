@@ -18,6 +18,9 @@ public sealed class JarvisAssistant
         "cancel", "never mind", "nevermind", "forget it", "no", "stop"
     };
     private (string Command, DateTimeOffset AskedUtc)? _pendingFollowUpCommand;
+    private readonly ILectureRecorder? _lectureRecorder;
+
+    public bool IsRecordingLecture => _lectureRecorder?.IsRecording == true;
 
     public JarvisAssistant(
         JarvisOptions options,
@@ -38,6 +41,7 @@ public sealed class JarvisAssistant
         ILectureRecorder? lectureRecorder = null)
     {
         Options = options;
+        _lectureRecorder = lectureRecorder;
         _agentStateStore = agentStateStore;
         _planner = planner;
         _memoryStore = memoryStore;
@@ -61,6 +65,7 @@ public sealed class JarvisAssistant
 
         var tools = new List<IAssistantTool>();
         tools.Add(new HelpTool(() => tools));
+        tools.Add(new BrainTool(modelGateway));
         tools.Add(new StatusTool());
         tools.Add(new TimeTool());
         tools.Add(new RememberTool());
@@ -487,7 +492,8 @@ public sealed class JarvisAssistant
             recentToolResults,
             _conversationState.GetSnapshot(Math.Max(4, Options.PlannerRecentTurnCount)),
             userState,
-            memoryProfile);
+            memoryProfile,
+            BrainWorkspace.BuildContext(Options, originalInput));
 
         AssistantPlanningResult plan;
 

@@ -33,7 +33,7 @@ public sealed partial class DesktopAutomationService
     private DateTime _startAppsBuiltUtc = DateTime.MinValue;
     private DateTime _lastMissRefreshUtc = DateTime.MinValue;
 
-    private string ApplicationIndexPath => Path.Combine(_workspaceRoot, "data", "app-index.json");
+    private string ApplicationIndexPath => JarvisDataPaths.Resolve("data/app-index.json");
 
     /// <summary>
     /// Builds (or refreshes) the application index without blocking the caller, so the first spoken

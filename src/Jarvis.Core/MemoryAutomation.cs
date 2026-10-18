@@ -54,8 +54,10 @@ internal static class MemoryAutomation
     private static readonly Regex WorkingOnProjectRegex = new(@"\b(?:i am working on|i'm working on|i am building|i'm building|my project is)\s+(?<project>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex WorkFromPlaceRegex = new(@"\b(?:i work from|i study at|i train at)\s+(?<place>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex AddressPreferenceRegex = new(@"\b(?:call me|you can call me|my nickname is|my preferred name is|refer to me as|address me as|my name is)\s+(?<name>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static readonly Regex ReminderPrefixRegex = new(@"^(?:remind\s+me|set\s+(?:a\s+)?reminder)\s+(?:(?:to|about|that)\s+)?", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static readonly Regex RelativeReminderRegex = new(@"\bin\s+(?:(?<half>half\s+an)|(?<n>an?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|\d+(?:\.\d+)?))\s*(?<u>seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex ReminderPrefixRegex = new(@"^(?:remind\s+me|(?:set|add|create|make)\s+(?:a\s+)?(?:new\s+)?reminder)(?:\s+(?:(?:to|about|that)\b)?|$)", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // "in 10 minutes", "after an hour", "30 seconds from now", "half an hour from now"
+    private const string ReminderSpan = @"(?:(?<half>half\s+an)|(?<n>an?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|\d+(?:\.\d+)?))\s*(?<u>seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b";
+    private static readonly Regex RelativeReminderRegex = new($@"\b(?:in|after)\s+{ReminderSpan}|\b{ReminderSpan}\s+from\s+now\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly string[] ToneTerms =
     [
         "concise",
@@ -254,16 +256,14 @@ internal static class MemoryAutomation
             RetentionPolicy: "episodic");
     }
 
-    public static MemoryWriteRequest? BuildReminderMemory(
-        string input,
+    public static bool IsReminderRequest(string input) => ReminderPrefixRegex.IsMatch(input.Trim());
+
+    public static MemoryWriteRequest BuildReminderMemory(
+        string reminderText,
+        DateTimeOffset reminderAtLocal,
         InteractionContextSnapshot context,
         DateTimeOffset nowLocal)
     {
-        if (!TryParseReminder(input, nowLocal, out var reminderText, out var reminderAtLocal))
-        {
-            return null;
-        }
-
         return new MemoryWriteRequest(
             $"Reminder: {TrimSentence(reminderText)}",
             Kind: "reminder",
@@ -1146,7 +1146,12 @@ internal static class MemoryAutomation
                || lowered.Contains("emoji", StringComparison.Ordinal);
     }
 
-    private static bool TryParseReminder(
+    /// <summary>
+    /// Reads "remind me to call mom at 5" or "set a reminder 30 seconds from now to take my medication".
+    /// True only with both a task and a time still ahead. Either way the outputs hold what was understood
+    /// (an empty task, or <c>default</c> for no time), so the caller can ask for just the missing part.
+    /// </summary>
+    internal static bool TryParseReminder(
         string input,
         DateTimeOffset nowLocal,
         out string reminderText,
@@ -1181,19 +1186,19 @@ internal static class MemoryAutomation
                 ? (date ?? (clock > TimeOnly.FromDateTime(nowLocal.DateTime) ? today : today.AddDays(1))).ToDateTime(clock)
                 : date?.ToDateTime(new TimeOnly(9, 0));
 
-            // An unspecified-kind DateTime takes the local offset for its own date, so DST is right.
-            if (at is null || new DateTimeOffset(at.Value) < nowLocal)
+            if (at is not null)
             {
-                return false;
+                // An unspecified-kind DateTime takes the local offset for its own date, so DST is right.
+                reminderAtLocal = new DateTimeOffset(at.Value);
             }
-
-            reminderAtLocal = new DateTimeOffset(at.Value);
         }
 
         // Words stranded by the removed time: "to stretch" from "in 10 minutes to stretch", "call mom at".
         reminderText = Regex.Replace(payload, @"\s+", " ").Trim(' ', ',', '.', ';', ':', '-');
-        reminderText = Regex.Replace(reminderText, @"^(?:(?:to|about|that)\s+)+|(?:\s+(?:at|on|in|for|by|and|to|,))+$", string.Empty, RegexOptions.IgnoreCase).Trim(' ', ',', '.');
-        return reminderText.Length > 0;
+        // An answer to "What should I remind you about?" can restate the request: "(and I want you to) remind me about my medication".
+        reminderText = Regex.Replace(reminderText, @"^(?:.*?\bremind\s+me\b|(?:set|add|create|make)\s+(?:a\s+)?(?:new\s+)?reminder\b)\s*", string.Empty, RegexOptions.IgnoreCase);
+        reminderText = Regex.Replace(reminderText, @"^(?:(?:to|about|that)\b\s*)+|(?:\s+(?:at|on|in|for|by|and|to|,))+$", string.Empty, RegexOptions.IgnoreCase).Trim(' ', ',', '.');
+        return reminderText.Length > 0 && reminderAtLocal > nowLocal;
     }
 
     private static TimeSpan ParseRelativeReminder(Match match)

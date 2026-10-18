@@ -42,7 +42,8 @@ public sealed record AssistantPlanningRequest(
     IReadOnlyList<AssistantToolExecution> RecentToolResults,
     ConversationStateSnapshot ConversationState,
     UserStateSnapshot UserState,
-    MemoryProfileSnapshot MemoryProfile);
+    MemoryProfileSnapshot MemoryProfile,
+    string BrainContext = "");
 
 public sealed record AssistantPlanningResult(
     string Response,
@@ -125,7 +126,12 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
     private readonly IModelGateway _modelGateway;
     private readonly IAgentStateStore _stateStore;
     private readonly IWebResearchService _webResearchService;
-    private readonly ConcurrentDictionary<string, Task> _backgroundTasks = new(StringComparer.OrdinalIgnoreCase);
+    // One background budget and task map per process: the app rebuilds the assistant on many settings changes
+    // while background jobs keep running. ponytail: capacity is fixed at first use, so changing
+    // PlannerMaxConcurrentBackgroundTasks takes effect on restart.
+    private static ModelWorkScheduler? _sharedBackgroundScheduler;
+    private static readonly ConcurrentDictionary<string, Task> _backgroundTasks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ModelWorkScheduler _backgroundScheduler;
 
     public StructuredAssistantPlanner(
         JarvisOptions options,
@@ -137,13 +143,15 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
         _modelGateway = modelGateway;
         _stateStore = stateStore;
         _webResearchService = webResearchService;
+        _backgroundScheduler = LazyInitializer.EnsureInitialized(ref _sharedBackgroundScheduler,
+            () => new ModelWorkScheduler(Math.Clamp(options.PlannerMaxConcurrentBackgroundTasks, 1, 4), maxWaiting: 16));
     }
 
     public bool IsAvailable => true;
 
     public string Status =>
         _modelGateway.IsAvailable
-            ? $"agent runtime enabled ({_options.PlannerProvider}, routes fast/reasoning/vision, retries {_options.PlannerRetryCount})"
+            ? $"agent runtime enabled ({_options.PlannerProvider}, routes fast/reasoning/vision, retries {_options.PlannerRetryCount}); {_modelGateway.Status}"
             : "agent runtime enabled in degraded mode (heuristics, direct tools, and optional web research)";
 
     public async Task InitializeAsync(
@@ -259,10 +267,12 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
 
         // On a local model the classifier and the reply each take seconds. When a plain reply is the likely
         // outcome, start it alongside the classifier and cancel it if the classifier routes elsewhere.
+        // With one model slot the reply would hold it and make the classifier wait, so only overlap when two can run.
         using var speculativeReplyCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var speculativeReply = pendingSession is null
             && resumedSession is null
             && _modelGateway.IsAvailable
+            && (_modelGateway is not ScheduledModelGateway shared || shared.Scheduler.Snapshot.Capacity > 1)
             && ClassifyHeuristically(effectiveInput, effectiveRequest, null).Intent == AgentIntentKind.SimpleReply
                 ? ExecuteSimpleReplyAsync(effectiveRequest, sessionId, null, speculativeReplyCts.Token)
                 : null;
@@ -337,7 +347,7 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
     private static readonly string[] CorePlannerTools =
     [
         "computer", "open app", "focus app", "close app", "type into", "send hotkey",
-        "click element", "open path", "search web", "wait", "calendar", "write down", "page"
+        "click element", "open path", "search web", "wait", "calendar", "write down", "page", "brain"
     ];
 
     // Limit local-model context to core tools and tools whose names match words in the request.
@@ -370,6 +380,17 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
         PersistedAgentSession? existingSession,
         CancellationToken cancellationToken)
     {
+        // Reserve the background slot before promising anything: a full queue comes back as an already-faulted task.
+        var slot = _backgroundScheduler.AcquireAsync(background: true, CancellationToken.None);
+        if (slot.Exception is not null)
+        {
+            return new AssistantPlanningResult(
+                "The background queue is full, so I did not start that. Try again after a background job finishes.",
+                [],
+                [],
+                AgentIntentKind.Background);
+        }
+
         var queuedStep = new PlanStepState("Queued", "queued", "Waiting for the background worker to start.");
         var session = new PersistedAgentSession(
             sessionId,
@@ -388,18 +409,30 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
             existingSession?.ToolResults ?? [],
             existingSession?.Citations ?? []);
 
-        await _stateStore.UpsertSessionAsync(session, cancellationToken);
+        try
+        {
+            await _stateStore.UpsertSessionAsync(session, cancellationToken);
+            activity.Report(new AssistantActivityEvent(
+                AssistantActivityKind.Background,
+                "Queued a background workflow.",
+                sessionId,
+                Detail: request.UserInput));
+        }
+        catch
+        {
+            // Give the reserved slot back (now, or once it is granted) so a failed save cannot shrink the budget.
+            _ = slot.ContinueWith(static reserved => reserved.Result.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
+            throw;
+        }
 
-        activity.Report(new AssistantActivityEvent(
-            AssistantActivityKind.Background,
-            "Queued a background workflow.",
-            sessionId,
-            Detail: request.UserInput));
-
-        var backgroundTask = Task.Run(async () =>
+        // Register before starting: a fast completion must not leave a stale entry that blocks resume.
+        _backgroundTasks[sessionId] = Task.CompletedTask;
+        _ = Task.Run(async () =>
         {
             try
             {
+                using var backgroundScope = ModelWorkContext.EnterBackground();
+                using var workLease = await slot;
                 var backgroundRequest = request with
                 {
                     UserInput = request.UserInput.Replace("in the background", string.Empty, StringComparison.OrdinalIgnoreCase).Trim()
@@ -448,7 +481,7 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
                     sessionId,
                     Detail: result.Response));
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
+            catch (Exception exception) // runs on CancellationToken.None, so even a cancellation is a failure
             {
                 await _stateStore.UpsertSessionAsync(
                     session with
@@ -472,7 +505,6 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
             }
         });
 
-        _backgroundTasks[sessionId] = backgroundTask;
 
         return new AssistantPlanningResult(
             "I queued that as a background task and will keep working on it while the app stays open.",

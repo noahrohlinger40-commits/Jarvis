@@ -44,10 +44,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         _responseFormat = responseFormat;
         _apiKey = apiKey;
         _fallbackSpeaker = new WindowsSpeechSpeaker(options);
-        _httpClient = new HttpClient
-        {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
+        _httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, Timeout.InfiniteTimeSpan);
     }
 
     public event EventHandler<SpeakerStatusChangedEventArgs>? StatusChanged;
@@ -71,6 +68,8 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         {
             return false;
         }
+
+        if (options.LocalAiOnly && !LocalAiPolicy.IsLoopbackHttpEndpoint(baseUrl)) return false;
 
         var apiKey = ResolveVoiceApiKey(options);
 

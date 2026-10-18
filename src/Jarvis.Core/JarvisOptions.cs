@@ -144,6 +144,22 @@ public sealed record JarvisOptions
 
     public bool SafetyBlockProtectedSystemPaths { get; init; } = true;
 
+    public bool BrainContextEnabled { get; init; } = false;
+
+    public string BrainWorkspacePath { get; init; } = string.Empty;
+
+    public int BrainContextMaxCharacters { get; init; } = 2400;
+
+    public bool LocalAiOnly { get; init; } = true;
+
+    public int ModelMaxConcurrentRequests { get; init; } = 1;
+
+    public int PlannerMaxConcurrentBackgroundTasks { get; init; } = 2;
+
+    public int PlannerLocalCpuThreads { get; init; } = 2;
+
+    public bool PlannerRecordLocalCalls { get; init; } = true;
+
     public bool PlannerEnabled { get; init; } = true;
 
     public string PlannerProvider { get; init; } = "openai-compatible";

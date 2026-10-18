@@ -71,13 +71,24 @@ public static class ModelGatewayFactory
 
         var profiles = BuildProfiles(options);
 
+        profiles.RemoveAll(profile => !LocalAiPolicy.AllowsModelProvider(options, profile.Provider, profile.BaseUrl));
+
+        if (options.LocalAiOnly && profiles.Count == 0)
+            return new DisabledModelGateway("local-only AI mode requires a local provider on this computer; hosted and OpenClaw routes are blocked");
+
         if (profiles.Count == 0)
         {
             return new DisabledModelGateway("no usable model provider is configured");
         }
 
-        return new OpenAiCompatibleModelGateway(workspaceRoot, options, profiles);
+        // One inference budget per process: the app rebuilds the gateway on settings changes while earlier requests
+        // may still run. ponytail: capacity is fixed at first use, so changing ModelMaxConcurrentRequests takes effect on restart.
+        var capacity = Math.Clamp(options.ModelMaxConcurrentRequests, 1, 4);
+        var scheduler = LazyInitializer.EnsureInitialized(ref _sharedScheduler, () => new ModelWorkScheduler(capacity));
+        return new ScheduledModelGateway(new OpenAiCompatibleModelGateway(workspaceRoot, options, profiles), capacity, scheduler);
     }
+
+    private static ModelWorkScheduler? _sharedScheduler;
 
     private static List<ResolvedProviderProfile> BuildProfiles(JarvisOptions options)
     {
@@ -292,10 +303,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         _workspaceRoot = workspaceRoot;
         _options = options;
         _profiles = profiles;
-        _httpClient = new HttpClient
-        {
-            Timeout = TimeSpan.FromSeconds(45)
-        };
+        _httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, TimeSpan.FromSeconds(45));
     }
 
     public bool IsAvailable => _profiles.Count > 0;
@@ -328,6 +336,19 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
                 return $"{profile.Name}:{profile.Provider} fast={fastModel} reasoning={reasoningModel}";
             }));
 
+    // HttpClient.Timeout throws TaskCanceledException; report it as a failure so callers do not mistake it for the user cancelling.
+    private async Task<HttpResponseMessage> SendHttpAsync(HttpRequestMessage message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _httpClient.SendAsync(message, cancellationToken);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"The local model did not answer within {_httpClient.Timeout.TotalSeconds:0} seconds.");
+        }
+    }
+
     public async Task<ChatCompletionResponse> CompleteAsync(
         ChatCompletionRequest request,
         ModelRoute route,
@@ -346,7 +367,8 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             {
                 return await SendAsync(candidate, request, route, cancellationToken);
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
+            // A timeout already cost the full HTTP timeout while holding the model slot; fail now instead of waiting again.
+            catch (Exception exception) when (exception is not OperationCanceledException and not TimeoutException)
             {
                 failures.Add($"{candidate.Profile.Name}/{candidate.Model}: {TrimError(exception.Message)}");
             }
@@ -584,6 +606,16 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         ModelRoute route,
         CancellationToken cancellationToken)
     {
+        if (!LocalAiPolicy.AllowsModelProvider(_options, candidate.Profile.Provider, candidate.Profile.BaseUrl))
+            throw new InvalidOperationException("Local-only AI mode blocked this model provider.");
+
+        if (request.Messages.Any(message => message.Content.Any(part => part.Text.Contains(BrainWorkspace.ReferenceMarker, StringComparison.Ordinal))))
+        {
+            if (!Uri.TryCreate(candidate.Profile.BaseUrl, UriKind.Absolute, out var brainUri) || !brainUri.IsLoopback
+                || !string.Equals(candidate.Profile.Provider, "local", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Brain work references are restricted to local loopback models; remote fallback was skipped.");
+        }
+
         if (IsOpenClawLocal(candidate.Profile))
         {
             return await SendViaOpenClawLocalAsync(candidate, request, route, cancellationToken);
@@ -638,11 +670,13 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             payload["tool_choice"] = "auto";
         }
 
+        var requestJson = JsonSerializer.Serialize(payload, JsonOptions);
+
         using var message = new HttpRequestMessage(
             HttpMethod.Post,
             BuildEndpoint(candidate.Profile.BaseUrl))
         {
-            Content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8, "application/json")
+            Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
         };
 
         if (!string.IsNullOrWhiteSpace(candidate.Profile.ApiKey))
@@ -660,7 +694,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             }
         }
 
-        using var response = await _httpClient.SendAsync(message, cancellationToken);
+        using var response = await SendHttpAsync(message, cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
 
         if (!response.IsSuccessStatusCode)
@@ -669,7 +703,42 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         }
 
         using var document = JsonDocument.Parse(body);
-        return ExtractCompletion(document.RootElement, candidate);
+        var completion = ExtractCompletion(document.RootElement, candidate);
+
+        // Local call recording is configurable; it never changes inference success.
+        LogPlannerCall(candidate, route, requestJson, document.RootElement);
+
+        return completion;
+    }
+
+    private static readonly object PlannerLogLock = new();
+
+    private void LogPlannerCall(ModelCandidate candidate, ModelRoute route, string requestJson, JsonElement root)
+    {
+        try
+        {
+            if (!_options.PlannerRecordLocalCalls || !IsLocalLoopbackProfile(candidate.Profile)
+                || !root.TryGetProperty("choices", out var choices)
+                || choices.ValueKind != JsonValueKind.Array
+                || choices.GetArrayLength() == 0)
+            {
+                return;
+            }
+
+            var line = $"{{\"timestampUtc\":\"{DateTime.UtcNow:O}\",\"route\":\"{route}\",\"model\":{JsonSerializer.Serialize(candidate.Model)},"
+                + $"\"response\":{JsonSerializer.Serialize(choices[0])},\"request\":{requestJson}}}{Environment.NewLine}";
+            var path = JarvisDataPaths.Resolve("data/planner-log.jsonl");
+
+            lock (PlannerLogLock)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.AppendAllText(path, line, new UTF8Encoding(false));
+            }
+        }
+        catch
+        {
+            // Logging must never break a planner turn.
+        }
     }
 
     private async Task<ChatCompletionResponse> SendViaResponsesApiAsync(
@@ -727,7 +796,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", candidate.Profile.ApiKey);
         }
 
-        using var response = await _httpClient.SendAsync(message, cancellationToken);
+        using var response = await SendHttpAsync(message, cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
 
         if (!response.IsSuccessStatusCode)

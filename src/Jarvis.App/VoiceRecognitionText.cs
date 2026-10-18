@@ -193,6 +193,13 @@ internal static partial class VoiceRecognitionText
 
             commandText = NormalizeCommandText(
                 string.Join(' ', tokens.Skip(startIndex + 1).Select(token => token.Original)));
+
+            // "...my project Jarvis." only mentions the name; it is not a call.
+            if (commandText.Length == 0)
+            {
+                return false;
+            }
+
             return true;
         }
 
@@ -499,41 +506,6 @@ internal static partial class VoiceRecognitionText
 
     [GeneratedRegex("\\s+")]
     private static partial Regex WhitespaceRegex();
-
-    [GeneratedRegex(@"^\s*(?<head>[\p{L}'\-]{2,14}(?:\s+[\p{L}'\-]{2,14})?)\s*[,.]\s*(?<rest>\S.*)$", RegexOptions.Singleline | RegexOptions.CultureInvariant)]
-    private static partial Regex LeadingVocativeRegex();
-
-    // A sentence that starts with one of these is a real command, never a misheard wake word.
-    private static readonly HashSet<string> CommandLeadWords = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "open", "close", "play", "pause", "stop", "search", "set", "take", "turn", "what", "what's", "whats",
-        "help", "status", "weather", "time", "notes", "note", "focus", "click", "type", "scroll", "wait",
-        "run", "browse", "read", "list", "find", "show", "send", "get", "how", "where", "when", "who", "why",
-        "can", "could", "please", "tell", "remind", "call", "start", "launch", "switch", "go"
-    };
-
-    /// <summary>
-    /// Removes a leading name such as "Jokes, what time is it?" or "Join us. What time is it?". Use it
-    /// only when the wake word has already been confirmed some other way: transcription often mishears
-    /// "Jarvis" as a different word, and that word would otherwise stay glued to the front of the command.
-    /// </summary>
-    public static string StripLeadingVocative(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return text;
-        }
-
-        var match = LeadingVocativeRegex().Match(text);
-
-        if (!match.Success)
-        {
-            return text;
-        }
-
-        var firstWord = match.Groups["head"].Value.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
-        return CommandLeadWords.Contains(firstWord) ? text : match.Groups["rest"].Value.Trim();
-    }
 
     private sealed record SpokenToken(string Original, string Match);
 }

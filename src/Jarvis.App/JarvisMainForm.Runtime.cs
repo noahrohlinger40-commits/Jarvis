@@ -23,6 +23,17 @@ internal sealed partial class JarvisMainForm
         try
         {
             await RefreshRuntimeStateAsync();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+        }
+
+        // Guarded on its own, so a failing screen refresh can never silence reminders.
+        try
+        {
             await AnnounceDueRemindersAsync();
         }
         catch (OperationCanceledException)
@@ -1570,6 +1581,19 @@ internal sealed partial class JarvisMainForm
 
     private async Task HandleVoiceCommandAsync(VoiceCommandRecognizedEventArgs eventArgs)
     {
+        // While a lecture records, whatever the wake gate lets through is most likely the lecture, so only the
+        // stop command is acted on and nothing else gets a reply. It skips the low-confidence check, whose
+        // "did you mean" would wait for a yes this gate drops.
+        if (_context.Assistant.IsRecordingLecture)
+        {
+            if (eventArgs.Text == "lecture notes stop")
+            {
+                await ProcessPromptAsync(eventArgs.Text, "VOICE", clearInput: false);
+            }
+
+            return;
+        }
+
         // Talking over a reply only counts with the wake word ("Jarvis, stop", "Jarvis, that's good, thank you"):
         // loudness can't tell the user from Jarvis's own voice coming back through a speaker. The words aren't
         // acted on, since at speaker volume they're mixed with the echo; Jarvis goes quiet and listens instead.

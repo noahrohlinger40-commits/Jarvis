@@ -800,7 +800,8 @@ public static partial class JarvisCommandCatalog
     private static partial Regex ReadPageRegex();
 
     // "summarize this page", "give me a quick summary of the article", "tldr", "summarize the reviews on this page"
-    [GeneratedRegex(@"^(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+)?(?:summari[sz]e|sum\s+up|recap|give\s+me\s+(?:a\s+|the\s+)?(?:quick\s+|short\s+|brief\s+)?(?:summary|rundown|gist|tl;?dr)(?:\s+of)?|tl;?dr|what'?s\s+the\s+(?:gist|tl;?dr|summary)(?:\s+of)?)(?<rest>.*)$", RegexOptions.IgnoreCase)]
+    // "summarized" too: Whisper hears "Jarvis, summarize this page" as "Jarvis summarized this page".
+    [GeneratedRegex(@"^(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|please\s+)?(?:summari[sz]e[ds]?\b|sum\s+up|recap|give\s+me\s+(?:a\s+|the\s+)?(?:quick\s+|short\s+|brief\s+)?(?:summary|rundown|gist|tl;?dr)(?:\s+of)?|tl;?dr|what'?s\s+the\s+(?:gist|tl;?dr|summary)(?:\s+of)?)(?<rest>.*)$", RegexOptions.IgnoreCase)]
     private static partial Regex SummarizePageRegex();
 
     // "what's this article about", "what does this page say about pricing"
@@ -908,11 +909,12 @@ public static partial class JarvisCommandCatalog
     // "start lecture notes for IT Professions", "record my biology lecture", "take notes on this meeting".
     // Up to four words may name it before the kind ("my IT Professions lecture"), but no preposition, so
     // "record a reminder for class" isn't a recording.
-    [GeneratedRegex(@"^(?:please\s+)?(?:start|begin|record|take)\s+(?:(?:taking|recording)\s+)?(?:notes\s+(?:on|for|in|during|of)\s+)?(?:(?:this|the|my|our|a|an|today'?s)\s+)?(?<before>(?:(?!(?:for|to|about|with|in|on|at|of)\b)[\w'&.-]+\s+){0,4}?)(?<kind>lecture|class|meeting)(?:\s+(?:notes|recording))?(?:\s+(?:for|in|on|called|named|about|of)\s+(?:(?:the|my|our)\s+)?(?<after>.+))?$", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"^(?:please\s+)?(?:start|begin|record|take)\s+(?:(?:taking|recording)\s+)?(?:notes\s+(?:on|for|in|during|of)\s+)?(?:(?:this|the|my|our|a|an|today'?s)\s+)?(?<before>(?:(?!(?:for|to|about|with|in|on|at|of)\b)[\w'&.-]+\s+){0,4}?)(?<kind>lecture|class|meeting)(?:\s+(?:notes|nodes|recording))?(?:\s+(?:for|in|on|called|named|about|of)\s+(?:(?:the|my|our)\s+)?(?<after>.+))?$", RegexOptions.IgnoreCase)]
     private static partial Regex LectureNotesStartRegex();
 
-    // "stop recording", "end the meeting notes", "stop taking notes", "class is over"
-    [GeneratedRegex(@"^(?:please\s+)?(?:stop|end|finish|wrap\s+up)\s+(?:taking\s+)?(?:(?:the|my|this)\s+)?(?:(?:lecture|class|meeting)\s+)?(?:notes|recording)$|^(?:the\s+)?(?:lecture|class|meeting)\s+is\s+over$", RegexOptions.IgnoreCase)]
+    // "stop recording", "end the meeting notes", "stop taking notes", "class is over". "Nodes" is Whisper's
+    // mishearing of "notes" in both patterns.
+    [GeneratedRegex(@"^(?:please\s+)?(?:stop|end|finish|wrap\s+up)\s+(?:taking\s+)?(?:(?:the|my|this)\s+)?(?:(?:lecture|class|meeting)\s+)?(?:notes|nodes|recording)$|^(?:the\s+)?(?:lecture|class|meeting)\s+is\s+over$", RegexOptions.IgnoreCase)]
     private static partial Regex LectureNotesStopRegex();
 
     private static bool TryCanonicalizeLectureNotesCommand(string input, out string command)
@@ -929,7 +931,7 @@ public static partial class JarvisCommandCatalog
         var start = LectureNotesStartRegex().Match(text);
 
         // "start the meeting" or "take the class" asks for no recording.
-        if (!start.Success || !Regex.IsMatch(text, @"\b(?:notes|record|recording)\b", RegexOptions.IgnoreCase))
+        if (!start.Success || !Regex.IsMatch(text, @"\b(?:notes|nodes|record|recording)\b", RegexOptions.IgnoreCase))
         {
             return false;
         }

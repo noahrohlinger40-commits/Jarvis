@@ -198,10 +198,24 @@ How it behaves:
 - The server runs on the CPU. On an 8-core laptop a spoken command takes about 1.5 to 2 seconds to transcribe.
 - `small.en` is English-only. For other languages use a multilingual model such as `small`, and for speed use `base.en`. The model name is passed straight to the server.
 - The server ignores the long instruction-style prompt Jarvis sends, because Whisper treats prompts as earlier speech and can repeat them back. Set `JARVIS_WHISPER_CLIENT_PROMPT=1` to change that.
-- Server output goes to `data\whisper-server.log`. Set `JARVIS_WHISPER_SAVE_DIR` to a folder to keep every audio clip it receives, which helps when diagnosing a recognition problem.
+- Server output goes to `%LOCALAPPDATA%\Jarvis\data\whisper-server.log`. Set `JARVIS_WHISPER_SAVE_DIR` to a folder to keep every audio clip it receives, which helps when diagnosing a recognition problem.
 - To use a cloud service instead, set `speechRecognitionBaseUrl` back to `https://api.openai.com/v1` with a key as described below.
-- If the server has not been set up or is not running, the voice status says "The local speech server is not running" and Jarvis cannot turn your voice into text. Check `data\whisper-server.log`, run the setup script, or set `speechRecognitionProvider` to `windows` to use the built-in recognizer instead.
+- If the server has not been set up or is not running, the voice status says "The local speech server is not running" and Jarvis cannot turn your voice into text. Check `%LOCALAPPDATA%\Jarvis\data\whisper-server.log`, run the setup script, or set `speechRecognitionProvider` to `windows` to use the built-in recognizer instead.
 - The built-in Windows recognizer now listens to the microphone named in `speechRecognitionDeviceName` with automatic gain, and its status line says why the cloud path was unavailable.
+
+## Local Model Without LM Studio
+
+Jarvis can run its own local language model with llama.cpp, so LM Studio is optional.
+
+```powershell
+.\scripts\Setup-LocalLlm.ps1
+```
+
+Run that once. It installs `llama-server.exe` and a model to `%LOCALAPPDATA%\Jarvis\llm`, and from then on Jarvis starts `llama-server` itself on the planner address at launch and stops it when it exits. Output goes to `%LOCALAPPDATA%\Jarvis\data\llm-server.log`. If something is already answering on the planner address, such as LM Studio, Jarvis uses that instead, and it falls back to LM Studio when the setup script has not been run. To swap in a different model, for example a fine-tuned one, run `.\scripts\Setup-LocalLlm.ps1 -ModelPath <file.gguf>`.
+
+## Where Jarvis Keeps Your Data
+
+Everything Jarvis writes while it runs lives in `%LOCALAPPDATA%\Jarvis\data`, outside the project: memory, transcripts, the planner log used for fine-tuning, screenshots, logs, the Google Calendar client secret, and the app index. The project often sits in a OneDrive folder, which would otherwise copy all of that to the cloud. Relative paths in the settings, such as `memoryFilePath: "data/memory.json"`, are read from `%LOCALAPPDATA%\Jarvis`; absolute paths are used as given. The project's own `data` folder holds only files that ship with Jarvis, such as the wake-word profiles. The Google sign-in itself is kept in Windows Credential Manager.
 
 ## Streaming Voice Setup
 
@@ -367,7 +381,7 @@ Jarvis scans every app on the PC and keeps an index of them, so "open Spotify" o
 
 - **What is scanned:** Start Menu and desktop shortcuts, the registry (installed apps and App Paths), Steam, Epic, Xbox, Riot and Battle.net libraries, and everything Windows itself lists as an app. That last source includes Microsoft Store apps such as Claude, ChatGPT, Clock, Photos and Snipping Tool, which have no shortcut file to find.
 - **When:** in the background at every launch, cached for ten minutes in memory, with Windows' own app list refreshed every six hours. If a spoken name matches nothing, Jarvis rescans once, at most every two minutes, in case the app was just installed.
-- **The saved copy:** `data\app-index.json` lists every indexed app with its launch target and the spoken names it answers to. Open it to see exactly what Jarvis knows. It is rebuilt automatically and is safe to delete.
+- **The saved copy:** `%LOCALAPPDATA%\Jarvis\data\app-index.json` lists every indexed app with its launch target and the spoken names it answers to. Open it to see exactly what Jarvis knows. It is rebuilt automatically and is safe to delete.
 - **Spoken shortcuts:** each app answers to its full name and to shorter forms, so "Microsoft Edge" also answers to "edge" and "Microsoft Photos" and "Photos" both work. Filler such as "the", "my" and "app" is ignored.
 - **Mishearings:** names that are a letter or two off ("Discourd") or that sound alike ("Clawed" for Claude) still find the right app. Text that matches no app opens nothing.
 - **Punctuation:** speech transcripts end sentences with a period, and a name like "Spotify." used to be mistaken for a web address. Trailing punctuation is now ignored.

@@ -101,6 +101,12 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return false;
         }
 
+        if (options.LocalAiOnly && !LocalAiPolicy.IsLoopbackHttpEndpoint(options.SpeechRecognitionBaseUrl))
+        {
+            status = "Local-only AI mode blocked remote transcription. Configure a local speech endpoint or Windows speech.";
+            return false;
+        }
+
         var apiKey = ResolveApiKey(options);
 
         if (string.IsNullOrWhiteSpace(apiKey)
@@ -119,7 +125,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
                 options.SpeechRecognitionModel,
                 apiKey,
                 options.SpeechRecognitionLanguage,
-                VoiceRecognitionText.BuildTranscriptionPrompt(options)));
+                VoiceRecognitionText.BuildTranscriptionPrompt(options), options.LocalAiOnly));
 
         status = $"Rolling transcription fallback ready with model {options.SpeechRecognitionModel}.";
         return true;
@@ -392,12 +398,6 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
     private async Task TranscribeUtteranceAsync(byte[] utteranceBytes)
     {
         var lifetimeToken = _lifetimeCts?.Token ?? CancellationToken.None;
-        // The built-in wake check takes up to a few seconds, so run it alongside transcription, not before it.
-        // Skipped while Jarvis is talking: every piece of its echo would wait on it and the queue would fall
-        // behind, and interrupting needs the wake word in the transcript anyway.
-        var wakeHintTask = _echoSuppressor.IsPlaybackActive
-            ? Task.FromResult<WakeWordDetectionResult?>(null)
-            : Task.Run(() => TryDetectWakeWord(utteranceBytes));
 
         try
         {
@@ -411,7 +411,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         try
         {
             var transcript = await _client.TranscribeAsync(utteranceBytes, _options.SpeechRecognitionSampleRateHz, lifetimeToken);
-            await HandleRecognizedTextAsync(transcript.Text.Trim(), transcript.Confidence, wakeHintTask);
+            HandleRecognizedText(transcript.Text.Trim(), transcript.Confidence);
         }
         catch (OperationCanceledException)
         {
@@ -422,7 +422,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             PublishStatus(
                 isArmed: _isArmed,
                 statusText: "The local speech server is not running, so Jarvis cannot turn your voice into text. "
-                    + "See data\\whisper-server.log, or run scripts\\Setup-LocalSpeech.ps1.");
+                    + "See %LOCALAPPDATA%\\Jarvis\\data\\whisper-server.log, or run scripts\\Setup-LocalSpeech.ps1.");
         }
         catch (Exception exception)
         {
@@ -439,10 +439,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
     private bool IsLocalSpeechEndpoint() =>
         Uri.TryCreate(_options.SpeechRecognitionBaseUrl, UriKind.Absolute, out var uri) && uri.IsLoopback;
 
-    private async Task HandleRecognizedTextAsync(
-        string recognizedText,
-        double? recognitionConfidence,
-        Task<WakeWordDetectionResult?> wakeHintTask)
+    private void HandleRecognizedText(string recognizedText, double? recognitionConfidence)
     {
         var rawRecognizedText = VoiceRecognitionText.NormalizeTranscript(recognizedText, _options, applyPersonalCorrections: false);
         recognizedText = VoiceRecognitionText.ApplyPersonalCorrections(rawRecognizedText, _options);
@@ -481,41 +478,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return;
         }
 
-        // Awaited only here: when the transcript already carried the wake word, the slower built-in
-        // check (up to 2.5 s) has nothing to add, so the command goes out without waiting for it.
-        if (await wakeHintTask is { IsDetected: true })
-        {
-            // The built-in recognizer only vouches that the wake word was said. When the transcription
-            // service also produced text, that text is far more accurate than the built-in recognizer's
-            // own guess at the command, so prefer it and fall back to the guess only if there is none.
-            if (!string.IsNullOrWhiteSpace(recognizedText))
-            {
-                // A leading "Harvest," is a mishearing of the wake word the hint heard. With no such word,
-                // the hint is a false positive on ordinary speech, and passing it on would send the whole
-                // conversation to the model as a command.
-                var command = VoiceRecognitionText.StripLeadingVocative(recognizedText);
-
-                if (command == recognizedText)
-                {
-                    return;
-                }
-
-                ResetToIdle();
-                PublishRecognizedCommand(
-                    JarvisCommandCatalog.NormalizeVoiceDirective(command),
-                    rawRecognizedText,
-                    recognitionConfidence,
-                    minimumConfidence);
-                return;
-            }
-
-            // The transcription service heard no speech, so any command the built-in recognizer guessed
-            // is most likely noise ("open app if"). Treat the hint as a wake word only and let the
-            // user say the command, instead of running a command nobody spoke.
-            ArmWakeWindow();
-            return;
-        }
-
+        // No name in the transcript: only run it if a wake window is already open
+        // (name said alone, hotkey, or a follow-up after Jarvis asked something).
         if (string.IsNullOrWhiteSpace(recognizedText))
         {
             return;
@@ -818,17 +782,6 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         SignalLevelChanged?.Invoke(this, new VoiceSignalChangedEventArgs(CurrentSignal));
     }
 
-    private WakeWordDetectionResult? TryDetectWakeWord(byte[] utteranceBytes)
-    {
-        if (_wakeWordDetector is null)
-        {
-            return null;
-        }
-
-        var detection = _wakeWordDetector.Detect(utteranceBytes, _options.SpeechRecognitionSampleRateHz);
-        return detection.IsDetected ? detection : null;
-    }
-
     private async Task<string> EnsureVendorDspAppliedAsync(CancellationToken cancellationToken)
     {
         if (_vendorDspControl is null)
@@ -953,17 +906,15 @@ internal sealed class OpenAiCompatibleTranscriptionClient
         string model,
         string apiKey,
         string language,
-        string prompt)
+        string prompt,
+        bool localAiOnly = true)
     {
         _endpoint = BuildEndpoint(baseUrl);
         _model = model;
         _apiKey = apiKey;
         _language = language;
         _prompt = prompt;
-        _httpClient = new HttpClient
-        {
-            Timeout = TimeSpan.FromSeconds(45)
-        };
+        _httpClient = LocalAiPolicy.CreateHttpClient(localAiOnly, TimeSpan.FromSeconds(45));
     }
 
     public async Task<VoiceTranscriptResult> TranscribeAsync(byte[] pcm16MonoAudio, int sampleRateHz, CancellationToken cancellationToken)

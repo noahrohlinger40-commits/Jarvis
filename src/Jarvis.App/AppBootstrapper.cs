@@ -38,13 +38,13 @@ internal static class AppBootstrapper
         IDesktopAutomationService desktopAutomation,
         CancellationToken cancellationToken)
     {
-        var memoryStore = new JsonMemoryStore(Path.Combine(workspaceRoot, options.MemoryFilePath));
+        var memoryStore = new JsonMemoryStore(JarvisDataPaths.Resolve(options.MemoryFilePath));
         IWeatherService weatherService = new OpenMeteoWeatherService();
-        IUserStateProvider userStateProvider = new JsonUserStateProvider(Path.Combine(workspaceRoot, options.UserStateFilePath));
+        IUserStateProvider userStateProvider = new JsonUserStateProvider(JarvisDataPaths.Resolve(options.UserStateFilePath));
         IWebResearchService webResearchService = new DuckDuckGoWebResearchService();
-        var transcriptStore = new JsonLineTranscriptStore(Path.Combine(workspaceRoot, options.TranscriptFilePath));
-        IAgentStateStore agentStateStore = new JsonAgentStateStore(Path.Combine(workspaceRoot, options.AgentStateFilePath));
-        IPendingApprovalStore pendingApprovalStore = new JsonPendingApprovalStore(Path.Combine(workspaceRoot, options.PendingApprovalFilePath));
+        var transcriptStore = new JsonLineTranscriptStore(JarvisDataPaths.Resolve(options.TranscriptFilePath));
+        IAgentStateStore agentStateStore = new JsonAgentStateStore(JarvisDataPaths.Resolve(options.AgentStateFilePath));
+        IPendingApprovalStore pendingApprovalStore = new JsonPendingApprovalStore(JarvisDataPaths.Resolve(options.PendingApprovalFilePath));
         var modelGateway = ModelGatewayFactory.Create(workspaceRoot, options);
         IVisualContextService visualContextService = new WindowsVisualContextService(workspaceRoot, options, modelGateway);
         var planner = AssistantPlannerFactory.Create(options, modelGateway, agentStateStore, webResearchService);
@@ -91,7 +91,8 @@ internal static class AppBootstrapper
 
     private static async Task EnsureLocalPlannerReadyAsync(JarvisOptions options, CancellationToken cancellationToken)
     {
-        if (!options.PlannerEnabled || !LooksLikeLocalPlanner(options))
+        if (!options.PlannerEnabled || !LooksLikeLocalPlanner(options)
+            || !LocalAiPolicy.AllowsModelProvider(options, options.PlannerProvider, options.PlannerBaseUrl))
         {
             return;
         }
@@ -103,14 +104,18 @@ internal static class AppBootstrapper
             return;
         }
 
-        await EnsureLmStudioServerAndModelAsync(options, model, cancellationToken);
+        // Prefer Jarvis's own engine when it is installed and nothing is serving yet; otherwise LM Studio as before.
+        var startedOwnEngine = !await IsLocalApiReachableAsync(options.PlannerBaseUrl, cancellationToken)
+            && TryStartOwnLlmEngine(options, model);
+
+        if (!startedOwnEngine)
+        {
+            await EnsureLmStudioServerAndModelAsync(options, model, cancellationToken);
+        }
 
         // Per-request timeouts are applied below because the first reply from a large local model
         // can take far longer than a simple model-list request.
-        using var httpClient = new HttpClient
-        {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
+        using var httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, Timeout.InfiniteTimeSpan);
 
         var plannerApiKey = ApiKeyResolver.Resolve(
             options.PlannerApiKey,
@@ -124,12 +129,18 @@ internal static class AppBootstrapper
 
         var modelsEndpoint = BuildLocalPlannerEndpoint(options.PlannerBaseUrl, "models");
         var chatEndpoint = BuildLocalPlannerEndpoint(options.PlannerBaseUrl, "chat/completions");
-        var deadlineUtc = DateTimeOffset.UtcNow.AddSeconds(30);
+        var deadlineUtc = DateTimeOffset.UtcNow.AddSeconds(startedOwnEngine ? 90 : 30);
         var modelFound = false;
 
         while (DateTimeOffset.UtcNow < deadlineUtc)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // llama-server exits at once when the model will not load; don't wait out the deadline.
+            if (startedOwnEngine && _ownLlmProcess is { HasExited: true })
+            {
+                break;
+            }
 
             try
             {
@@ -154,7 +165,7 @@ internal static class AppBootstrapper
         if (!modelFound)
         {
             throw new InvalidOperationException(
-                $"The local planner model `{model}` is not ready at {modelsEndpoint}. Start LM Studio and load that model before launching Jarvis.");
+                $"The local planner model `{model}` is not ready at {modelsEndpoint}. Check %LOCALAPPDATA%\\Jarvis\\data\\llm-server.log, run scripts\\Setup-LocalLlm.ps1 once, or start LM Studio and load that model, before launching Jarvis.");
         }
 
         var warmupPayload = new Dictionary<string, object?>
@@ -191,6 +202,97 @@ internal static class AppBootstrapper
         {
             throw new InvalidOperationException(
                 $"The local planner warm-up request failed at {chatEndpoint}: HTTP {(int)warmupResponse.StatusCode}. {TrimStartupError(warmupBody)}");
+        }
+    }
+
+    private static Process? _ownLlmProcess;
+    // stdout and stderr lines arrive on separate threads; appends to one file must not overlap.
+    private static readonly object OwnLlmLogLock = new();
+
+    /// <summary>
+    /// Starts Jarvis's own llama-server when scripts\Setup-LocalLlm.ps1 has installed it.
+    /// Returns false (so the caller falls back to LM Studio) when it is not installed or cannot start.
+    /// </summary>
+    private static bool TryStartOwnLlmEngine(JarvisOptions options, string model)
+    {
+        var llmHome = Path.Combine(JarvisDataPaths.Home, "llm");
+        var binDirectory = Path.Combine(llmHome, "bin");
+        var serverPath = Path.Combine(binDirectory, "llama-server.exe");
+        var modelPath = Path.Combine(llmHome, "planner.gguf");
+        var logPath = JarvisDataPaths.Resolve("data/llm-server.log");
+
+        if (!File.Exists(serverPath) || !File.Exists(modelPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var plannerUri = new Uri(BuildLocalPlannerEndpoint(options.PlannerBaseUrl, string.Empty).TrimEnd('/'));
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = serverPath,
+                WorkingDirectory = binDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            foreach (var argument in new[]
+            {
+                "-m", modelPath, "--alias", model, "--host", plannerUri.Host, "--port", plannerUri.Port.ToString(),
+                "-c", Math.Max(4096, options.PlannerLocalContextLength).ToString(), "-ngl", "99", "-np", "1",
+                "-t", Math.Clamp(options.PlannerLocalCpuThreads, 1, Environment.ProcessorCount).ToString(),
+                "-tb", Math.Clamp(options.PlannerLocalCpuThreads, 1, Environment.ProcessorCount).ToString(), "--jinja", "--no-webui"
+            })
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            var process = Process.Start(startInfo);
+
+            if (process is null)
+            {
+                return false;
+            }
+
+            DataReceivedEventHandler append = (_, e) =>
+            {
+                if (e.Data is not null)
+                {
+                    lock (OwnLlmLogLock)
+                    {
+                        AppendSpeechServerLog(logPath, e.Data);
+                    }
+                }
+            };
+            process.OutputDataReceived += append;
+            process.ErrorDataReceived += append;
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            _ownLlmProcess = process;
+            // ponytail: killed on normal exit only; a crash leaves it running and the next launch reuses it (reachability check). Use a Job Object if orphans become a problem.
+            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            {
+                try
+                {
+                    _ownLlmProcess?.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Already gone.
+                }
+            };
+
+            AppendSpeechServerLog(logPath, $"Started Jarvis's own llama-server as `{model}` on {plannerUri.Host}:{plannerUri.Port}.");
+            return true;
+        }
+        catch (Exception exception)
+        {
+            AppendSpeechServerLog(logPath, $"Could not start Jarvis's own llama-server, falling back to LM Studio: {exception.Message}");
+            return false;
         }
     }
 
@@ -291,7 +393,7 @@ internal static class AppBootstrapper
 
         var pythonPath = Path.Combine(speechHome, "venv", "Scripts", "python.exe");
         var serverScriptPath = Path.Combine(workspaceRoot, "scripts", "whisper-server.py");
-        var logPath = Path.Combine(workspaceRoot, "data", "whisper-server.log");
+        var logPath = JarvisDataPaths.Resolve("data/whisper-server.log");
 
         if (!File.Exists(pythonPath) || !File.Exists(serverScriptPath))
         {
@@ -357,10 +459,7 @@ internal static class AppBootstrapper
     {
         try
         {
-            using var probeClient = new HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(2)
-            };
+            using var probeClient = LocalAiPolicy.CreateHttpClient(true, TimeSpan.FromSeconds(2));
 
             // Any HTTP response, even an auth error, proves the server is up.
             using var response = await probeClient.GetAsync(

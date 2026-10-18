@@ -1097,10 +1097,10 @@ internal static class ChromeDevToolsAutomation
     }
 
     private static string GetStatePath(string workspaceRoot) =>
-        Path.Combine(workspaceRoot, "data", "automation", "chrome-devtools-session.json");
+        JarvisDataPaths.Resolve("data/automation/chrome-devtools-session.json");
 
     private static string GetProfileDirectory(string workspaceRoot) =>
-        Path.Combine(workspaceRoot, "data", "automation", "chrome-devtools-profile");
+        JarvisDataPaths.Resolve("data/automation/chrome-devtools-profile");
 
     private static string BuildLaunchArguments(string workspaceRoot, int port)
     {

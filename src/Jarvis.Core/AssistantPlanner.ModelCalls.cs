@@ -21,7 +21,8 @@ internal sealed partial class StructuredAssistantPlanner
             {
                 return await _modelGateway.CompleteAsync(request, route, cancellationToken);
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
+            // A model timeout is not retried: each attempt would hold the shared model slot for the full timeout again.
+            catch (Exception exception) when (exception is not OperationCanceledException and not TimeoutException)
             {
                 lastError = exception;
 

@@ -168,6 +168,8 @@ public sealed class StatusTool : IAssistantTool
             $"Ambient sensing: {(context.Options.AmbientContextEnabled ? "enabled" : "disabled")} | webcam {(string.IsNullOrWhiteSpace(context.Options.AmbientWebcamFramePath) ? "not configured" : "configured")} | room sensors {(string.IsNullOrWhiteSpace(context.Options.AmbientRoomSensorSnapshotPath) ? "not configured" : "configured")} | face recognition {(context.Options.AmbientFaceRecognitionEnabled ? (context.Options.AmbientFaceRecognitionConsentGranted ? "enabled with consent" : "blocked until consent is granted") : "disabled")} | spatial cues {(context.Options.SpatialAudioCuesEnabled ? "enabled" : "disabled")} | far-field {(context.Options.FarFieldListeningEnabled ? "enabled" : "disabled")}",
             $"Shell execution: {(context.Options.ShellExecutionEnabled ? "enabled" : "disabled")}",
             $"Action safety: {(context.Options.SafetyRequireApprovalForMajorActions ? "approval required for shell changes" : "approval disabled")} | {(context.Options.SafetyBlockProtectedSystemPaths ? "protected system paths blocked" : "protected system path blocking disabled")}",
+            $"Local AI mode: {(context.Options.LocalAiOnly ? "this computer only; hosted model, voice, and transcription routes blocked" : "remote AI providers permitted")}",
+            $"Background workflow limit: {Math.Clamp(context.Options.PlannerMaxConcurrentBackgroundTasks, 1, 4)}",
             $"Planner: {context.PlannerStatus}",
             $"Natural language understanding: {(context.PlannerAvailable ? "multi-step, structured tool-calling, verification-aware, and context-aware" : "command-driven only")}",
             $"Web research: {(context.Options.PlannerWebResearchEnabled ? "enabled" : "disabled")}",
@@ -383,9 +385,7 @@ public sealed class ReminderTool : IAssistantTool
         || input.Equals("show reminders", StringComparison.OrdinalIgnoreCase)
         || input.Equals("list reminders", StringComparison.OrdinalIgnoreCase)
         || input.StartsWith("reminders ", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("remind me ", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("set reminder ", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("set a reminder ", StringComparison.OrdinalIgnoreCase);
+        || MemoryAutomation.IsReminderRequest(input);
 
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
@@ -406,21 +406,31 @@ public sealed class ReminderTool : IAssistantTool
         var reminderInput = input.StartsWith("reminders ", StringComparison.OrdinalIgnoreCase)
             ? "remind me to " + input["reminders ".Length..].Trim()
             : input;
-        var memoryContext = await ToolInputHelper.BuildInteractionContextAsync(context, "manual reminder", cancellationToken);
-        var reminder = MemoryAutomation.BuildReminderMemory(reminderInput, memoryContext, DateTimeOffset.Now);
-
-        if (reminder is null)
+        if (!MemoryAutomation.TryParseReminder(reminderInput, DateTimeOffset.Now, out var reminderText, out var reminderAt))
         {
+            // Asks only for the missing part. The answer is appended to the follow-up command, so a short
+            // reply ("in 10 minutes", "take my medication") completes the reminder.
+            var (question, followUp) = (reminderText.Length > 0, reminderAt != default) switch
+            {
+                (true, false) => ("When should I remind you? For example, in 10 minutes or at 5.", $"remind me to {reminderText}"),
+                (true, true) => ("That time has already passed. When should I remind you?", $"remind me to {reminderText}"),
+                (false, true) => ("What should I remind you about?", reminderInput),
+                _ => ("What should I remind you about, and when?", "remind me")
+            };
+
             return new ToolResult(
-                "When should I remind you, and about what? For example: remind me to call Sam at 5, or remind me to stretch in 10 minutes.",
+                question,
                 Succeeded: false,
-                VerificationText: "The reminder request could not be parsed into a date and task.",
-                SummaryText: "Reminder parsing failed.");
+                VerificationText: "The reminder request is missing a task or a time.",
+                SummaryText: "Asked for the rest of the reminder.",
+                FollowUpCommand: followUp);
         }
 
+        var memoryContext = await ToolInputHelper.BuildInteractionContextAsync(context, "manual reminder", cancellationToken);
+        var reminder = MemoryAutomation.BuildReminderMemory(reminderText, reminderAt, memoryContext, DateTimeOffset.Now);
         await context.MemoryStore.AddAsync(reminder, cancellationToken);
         return new ToolResult(
-            $"Stored reminder: {reminder.ReminderText} at {reminder.ReminderAtUtc?.ToLocalTime():dddd, MMMM d h:mm tt}.",
+            $"Okay, I'll remind you {CalendarText.DescribeMoment(reminderAt.LocalDateTime, DateOnly.FromDateTime(DateTime.Now))}: {reminder.ReminderText}.",
             VerificationText: "The reminder memory was written to the local store.",
             SummaryText: "Stored one reminder.");
     }
@@ -1786,11 +1796,10 @@ internal static class ToolInputHelper
     {
         if (string.IsNullOrWhiteSpace(requestedPath))
         {
-            return Path.Combine(
-                context.WorkspaceRoot,
+            return JarvisDataPaths.Resolve(Path.Combine(
                 "data",
                 "exports",
-                $"{prefix}-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.{defaultExtension.TrimStart('.')}");
+                $"{prefix}-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.{defaultExtension.TrimStart('.')}"));
         }
 
         var trimmed = Environment.ExpandEnvironmentVariables(requestedPath.Trim().Trim('"'));

@@ -589,7 +589,7 @@ public sealed class PageTool(IBrowserPageReader? pageReader, IModelGateway? mode
     {
         if (modelGateway is not { IsAvailable: true })
         {
-            return new ToolResult("I need the local model running in LM Studio to summarize pages.", Succeeded: false);
+            return new ToolResult("I need the local model running to summarize pages. Run scripts\\Setup-LocalLlm.ps1 once, or start LM Studio.", Succeeded: false);
         }
 
         // With next to no text the model summarizes from what it already knows and invents the rest.

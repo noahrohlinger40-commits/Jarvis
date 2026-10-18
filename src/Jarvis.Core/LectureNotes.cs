@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -110,6 +111,16 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
         var audioFile = Path.GetFileName(recording.AudioPath);
         await File.WriteAllTextAsync(notePath, LectureNoteText.Render(_title, _startedAt, recording, audioFile, null), CancellationToken.None);
 
+        // Opened now, not after the notes: the model can take minutes, and Obsidian reloads the file when it's rewritten.
+        try
+        {
+            Process.Start(new ProcessStartInfo("obsidian://open?path=" + Uri.EscapeDataString(notePath)) { UseShellExecute = true });
+        }
+        catch
+        {
+            // Obsidian isn't installed: saving the notes must not fail over it.
+        }
+
         if (recording.Lines.Count == 0)
         {
             return new ToolResult($"I saved the {_title} recording, but I couldn't make out any speech in it.");
@@ -168,6 +179,13 @@ public static partial class LectureNoteText
     {
         var cleaned = Regex.Replace(name, @"[\\/:*?""<>|#^\[\]]", " ");
         cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim(' ', '.');
+
+        // Whisper sometimes writes a spoken name in lowercase ("demo day"); it becomes a title and a folder name.
+        if (!cleaned.Any(char.IsUpper))
+        {
+            cleaned = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(cleaned);
+        }
+
         return cleaned.Length == 0 ? "Lecture" : cleaned;
     }
 

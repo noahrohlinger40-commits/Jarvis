@@ -22,7 +22,7 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         options.SpeechRecognitionModel,
         OpenAiCompatibleVoiceRuntime.ResolveApiKey(options),
         options.SpeechRecognitionLanguage,
-        prompt: string.Empty);
+        prompt: string.Empty, localAiOnly: options.LocalAiOnly);
 
     private readonly List<TranscriptLine> _lines = [];
     private MicrophonePcmStream? _microphone;

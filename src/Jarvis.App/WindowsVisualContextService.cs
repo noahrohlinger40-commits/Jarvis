@@ -1935,7 +1935,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
 
     private string ResolveCaptureDirectory()
     {
-        return ResolvePath(string.IsNullOrWhiteSpace(_options.VisualCaptureDirectory)
+        return JarvisDataPaths.Resolve(string.IsNullOrWhiteSpace(_options.VisualCaptureDirectory)
             ? Path.Combine("data", "captures")
             : _options.VisualCaptureDirectory);
     }

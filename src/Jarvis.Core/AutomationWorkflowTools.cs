@@ -230,7 +230,7 @@ public sealed class MacroTool : IAssistantTool
                 SummaryText: "Missing macro command.");
         }
 
-        var store = new MacroStore(Path.Combine(context.WorkspaceRoot, "data", "automation", "macros.json"));
+        var store = new MacroStore(JarvisDataPaths.Resolve("data/automation/macros.json"));
         var macros = await store.LoadAsync(cancellationToken);
 
         switch (command.Action)

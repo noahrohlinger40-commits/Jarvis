@@ -179,10 +179,11 @@ internal sealed partial class JarvisMainForm : Form
         _ = InitializeRuntimeAsync();
     }
 
-    // The voice hotkey (speechRecognitionHotkey) works from any app: it stops Jarvis mid-reply and listens
-    // for a command, like saying "Jarvis". It is the reliable way to cut off a long page reading, since
-    // Jarvis can't always hear "Jarvis, stop" over its own voice. Registered per window handle, because
-    // moving to the tray recreates the handle.
+    // The voice hotkey (speechRecognitionHotkey) works from any app. While Jarvis talks it only stops the
+    // reply; otherwise it listens for a command, like saying "Jarvis". Stopping doesn't also listen, because
+    // whoever cuts Jarvis off usually keeps talking to the room, and that speech would run as a command.
+    // It is the reliable way to cut off a long page reading, since Jarvis can't always hear "Jarvis, stop"
+    // over its own voice. Registered per window handle, because moving to the tray recreates the handle.
     private const int WmHotkey = 0x0312;
     private const int VoiceHotkeyId = 1;
 
@@ -231,8 +232,10 @@ internal sealed partial class JarvisMainForm : Form
                 _context.Speaker.Interrupt();
                 AddBargeInTimelineEntry("hotkey");
             }
-
-            _currentVoiceRuntime.ListenForFollowUp();
+            else
+            {
+                _currentVoiceRuntime.ListenForFollowUp();
+            }
         }
 
         base.WndProc(ref m);

@@ -36,7 +36,7 @@ public sealed class CalendarTool : IAssistantTool
     {
         var tail = ToolInputHelper.GetCommandTail(input, "calendar").Trim();
         var now = DateTime.Now;
-        _client ??= new GoogleCalendarClient(ResolvePath(context.WorkspaceRoot, context.Options.GoogleCalendarClientSecretPath));
+        _client ??= new GoogleCalendarClient(JarvisDataPaths.Resolve(context.Options.GoogleCalendarClientSecretPath));
 
         try
         {
@@ -85,9 +85,6 @@ public sealed class CalendarTool : IAssistantTool
         return new ToolResult($"Added {request.Title} {CalendarText.DescribeWhen(request, DateOnly.FromDateTime(now))}"
             + (request.Color is null ? "." : $" in {request.Color.Name}."));
     }
-
-    private static string ResolvePath(string workspaceRoot, string path) =>
-        Path.IsPathRooted(path) ? path : Path.Combine(workspaceRoot, path);
 }
 
 /// <summary>Reads spoken or typed event descriptions: "dentist tomorrow at 3pm in red".</summary>
@@ -296,6 +293,10 @@ public static partial class CalendarText
             ? $"{date} at {FormatTime(request.Date.ToDateTime(start))}"
             : $"{date}, all day";
     }
+
+    /// <summary>"today at 8:01 PM", "tomorrow at 5 PM", "on Friday, October 2 at 3:30 PM".</summary>
+    public static string DescribeMoment(DateTime at, DateOnly today) =>
+        $"{DescribeDate(DateOnly.FromDateTime(at), today)} at {FormatTime(at)}";
 
     private static string DescribeDate(DateOnly day, DateOnly today) =>
         day == today ? "today"
