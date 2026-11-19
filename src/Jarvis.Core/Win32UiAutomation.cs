@@ -1,7 +1,7 @@
 // Win32UiAutomation.cs: the core of how Jarvis controls other programs' windows by talking to Windows directly (the Win32 API).
-// DesktopAutomationService (DesktopAutomation.cs) calls these methods for focus, close, minimise/maximise, click, type, read text, scroll and hotkeys.
+// DesktopAutomationService (DesktopAutomation.cs) calls these methods for focus, close, minimise/maximise, click, type, read text and hotkeys.
 // This is the simple "old Windows controls" approach: windows and their child controls are found by title and class name, not through UI Automation.
-// Other slices of the same class: Win32UiAutomation.Advanced.cs (move/resize/snap, media keys, clipboard, window listing) and Win32UiAutomation.Text.cs.
+// Other slices of the same class: Win32UiAutomation.Advanced.cs (media keys, window listing) and Win32UiAutomation.Text.cs.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -13,17 +13,14 @@ internal static partial class Win32UiAutomation
 {
     // Windows message numbers. A "message" is a small request sent to a window; the window's owner program reacts to it.
     // WM_CLOSE asks a window to close itself. WM_LBUTTONDOWN / WM_LBUTTONUP are a left mouse button press and release. WM_SETTEXT sets a control's text,
-    // WM_GETTEXT / WM_GETTEXTLENGTH read it, WM_VSCROLL scrolls vertically. BM_CLICK clicks a button. SB_LINEDOWN / SB_LINEUP mean "scroll one line down / up".
+    // WM_GETTEXT / WM_GETTEXTLENGTH read it. BM_CLICK clicks a button.
     private const uint WM_CLOSE = 0x0010;
     private const uint WM_LBUTTONDOWN = 0x0201;
     private const uint WM_LBUTTONUP = 0x0202;
     private const uint WM_SETTEXT = 0x000C;
     private const uint WM_GETTEXT = 0x000D;
     private const uint WM_GETTEXTLENGTH = 0x000E;
-    private const uint WM_VSCROLL = 0x0115;
     private const uint BM_CLICK = 0x00F5;
-    private const uint SB_LINEDOWN = 1;
-    private const uint SB_LINEUP = 0;
     // ShowWindow commands: show normally (5), minimise (6), restore (9), maximise (3).
     private const int SwShow = 5;
     private const int SwMinimize = 6;
@@ -64,11 +61,11 @@ internal static partial class Win32UiAutomation
 
     // GetWindowText: copies a window's title or a control's text into a buffer.
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    internal static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     // GetWindowTextLength: how many characters that text has.
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern int GetWindowTextLength(IntPtr hWnd);
+    internal static extern int GetWindowTextLength(IntPtr hWnd);
 
     // ShowWindowAsync: change a window's state (minimise, maximise, restore) without waiting for the other program.
     [DllImport("user32.dll", SetLastError = true)]
@@ -263,24 +260,6 @@ internal static partial class Win32UiAutomation
         var builder = new StringBuilder(length + 1);
         _ = SendMessageText(targetHandle, WM_GETTEXT, builder.Capacity, builder);
         return Task.FromResult(builder.ToString());
-    }
-
-    // Tool: scroll the window's main text area one line up or down.
-    public static Task<string> ScrollWindowAsync(string targetApp, string direction)
-    {
-        if (!TryResolveWindow(targetApp, out var window))
-        {
-            return Task.FromResult($"Window matching '{targetApp}' was not found.");
-        }
-
-        _ = TryBringWindowToFront(window.Handle);
-        var targetHandle = FindBestTextHandle(window.Handle);
-        var scrollCode = string.Equals(direction, "down", StringComparison.OrdinalIgnoreCase)
-            ? SB_LINEDOWN
-            : SB_LINEUP;
-
-        _ = SendMessage(targetHandle, WM_VSCROLL, (IntPtr)scrollCode, IntPtr.Zero);
-        return Task.FromResult($"Scrolled '{DescribeWindow(window)}' {direction}.");
     }
 
     // Tool: press a key combination in a window. The window is focused first, then a 120 ms pause lets focus settle before the keys are injected.
@@ -879,8 +858,8 @@ internal static partial class Win32UiAutomation
         return builder.ToString();
     }
 
-    // Reads a control's text.
-    private static string ReadWindowText(IntPtr handle)
+    // Reads a window's title bar text or a control's text. GetWindowTextLength says how long it is, GetWindowText copies it into a buffer (+1 for the end-of-string character).
+    internal static string ReadWindowText(IntPtr handle)
     {
         var length = GetWindowTextLength(handle);
 
@@ -977,8 +956,8 @@ internal static partial class Win32UiAutomation
             : window.Title;
     }
 
-    // Makes names comparable: lower-case, punctuation becomes spaces, repeated spaces collapse.
-    private static string NormalizeForMatching(string value)
+    // Makes names comparable: lower-case, punctuation becomes spaces, repeated spaces collapse. Shared by the app lookup and the app tools; the command catalog keeps its own variant that also drops apostrophes.
+    internal static string NormalizeForMatching(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
@@ -991,6 +970,12 @@ internal static partial class Win32UiAutomation
             .ToArray();
 
         return string.Join(' ', new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    // Returns "Unavailable" for blank text, otherwise the trimmed text. Shared by the desktop status text and the app tools.
+    internal static string OrUnavailable(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "Unavailable" : value.Trim();
     }
 
     // "1 character" or "N characters" for the reply.

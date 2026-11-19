@@ -1,7 +1,7 @@
 // VoiceAcousticEchoSuppressor.cs: stops Jarvis from hearing its own voice. While Jarvis is speaking, its sound comes back
 // into the microphone through the speakers ("acoustic echo"). Called once per microphone chunk by OpenAiCompatibleVoiceRuntime.
 // It learns how loud the echo normally is and only lets through sound clearly louder than that (the user talking over Jarvis).
-// All levels are 0..1 loudness values (see OpenAiCompatibleVoiceRuntime.CalculateRootMeanSquareLevel); thresholds come from the tuning profile.
+// All levels are 0..1 loudness values (see AudioLevels.Rms); thresholds come from the tuning profile.
 using Jarvis.Core;
 
 namespace Jarvis.App;

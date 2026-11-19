@@ -1,6 +1,6 @@
-// UiControlTools.cs: assistant tools for window and control actions (focus, close, minimise/maximise, hotkey, click, type, read text, scroll, wait).
+// UiControlTools.cs: assistant tools for window and control actions (focus, close, minimise/maximise, hotkey, click, type, read text, wait).
 // Each tool follows the IAssistantTool pattern: CanHandle says whether a typed command is for it, ExecuteAsync parses it with UiCommandParsing
-// (bottom of this file) and calls IDesktopAutomationService, which reaches Win32UiAutomation. Window listing, move/resize/snap, media and clipboard tools are in DesktopAutomationAdvancedTools.cs.
+// (bottom of this file) and calls IDesktopAutomationService, which reaches Win32UiAutomation. Window listing and media tools are in DesktopAutomationAdvancedTools.cs.
 // Every CanHandle refuses vague targets like "it" or "that one": the tool cannot know which window those mean, so it does not guess.
 using System.Globalization;
 
@@ -260,50 +260,6 @@ public sealed class GetElementTextTool : IAssistantTool
     }
 }
 
-// Tool: scroll a window up or down, repeated up to 10 times. It stops at the first failure.
-public sealed class ScrollWindowTool : IAssistantTool
-{
-    public string Name => "scroll";
-
-    public string Description => "Scroll a target window. `scroll notepad down` or `scroll notepad up 3`.";
-
-    public bool CanHandle(string input)
-    {
-        var matches = ToolInputHelper.StartsWithCommand(input, Name)
-            || input.StartsWith("move down ", StringComparison.OrdinalIgnoreCase)
-            || input.StartsWith("move up ", StringComparison.OrdinalIgnoreCase);
-
-        return matches
-            && (!UiCommandParsing.TryParseScrollCommand(input, out var target, out _, out _)
-                || !UiCommandParsing.LooksLikeContextualReferenceTarget(target));
-    }
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!UiCommandParsing.TryParseScrollCommand(input, out var target, out var direction, out var count))
-        {
-            return new ToolResult("Usage: scroll <window> <up|down> [count]");
-        }
-
-        string result = string.Empty;
-
-        for (var index = 0; index < count; index++)
-        {
-            result = await context.DesktopAutomation.ScrollWindowAsync(target, direction, cancellationToken);
-
-            if (UiCommandParsing.LooksLikeFailure(result))
-            {
-                return new ToolResult(result, VerificationText: result, SummaryText: "Scroll failed.");
-            }
-        }
-
-        var response = count == 1
-            ? result
-            : $"Scrolled '{target}' {direction} {count} times.";
-        return new ToolResult(response, VerificationText: response, SummaryText: "Scrolled window.");
-    }
-}
-
 // Tool: pause between steps, 0 to 30 seconds.
 public sealed class WaitTool : IAssistantTool
 {
@@ -370,22 +326,11 @@ internal static partial class UiCommandParsing
         return TryParseTargetAndPayload(input, out target, out hotkey, "send hotkey", "press key", "send shortcut", "shortcut");
     }
 
-    public static bool TryParseClickTarget(string input, out string target)
-    {
-        return TryParseClickTarget(input, out target, out _);
-    }
-
     // "click element notepad :: save" or "click save": the part before "::" is the window and the optional part after it is the control.
     public static bool TryParseClickTarget(string input, out string target, out string elementName)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "click element", "click", "tap");
         return TryParseTargetAndOptionalElement(remainder, out target, out elementName);
-    }
-
-    public static bool TryParseTypeInto(string input, out string target, out string text)
-    {
-        var parsed = TryParseTypeInto(input, out target, out _, out text);
-        return parsed;
     }
 
     // Type commands have three accepted shapes: "type into window :: field :: text"; "type into window text"; and natural "type hello into notepad" (text first, then " into " and the window).
@@ -436,69 +381,10 @@ internal static partial class UiCommandParsing
         return false;
     }
 
-    public static bool TryParseGetTextTarget(string input, out string target)
-    {
-        return TryParseGetTextTarget(input, out target, out _);
-    }
-
     public static bool TryParseGetTextTarget(string input, out string target, out string elementName)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "get element text", "read element", "element text", "what text");
         return TryParseTargetAndOptionalElement(remainder, out target, out elementName);
-    }
-
-    // Scroll command: "scroll window [up|down] [count]", or "move down/up <window>". The count is limited to 1..10; direction defaults to down.
-    public static bool TryParseScrollCommand(string input, out string target, out string direction, out int count)
-    {
-        direction = "down";
-        count = 1;
-        var remainder = string.Empty;
-
-        if (ToolInputHelper.StartsWithCommand(input, "move down"))
-        {
-            remainder = ToolInputHelper.GetCommandTail(input, "move down");
-        }
-        else if (ToolInputHelper.StartsWithCommand(input, "move up"))
-        {
-            remainder = ToolInputHelper.GetCommandTail(input, "move up");
-            direction = "up";
-        }
-        else
-        {
-            remainder = ToolInputHelper.GetCommandTail(input, "scroll", "scroll window");
-        }
-
-        if (string.IsNullOrWhiteSpace(remainder))
-        {
-            target = string.Empty;
-            return false;
-        }
-
-        var tokens = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
-
-        if (tokens.Count == 0)
-        {
-            target = string.Empty;
-            return false;
-        }
-
-        if (tokens.Count > 1
-            && int.TryParse(tokens[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedCount))
-        {
-            count = Math.Clamp(parsedCount, 1, 10);
-            tokens.RemoveAt(tokens.Count - 1);
-        }
-
-        if (tokens.Count > 1
-            && (tokens[^1].Equals("up", StringComparison.OrdinalIgnoreCase)
-                || tokens[^1].Equals("down", StringComparison.OrdinalIgnoreCase)))
-        {
-            direction = tokens[^1].ToLowerInvariant();
-            tokens.RemoveAt(tokens.Count - 1);
-        }
-
-        target = string.Join(' ', tokens).Trim();
-        return !string.IsNullOrWhiteSpace(target);
     }
 
     // Wait seconds: accepts a plain number; tries the invariant culture (1.5) and then the PC's own culture (1,5).
@@ -510,8 +396,8 @@ internal static partial class UiCommandParsing
             || double.TryParse(value, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out seconds);
     }
 
-    // Jarvis's own "not found" failures all start with one of these. Only the start counts, so text a tool reads back (the
-    // clipboard, a control's text) that happens to say "command not found" is not a failure. Also used by JarvisAssistant.InferToolError.
+    // Jarvis's own "not found" failures all start with one of these. Only the start counts, so text a tool reads back (a
+    // control's text) that happens to say "command not found" is not a failure. Also used by JarvisAssistant.InferToolError.
     internal static readonly string[] NotFoundPrefixes =
         ["path not found", "file not found", "directory not found", "image file not found", "document not found", "selector not found", "window matching '", "element matching '"];
 

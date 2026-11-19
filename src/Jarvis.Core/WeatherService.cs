@@ -68,7 +68,9 @@ public sealed class OpenMeteoWeatherService : IWeatherService
         var currentUnits = root.TryGetProperty("current_units", out var units) ? units : default;
         var temperature = GetDouble(current, "temperature_2m");
         var apparentTemperature = GetDouble(current, "apparent_temperature");
-        var weatherCode = GetInt32(current, "weather_code");
+        // A missing or non-numeric weather code becomes -1, which DescribeWeatherCode reports as unknown.
+        var weatherCode = current.TryGetProperty("weather_code", out var codeProperty)
+            && codeProperty.ValueKind == JsonValueKind.Number && codeProperty.TryGetInt32(out var codeValue) ? codeValue : -1;
         var windSpeed = GetDouble(current, "wind_speed_10m");
         var windDirection = GetDouble(current, "wind_direction_10m");
         var observationTime = GetString(current, "time");
@@ -177,7 +179,7 @@ public sealed class OpenMeteoWeatherService : IWeatherService
         return double.IsNaN(value) ? "n/a" : value.ToString("0.#", CultureInfo.InvariantCulture);
     }
 
-    // The Get* helpers read a JSON property safely. Missing or wrong-typed values become null, NaN (doubles) or -1 (integers) instead of throwing.
+    // The Get* helpers read a JSON property safely. Missing or wrong-typed values become null or NaN (doubles) instead of throwing.
     private static string? GetString(JsonElement element, string propertyName)
     {
         if (element.ValueKind == JsonValueKind.Undefined || !element.TryGetProperty(propertyName, out var property))
@@ -200,18 +202,6 @@ public sealed class OpenMeteoWeatherService : IWeatherService
         return property.ValueKind == JsonValueKind.Number && property.TryGetDouble(out var value)
             ? value
             : double.NaN;
-    }
-
-    private static int GetInt32(JsonElement element, string propertyName)
-    {
-        if (!element.TryGetProperty(propertyName, out var property))
-        {
-            return -1;
-        }
-
-        return property.ValueKind == JsonValueKind.Number && property.TryGetInt32(out var value)
-            ? value
-            : -1;
     }
 
     // A place found by geocoding: coordinates, a display name and its time zone.

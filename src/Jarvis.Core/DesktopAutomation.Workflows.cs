@@ -4,6 +4,7 @@
 using System.Diagnostics;
 using System.Security;
 using System.Text;
+using static Jarvis.Core.Win32UiAutomation;
 
 namespace Jarvis.Core;
 

@@ -857,13 +857,9 @@ internal sealed partial class StructuredAssistantPlanner
             }
         }
 
-        if (UiCommandParsing.TryParseClickTarget(normalized, out var clickTarget)
-            || UiCommandParsing.TryParseGetTextTarget(normalized, out clickTarget)
-            || UiCommandParsing.TryParseTypeInto(normalized, out clickTarget, out _)
-            || UiCommandParsing.TryParseScrollCommand(normalized, out clickTarget, out _, out _)
-            || UiCommandParsing.TryParseMoveWindow(normalized, out clickTarget, out _, out _)
-            || UiCommandParsing.TryParseResizeWindow(normalized, out clickTarget, out _, out _)
-            || UiCommandParsing.TryParseSnapWindow(normalized, out clickTarget, out _)
+        if (UiCommandParsing.TryParseClickTarget(normalized, out var clickTarget, out _)
+            || UiCommandParsing.TryParseGetTextTarget(normalized, out clickTarget, out _)
+            || UiCommandParsing.TryParseTypeInto(normalized, out clickTarget, out _, out _)
             || UiCommandParsing.TryParseWindowState(normalized, out clickTarget, out _))
         {
             candidate = new ReferenceCandidate("app", clickTarget.Trim(), $"the window `{TruncateForContext(clickTarget, 56)}`");
@@ -1657,20 +1653,9 @@ internal sealed partial class StructuredAssistantPlanner
                 return true;
             }
 
-            if (UiCommandParsing.TryParseTypeInto($"type into {trimmedInput}", out var typeTarget, out _))
+            if (UiCommandParsing.TryParseTypeInto($"type into {trimmedInput}", out var typeTarget, out _, out _))
             {
                 candidate = new ReferenceCandidate("app", typeTarget, $"the window `{TruncateForContext(typeTarget, 56)}`");
-                return true;
-            }
-
-            return false;
-        }
-
-        if (normalizedTool is "scroll")
-        {
-            if (UiCommandParsing.TryParseScrollCommand($"scroll {trimmedInput}", out var scrollTarget, out _, out _))
-            {
-                candidate = new ReferenceCandidate("app", scrollTarget, $"the window `{TruncateForContext(scrollTarget, 56)}`");
                 return true;
             }
 
@@ -1688,57 +1673,11 @@ internal sealed partial class StructuredAssistantPlanner
             return false;
         }
 
-        if (normalizedTool is "move window")
-        {
-            if (UiCommandParsing.TryParseMoveWindow($"move window {trimmedInput}", out var moveTarget, out _, out _))
-            {
-                candidate = new ReferenceCandidate("app", moveTarget, $"the window `{TruncateForContext(moveTarget, 56)}`");
-                return true;
-            }
-
-            return false;
-        }
-
-        if (normalizedTool is "resize window")
-        {
-            if (UiCommandParsing.TryParseResizeWindow($"resize window {trimmedInput}", out var resizeTarget, out _, out _))
-            {
-                candidate = new ReferenceCandidate("app", resizeTarget, $"the window `{TruncateForContext(resizeTarget, 56)}`");
-                return true;
-            }
-
-            return false;
-        }
-
-        if (normalizedTool is "snap window")
-        {
-            if (UiCommandParsing.TryParseSnapWindow($"snap window {trimmedInput}", out var snapTarget, out _))
-            {
-                candidate = new ReferenceCandidate("app", snapTarget, $"the window `{TruncateForContext(snapTarget, 56)}`");
-                return true;
-            }
-
-            return false;
-        }
-
         if (normalizedTool is "send hotkey")
         {
             if (UiCommandParsing.TryParseHotkeyCommand($"send hotkey {trimmedInput}", out var hotkeyTarget, out _))
             {
                 candidate = new ReferenceCandidate("app", hotkeyTarget, $"the window `{TruncateForContext(hotkeyTarget, 56)}`");
-                return true;
-            }
-
-            return false;
-        }
-
-        if (normalizedTool is "clipboard")
-        {
-            if (UiCommandParsing.TryParseClipboardCommand($"clipboard {trimmedInput}".Trim(), out var clipboardAction, out var clipboardPayload)
-                && string.Equals(clipboardAction, "paste", StringComparison.OrdinalIgnoreCase)
-                && !string.IsNullOrWhiteSpace(clipboardPayload))
-            {
-                candidate = new ReferenceCandidate("app", clipboardPayload, $"the window `{TruncateForContext(clipboardPayload, 56)}`");
                 return true;
             }
 
@@ -2183,29 +2122,6 @@ internal sealed partial class StructuredAssistantPlanner
             return true;
         }
 
-        if (ToolInputHelper.StartsWithCommand(value, "move window")
-            || ToolInputHelper.StartsWithCommand(value, "move app")
-            || ToolInputHelper.StartsWithCommand(value, "position window"))
-        {
-            toolName = "move window";
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(value, "resize window")
-            || ToolInputHelper.StartsWithCommand(value, "resize app"))
-        {
-            toolName = "resize window";
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(value, "snap window")
-            || ToolInputHelper.StartsWithCommand(value, "snap app")
-            || ToolInputHelper.StartsWithCommand(value, "dock window"))
-        {
-            toolName = "snap window";
-            return true;
-        }
-
         if (ToolInputHelper.StartsWithCommand(value, "send hotkey")
             || ToolInputHelper.StartsWithCommand(value, "press key")
             || ToolInputHelper.StartsWithCommand(value, "send shortcut")
@@ -2260,34 +2176,9 @@ internal sealed partial class StructuredAssistantPlanner
             return true;
         }
 
-        if (ToolInputHelper.StartsWithCommand(value, "office")
-            || ToolInputHelper.StartsWithCommand(value, "word")
-            || ToolInputHelper.StartsWithCommand(value, "excel")
-            || ToolInputHelper.StartsWithCommand(value, "powerpoint")
-            || ToolInputHelper.StartsWithCommand(value, "power point")
-            || ToolInputHelper.StartsWithCommand(value, "ppt")
-            || ToolInputHelper.StartsWithCommand(value, "outlook"))
-        {
-            toolName = "office";
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(value, "explorer")
-            || ToolInputHelper.StartsWithCommand(value, "file explorer"))
-        {
-            toolName = "explorer";
-            return true;
-        }
-
         if (ToolInputHelper.StartsWithCommand(value, "discord"))
         {
             toolName = "discord";
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(value, "slack"))
-        {
-            toolName = "slack";
             return true;
         }
 
@@ -2317,20 +2208,6 @@ internal sealed partial class StructuredAssistantPlanner
             return true;
         }
 
-        if (ToolInputHelper.StartsWithCommand(value, "clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "show clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "get clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "read clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "set clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "copy to clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "clear clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "empty clipboard")
-            || ToolInputHelper.StartsWithCommand(value, "paste clipboard"))
-        {
-            toolName = "clipboard";
-            return true;
-        }
-
         // Questions about what is on the PC right now go to the "computer" tool, which reports the active window and running apps.
         if (value.Contains("what app am i in", StringComparison.OrdinalIgnoreCase)
             || value.Contains("what's open", StringComparison.OrdinalIgnoreCase)
@@ -2349,7 +2226,6 @@ internal sealed partial class StructuredAssistantPlanner
         if (value.Contains("network", StringComparison.OrdinalIgnoreCase)
             || value.Contains("router", StringComparison.OrdinalIgnoreCase)
             || value.Contains("gateway", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("devices on my network", StringComparison.OrdinalIgnoreCase)
             || value.Contains("local lan", StringComparison.OrdinalIgnoreCase)
             || value.Contains("lan device", StringComparison.OrdinalIgnoreCase)
             || value.Contains("wifi device", StringComparison.OrdinalIgnoreCase))
@@ -2694,26 +2570,19 @@ internal sealed partial class StructuredAssistantPlanner
             "spotify" => ExtractDirectToolInput(normalized, "spotify"),
             "code" => ExtractDirectToolInput(normalized, "code", "vscode", "vs code"),
             "chrome" => ExtractDirectToolInput(normalized, "chrome"),
-            "office" => ExtractDirectToolInput(normalized, "office", "word", "excel", "powerpoint", "power point", "ppt", "outlook"),
-            "explorer" => ExtractDirectToolInput(normalized, "explorer", "file explorer"),
             "discord" => ExtractDirectToolInput(normalized, "discord"),
-            "slack" => ExtractDirectToolInput(normalized, "slack"),
             "windows" => ExtractDirectToolInput(normalized, "windows", "list windows", "show windows", "visible windows"),
             "click element" => ExtractDirectToolInput(normalized, "click element", "click", "tap"),
             "get element text" => ExtractDirectToolInput(normalized, "get element text", "read element", "element text", "what text", "get text from", "read text from"),
             "type into" => ExtractDirectToolInput(normalized, "type into", "types into", "enter into", "input into", "write into"),
             "close app" => ExtractDirectToolInput(normalized, "close app", "close window", "quit app"),
             "window state" => ExtractDirectToolInput(normalized, "window state", "minimize app", "maximize app", "restore app", "minimize window", "maximize window", "restore window"),
-            "move window" => ExtractDirectToolInput(normalized, "move window", "move app", "position window"),
-            "resize window" => ExtractDirectToolInput(normalized, "resize window", "resize app"),
-            "snap window" => ExtractDirectToolInput(normalized, "snap window", "snap app", "dock window"),
             "send hotkey" => ExtractDirectToolInput(normalized, "send hotkey", "press key", "send shortcut", "shortcut"),
             "open path" => ExtractDirectToolInput(normalized, "open path", "open file", "open folder"),
             "read file" => ExtractDirectToolInput(normalized, "read file", "show file", "preview file"),
             "browse" => ExtractDirectToolInput(normalized, "browse", "open website", "go to", "visit"),
             "search web" => ExtractDirectToolInput(normalized, "search web", "web search"),
             "media" => ExtractMediaToolInput(normalized),
-            "clipboard" => ExtractClipboardToolInput(normalized),
             "screen" => ExtractVisualToolInput(normalized),
             "analyze image" => ExtractDocumentToolInput(normalized, "analyze image", "inspect image"),
             "analyze document" => ExtractDocumentToolInput(normalized, "analyze document", "inspect document"),
@@ -2795,41 +2664,6 @@ internal sealed partial class StructuredAssistantPlanner
 
             var tail = ToolInputHelper.GetCommandTail(normalized, prefix);
             return string.IsNullOrWhiteSpace(tail) ? prefix : $"{prefix} {tail}";
-        }
-
-        return normalized;
-    }
-
-    // Maps clipboard phrases to the clipboard tool's argument: empty to show, "clear", "set <text>", or "paste <target>".
-    private static string ExtractClipboardToolInput(string normalized)
-    {
-        if (ToolInputHelper.MatchesExact(normalized, "clipboard", "show clipboard", "get clipboard", "read clipboard", "clipboard show"))
-        {
-            return string.Empty;
-        }
-
-        if (ToolInputHelper.MatchesExact(normalized, "clear clipboard", "clipboard clear", "empty clipboard"))
-        {
-            return "clear";
-        }
-
-        if (ToolInputHelper.StartsWithCommand(normalized, "set clipboard")
-            || ToolInputHelper.StartsWithCommand(normalized, "copy to clipboard")
-            || ToolInputHelper.StartsWithCommand(normalized, "clipboard set"))
-        {
-            var tail = ToolInputHelper.GetCommandTail(normalized, "set clipboard", "copy to clipboard", "clipboard set");
-            return string.IsNullOrWhiteSpace(tail) ? "set" : $"set {tail}";
-        }
-
-        if (ToolInputHelper.StartsWithCommand(normalized, "paste clipboard into")
-            || ToolInputHelper.StartsWithCommand(normalized, "paste clipboard")
-            || ToolInputHelper.StartsWithCommand(normalized, "clipboard paste"))
-        {
-            var tail = ToolInputHelper.GetCommandTail(normalized, "paste clipboard into", "paste clipboard", "clipboard paste");
-            tail = tail.StartsWith("into ", StringComparison.OrdinalIgnoreCase)
-                ? tail["into ".Length..].Trim()
-                : tail;
-            return string.IsNullOrWhiteSpace(tail) ? "paste" : $"paste {tail}";
         }
 
         return normalized;
@@ -3016,12 +2850,7 @@ internal sealed partial class StructuredAssistantPlanner
     }
 
     // Shortens an error message to 280 characters so it fits in a status line.
-    private static string TrimError(string text)
-    {
-        const int maxLength = 280;
-        var value = text.Trim();
-        return value.Length <= maxLength ? value : value[..maxLength] + "...";
-    }
+    private static string TrimError(string text) => text.Clip(280);
 
     // Limits on how much tool output the model sees: one result may use up to 1500 characters, all results
     // of one turn share a 4000-character budget, and a result is never cut below 220 characters.

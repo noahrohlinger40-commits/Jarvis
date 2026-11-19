@@ -53,10 +53,6 @@ internal sealed partial class StructuredAssistantPlanner
             decision = new IntentDecision(
                 ShouldRunInBackground(request.UserInput) ? AgentIntentKind.Background : AgentIntentKind.Planner,
                 $"resuming persisted {resumedSession.Status} workflow",
-                ToolHint: string.Empty,
-                ToolInput: string.Empty,
-                AskFollowUp: false,
-                FollowUpQuestion: string.Empty,
                 RunInBackground: ShouldRunInBackground(request.UserInput));
         }
         else
@@ -98,12 +94,7 @@ internal sealed partial class StructuredAssistantPlanner
         {
             return new IntentDecision(
                 AgentIntentKind.Planner,
-                "continuing pending clarification",
-                ToolHint: string.Empty,
-                ToolInput: string.Empty,
-                AskFollowUp: false,
-                FollowUpQuestion: string.Empty,
-                RunInBackground: false);
+                "continuing pending clarification");
         }
 
         if (LooksAmbiguous(input))
@@ -111,11 +102,8 @@ internal sealed partial class StructuredAssistantPlanner
             return new IntentDecision(
                 AgentIntentKind.Clarification,
                 "request is ambiguous",
-                ToolHint: string.Empty,
-                ToolInput: string.Empty,
                 AskFollowUp: true,
-                FollowUpQuestion: BuildClarificationQuestion(input, request),
-                RunInBackground: false);
+                FollowUpQuestion: BuildClarificationQuestion(input, request));
         }
 
         if (TryInferToolHint(input, out var toolHint))
@@ -130,22 +118,14 @@ internal sealed partial class StructuredAssistantPlanner
                 intent,
                 "matched a cheap local tool route",
                 toolHint,
-                ExtractNaturalToolInput(input, toolHint),
-                AskFollowUp: false,
-                FollowUpQuestion: string.Empty,
-                RunInBackground: false);
+                ExtractNaturalToolInput(input, toolHint));
         }
 
         if (LooksLikeSimpleReply(input))
         {
             return new IntentDecision(
                 AgentIntentKind.SimpleReply,
-                "small conversational request",
-                ToolHint: string.Empty,
-                ToolInput: string.Empty,
-                AskFollowUp: false,
-                FollowUpQuestion: string.Empty,
-                RunInBackground: false);
+                "small conversational request");
         }
 
         if (LooksLikeResearchRequest(input))
@@ -153,10 +133,6 @@ internal sealed partial class StructuredAssistantPlanner
             return new IntentDecision(
                 AgentIntentKind.Research,
                 "open-domain research request",
-                ToolHint: string.Empty,
-                ToolInput: string.Empty,
-                AskFollowUp: false,
-                FollowUpQuestion: string.Empty,
                 RunInBackground: ShouldRunInBackground(input));
         }
 
@@ -165,21 +141,12 @@ internal sealed partial class StructuredAssistantPlanner
             return new IntentDecision(
                 ShouldRunInBackground(input) ? AgentIntentKind.Background : AgentIntentKind.Planner,
                 "explicit action workflow",
-                ToolHint: string.Empty,
-                ToolInput: string.Empty,
-                AskFollowUp: false,
-                FollowUpQuestion: string.Empty,
                 RunInBackground: ShouldRunInBackground(input));
         }
 
         return new IntentDecision(
             AgentIntentKind.SimpleReply,
-            "assistant conversational reply",
-            ToolHint: string.Empty,
-            ToolInput: string.Empty,
-            AskFollowUp: false,
-            FollowUpQuestion: string.Empty,
-            RunInBackground: false);
+            "assistant conversational reply");
     }
 
     // Decides whether the guess needs a second opinion from the model. Strong guesses (tool, research, planner) are trusted;
@@ -640,11 +607,11 @@ internal sealed partial class StructuredAssistantPlanner
     private sealed record IntentDecision(
         AgentIntentKind Intent,
         string Reason,
-        string ToolHint,
-        string ToolInput,
-        bool AskFollowUp,
-        string FollowUpQuestion,
-        bool RunInBackground);
+        string ToolHint = "",
+        string ToolInput = "",
+        bool AskFollowUp = false,
+        string FollowUpQuestion = "",
+        bool RunInBackground = false);
 
     // The JSON shape the classifier model is asked to return.
     private sealed record IntentClassificationContract(
@@ -698,47 +665,22 @@ internal sealed partial class StructuredAssistantPlanner
             .ToLowerInvariant();
     }
 
-    // Maps a route back to the label the classifier prompt uses (Background is shown to the model as "planner").
+    // Maps a route back to the label the classifier prompt uses: the enum name in snake case ("direct_tool"); Background is shown to the model as "planner".
     private static string MapIntentToClassifierValue(AgentIntentKind intent) =>
-        intent switch
-        {
-            AgentIntentKind.DirectTool => "direct_tool",
-            AgentIntentKind.Clarification => "clarification",
-            AgentIntentKind.SimpleReply => "simple_reply",
-            AgentIntentKind.Planner => "planner",
-            AgentIntentKind.Research => "research",
-            AgentIntentKind.Visual => "visual",
-            AgentIntentKind.Background => "planner",
-            _ => "simple_reply"
-        };
+        intent == AgentIntentKind.Background
+            ? "planner"
+            : Regex.Replace(intent.ToString(), "(?<=[a-z])(?=[A-Z])", "_").ToLowerInvariant();
 
-    // Maps the label returned by the model to a route; false for anything unrecognised.
+    // Maps the label returned by the model to a route by enum name (spaces dropped, case ignored); false for anything unrecognised.
+    // Letters only, because Enum.TryParse would also accept numbers and comma lists. Background is a route Jarvis picks itself, never a label the model may answer with.
     private static bool TryMapClassifierIntent(string? value, out AgentIntentKind intent)
     {
-        switch (NormalizeClassifierLabel(value))
-        {
-            case "direct tool":
-                intent = AgentIntentKind.DirectTool;
-                return true;
-            case "clarification":
-                intent = AgentIntentKind.Clarification;
-                return true;
-            case "simple reply":
-                intent = AgentIntentKind.SimpleReply;
-                return true;
-            case "planner":
-                intent = AgentIntentKind.Planner;
-                return true;
-            case "research":
-                intent = AgentIntentKind.Research;
-                return true;
-            case "visual":
-                intent = AgentIntentKind.Visual;
-                return true;
-            default:
-                intent = AgentIntentKind.SimpleReply;
-                return false;
-        }
+        var label = NormalizeClassifierLabel(value).Replace(" ", string.Empty);
+        intent = AgentIntentKind.SimpleReply;
+        return label.Length > 0
+            && label.All(char.IsLetter)
+            && Enum.TryParse(label, ignoreCase: true, out intent)
+            && intent != AgentIntentKind.Background;
     }
 
     // Matches the model's tool name against the real tool list (by API name or command name); unknown names give an empty string.

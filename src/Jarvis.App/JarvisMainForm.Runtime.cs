@@ -739,7 +739,7 @@ internal sealed partial class JarvisMainForm
         };
     }
 
-    // The user picked a beamforming profile; "off" turns beamforming off entirely.
+    // The user picked a beamforming profile; "off" keeps the speech path in plain near-field mode.
     private async Task OnBeamformingProfileSelectionChangedAsync()
     {
         if (_beamformingProfileComboBox.SelectedIndex < 0
@@ -757,8 +757,7 @@ internal sealed partial class JarvisMainForm
 
         _currentOptions = _currentOptions with
         {
-            SpeechRecognitionBeamformingProfile = selectedProfile.Name,
-            SpeechRecognitionBeamformingEnabled = !string.Equals(selectedProfile.Name, "off", StringComparison.OrdinalIgnoreCase)
+            SpeechRecognitionBeamformingProfile = selectedProfile.Name
         };
 
         UpdateCalibrationUi();
@@ -1756,10 +1755,7 @@ internal sealed partial class JarvisMainForm
                 "spotify",
                 "code",
                 "chrome",
-                "explorer",
-                "office",
                 "discord",
-                "slack",
                 "screen"
             }.Contains(toolName, StringComparer.OrdinalIgnoreCase))
         {
@@ -2424,7 +2420,7 @@ internal sealed partial class JarvisMainForm
             return "Opening it.";
         }
 
-        if (StartsWithDirective(normalized, "focus app", "window state", "move window", "resize window", "snap window", "send hotkey", "click element", "type into", "get element text", "scroll"))
+        if (StartsWithDirective(normalized, "focus app", "window state", "send hotkey", "click element", "type into", "get element text"))
         {
             return "Working the desktop.";
         }

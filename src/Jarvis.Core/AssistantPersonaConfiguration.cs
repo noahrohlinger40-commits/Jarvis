@@ -1,7 +1,7 @@
 // AssistantPersonaConfiguration.cs: turns the personality settings in JarvisOptions (persona text, presence preset,
 // response style, nickname, pronunciation hints) into the instruction text that is put into the model's prompt, and picks the
 // speaking speed of the built-in Windows voice. Everything here only builds strings or picks valid values; nothing is
-// sent anywhere. Learned habits come in from the memory profile (MemoryProfileSnapshot).
+// sent anywhere.
 namespace Jarvis.Core;
 
 // Static helpers; there is no state, each method reads the options it is given.
@@ -132,7 +132,7 @@ public static class AssistantPersonaConfiguration
     }
 
     // Builds the block of "how to behave" lines added to the model prompt: preset, style, small talk, nickname,
-    // pronunciation hints, then preferences learned from memory (at most 3 or 4 of each kind, most often observed first).
+    // pronunciation hints.
     public static string BuildPresenceGuidance(JarvisOptions options, MemoryProfileSnapshot? memoryProfile = null)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -162,67 +162,6 @@ public static class AssistantPersonaConfiguration
             lines.AddRange(pronunciationHints.Take(4).Select(value => $"- {value}"));
         }
 
-        if (memoryProfile is not null)
-        {
-            // Tone and phrasing preferences the user has shown over time.
-            var learnedPreferences = memoryProfile.Preferences
-                .Where(preference =>
-                    string.Equals(preference.Category, "tone", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(preference.Category, "response style", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(preference.Category, "conversation", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(preference.Category, "phrasing", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(preference => preference.ObservationCount)
-                .ThenByDescending(preference => preference.LastObservedAtUtc)
-                .Select(preference => TrimPreferenceSentence(preference.Value))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(4)
-                .ToArray();
-
-            if (learnedPreferences.Length > 0)
-            {
-                lines.Add("Learned presence preferences:");
-                lines.AddRange(learnedPreferences.Select(value => $"- {value}"));
-            }
-
-            // Preferences about apps, automations and places.
-            var workflowPreferences = memoryProfile.Preferences
-                .Where(preference =>
-                    string.Equals(preference.Category, "apps", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(preference.Category, "automations", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(preference.Category, "locations", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(preference => preference.ObservationCount)
-                .ThenByDescending(preference => preference.LastObservedAtUtc)
-                .Select(preference => TrimPreferenceSentence(preference.Value))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(4)
-                .ToArray();
-
-            if (workflowPreferences.Length > 0)
-            {
-                lines.Add("Learned workflow preferences:");
-                lines.AddRange(workflowPreferences.Select(value => $"- {value}"));
-            }
-
-            // Saved routines and habits (uses the summary when there is one, otherwise the name).
-            var routinesAndHabits = memoryProfile.StructuredMemories
-                .Where(memory =>
-                    string.Equals(memory.Kind, "routine", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(memory.Kind, "habit", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(memory.Kind, "other", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(memory => memory.ObservationCount)
-                .ThenByDescending(memory => memory.LastObservedAtUtc)
-                .Select(memory => TrimPreferenceSentence(string.IsNullOrWhiteSpace(memory.Summary) ? memory.Name : memory.Summary))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(3)
-                .ToArray();
-
-            if (routinesAndHabits.Length > 0)
-            {
-                lines.Add("Learned user routines and habits:");
-                lines.AddRange(routinesAndHabits.Select(value => $"- {value}"));
-            }
-        }
-
         lines.Add("Warmth and emotional tone may flex slightly with context, but stay technically grounded and avoid theatrical overreaction.");
         return string.Join(Environment.NewLine, lines);
     }
@@ -240,9 +179,7 @@ public static class AssistantPersonaConfiguration
 
         return (ResolvePresencePreset(options), ResolveResponseStyle(options)) switch
         {
-            ("operator", "concise") => 1,
             ("operator", _) => 1,
-            ("warm", "detailed") => -1,
             ("warm", _) => -1,
             ("cinematic", _) => -1,
             (_, "concise") => 1,
@@ -306,17 +243,5 @@ public static class AssistantPersonaConfiguration
 
         var remainder = value[(index + marker.Length)..].Trim().TrimEnd('.', '!', '?');
         return string.IsNullOrWhiteSpace(remainder) ? null : remainder;
-    }
-
-    // Removes one trailing full stop so preferences read cleanly as bullet points.
-    private static string TrimPreferenceSentence(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var trimmed = value.Trim();
-        return trimmed.EndsWith('.') ? trimmed[..^1] : trimmed;
     }
 }

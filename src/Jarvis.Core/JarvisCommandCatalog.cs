@@ -132,15 +132,6 @@ public static partial class JarvisCommandCatalog
         "local network"
     ];
 
-    public static IReadOnlyList<string> NetworkScanPhrases { get; } =
-    [
-        "network scan",
-        "network devices",
-        "scan my network",
-        "devices on my network",
-        "discover devices on my network"
-    ];
-
     public static IReadOnlyList<string> NetworkHealthPhrases { get; } =
     [
         "network health",
@@ -255,56 +246,6 @@ public static partial class JarvisCommandCatalog
         "list windows",
         "show windows",
         "visible windows"
-    ];
-
-    public static IReadOnlyList<string> MoveWindowPrefixes { get; } =
-    [
-        "move window",
-        "move app",
-        "position window"
-    ];
-
-    public static IReadOnlyList<string> ResizeWindowPrefixes { get; } =
-    [
-        "resize window",
-        "resize app"
-    ];
-
-    public static IReadOnlyList<string> SnapWindowPrefixes { get; } =
-    [
-        "snap window",
-        "snap app",
-        "dock window"
-    ];
-
-    public static IReadOnlyList<string> ClipboardPrefixes { get; } =
-    [
-        "clipboard",
-        "show clipboard",
-        "get clipboard",
-        "read clipboard",
-        "clipboard show"
-    ];
-
-    public static IReadOnlyList<string> SetClipboardPrefixes { get; } =
-    [
-        "set clipboard",
-        "copy to clipboard",
-        "clipboard set"
-    ];
-
-    public static IReadOnlyList<string> ClearClipboardPrefixes { get; } =
-    [
-        "clear clipboard",
-        "clipboard clear",
-        "empty clipboard"
-    ];
-
-    public static IReadOnlyList<string> PasteClipboardPrefixes { get; } =
-    [
-        "paste clipboard into",
-        "paste clipboard",
-        "clipboard paste"
     ];
 
     public static IReadOnlyList<string> ListFilesPrefixes { get; } =
@@ -440,11 +381,6 @@ public static partial class JarvisCommandCatalog
             return "network";
         }
 
-        if (ContainsExact(NetworkScanPhrases, normalized))
-        {
-            return "network scan";
-        }
-
         if (ContainsExact(NetworkHealthPhrases, normalized))
         {
             return "network health";
@@ -519,7 +455,7 @@ public static partial class JarvisCommandCatalog
             return trimmed;
         }
 
-        // simple prefix commands ("open ...", "remember ...", "move window ...") are rewritten to their canonical verb.
+        // simple prefix commands ("open ...", "remember ...", "focus app ...") are rewritten to their canonical verb.
         if (TryCanonicalizeOpenCommand(trimmed, out var openCommand))
         {
             return openCommand;
@@ -575,21 +511,6 @@ public static partial class JarvisCommandCatalog
             return windowsCommand;
         }
 
-        if (TryCanonicalizePayloadCommand(trimmed, MoveWindowPrefixes, "move window", out var moveWindowCommand))
-        {
-            return moveWindowCommand;
-        }
-
-        if (TryCanonicalizePayloadCommand(trimmed, ResizeWindowPrefixes, "resize window", out var resizeWindowCommand))
-        {
-            return resizeWindowCommand;
-        }
-
-        if (TryCanonicalizePayloadCommand(trimmed, SnapWindowPrefixes, "snap window", out var snapWindowCommand))
-        {
-            return snapWindowCommand;
-        }
-
         if (TryCanonicalizePayloadCommand(trimmed, OpenPathPrefixes, "open path", out var openPathCommand))
         {
             return openPathCommand;
@@ -640,19 +561,9 @@ public static partial class JarvisCommandCatalog
             return getTextCommand;
         }
 
-        if (TryCanonicalizeScrollCommand(trimmed, out var scrollCommand))
-        {
-            return scrollCommand;
-        }
-
         if (TryCanonicalizeMediaCommand(trimmed, out var mediaCommand))
         {
             return mediaCommand;
-        }
-
-        if (TryCanonicalizeClipboardCommand(trimmed, out var clipboardCommand))
-        {
-            return clipboardCommand;
         }
 
         if (TryCanonicalizePayloadCommand(trimmed, WaitPrefixes, "wait", out var waitCommand))
@@ -1261,62 +1172,6 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
-    // Rewrites clipboard phrases (set, paste, clear, show) to "clipboard <action>".
-    private static bool TryCanonicalizeClipboardCommand(string input, out string command)
-    {
-        if (TryCanonicalizePayloadCommand(input, SetClipboardPrefixes, "clipboard set", out command))
-        {
-            return true;
-        }
-
-        if (TryCanonicalizePayloadCommand(input, PasteClipboardPrefixes, "clipboard paste", out command))
-        {
-            if (command.StartsWith("clipboard paste into ", StringComparison.OrdinalIgnoreCase))
-            {
-                command = "clipboard paste " + command["clipboard paste into ".Length..].TrimStart();
-            }
-
-            return true;
-        }
-
-        if (ContainsExact(ClearClipboardPrefixes, NormalizeForMatching(input)))
-        {
-            command = "clipboard clear";
-            return true;
-        }
-
-        if (ContainsExact(ClipboardPrefixes, NormalizeForMatching(input)))
-        {
-            command = "clipboard";
-            return true;
-        }
-
-        command = string.Empty;
-        return false;
-    }
-
-    // Rewrites "scroll ..." and "move down/up ..." to "scroll <target> <direction>".
-    private static bool TryCanonicalizeScrollCommand(string input, out string command)
-    {
-        if (TryCanonicalizeSinglePayloadCommand(input, ["scroll window ", "scroll "], "scroll", out command))
-        {
-            return true;
-        }
-
-        if (TryCanonicalizeDirectionalPayloadCommand(input, "move down ", "down", out command))
-        {
-            return true;
-        }
-
-        if (TryCanonicalizeDirectionalPayloadCommand(input, "move up ", "up", out command))
-        {
-            return true;
-        }
-
-        command = string.Empty;
-        return false;
-    }
-
     // Generic helper: if the input starts with a prefix, return "<verb> <rest>" (or just the verb when nothing follows).
     private static bool TryCanonicalizeSinglePayloadCommand(
         string input,
@@ -1340,31 +1195,6 @@ public static partial class JarvisCommandCatalog
 
         command = string.Empty;
         return false;
-    }
-
-    // Helper for "move down/up <target>": produces "scroll <target> <direction>". A target is required.
-    private static bool TryCanonicalizeDirectionalPayloadCommand(
-        string input,
-        string prefix,
-        string direction,
-        out string command)
-    {
-        if (!input.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-        {
-            command = string.Empty;
-            return false;
-        }
-
-        var remainder = input[prefix.Length..].TrimStart(' ', ',', ':', ';', '-');
-
-        if (string.IsNullOrWhiteSpace(remainder))
-        {
-            command = string.Empty;
-            return false;
-        }
-
-        command = $"scroll {remainder} {direction}";
-        return true;
     }
 
     // Helper for window state phrases: produces "window state <window> <state>". A window name is required.

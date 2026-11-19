@@ -104,7 +104,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
     }
 
     // Checks settings and builds the runtime; returns false with a plain-language reason when it cannot run
-    // (no model set, bad URL, remote endpoint blocked by local-only mode, or a missing API key for a non-local server).
+    // (no model set, bad URL, or a remote endpoint blocked by local-only mode).
     public static bool TryCreate(JarvisOptions options, out IVoiceRuntime? runtime, out string status)
     {
         runtime = null;
@@ -115,7 +115,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return false;
         }
 
-        if (!Uri.TryCreate(options.SpeechRecognitionBaseUrl, UriKind.Absolute, out var baseUri))
+        if (!Uri.TryCreate(options.SpeechRecognitionBaseUrl, UriKind.Absolute, out _))
         {
             status = "Rolling transcription fallback base URL is invalid.";
             return false;
@@ -128,24 +128,11 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return false;
         }
 
-        // Local servers do not need an API key; remote ones do.
-        var apiKey = ResolveApiKey(options);
-
-        if (string.IsNullOrWhiteSpace(apiKey)
-            && !string.Equals(baseUri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(baseUri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase))
-        {
-            status =
-                $"Rolling transcription fallback requires an API key in `speechRecognitionApiKey`, `speechRecognitionApiKeyCredentialTarget`, or `{options.SpeechRecognitionApiKeyEnvironmentVariable}`.";
-            return false;
-        }
-
         runtime = new OpenAiCompatibleVoiceRuntime(
             options,
             new OpenAiCompatibleTranscriptionClient(
                 options.SpeechRecognitionBaseUrl,
                 options.SpeechRecognitionModel,
-                apiKey,
                 options.SpeechRecognitionLanguage,
                 VoiceRecognitionText.BuildTranscriptionPrompt(options), options.LocalAiOnly));
 
@@ -253,8 +240,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
 
         // Measure the raw level before any gain, so the echo check sees the real input.
         byte[]? utterance = null;
-        var originalLevel = CalculateRootMeanSquareLevel(chunk);
-        var originalPeak = CalculatePeakLevel(chunk);
+        var originalLevel = AudioLevels.Rms(chunk);
+        var originalPeak = AudioLevels.Peak(chunk);
         double level = 0;
         double peakLevel = 0;
         bool detectedSpeech = false;
@@ -317,8 +304,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
 
             AppendToPreRoll(chunk);
 
-            level = CalculateRootMeanSquareLevel(chunk);
-            peakLevel = CalculatePeakLevel(chunk);
+            level = AudioLevels.Rms(chunk);
+            peakLevel = AudioLevels.Peak(chunk);
             detectedSpeech = IsSpeechChunk(level, peakLevel);
             wakeWindowOpen = _isArmed;
 
@@ -818,64 +805,11 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         SignalLevelChanged?.Invoke(this, new VoiceSignalChangedEventArgs(CurrentSignal));
     }
 
-    internal static string ResolveApiKey(JarvisOptions options) =>
-        ApiKeyResolver.Resolve(
-            options.SpeechRecognitionApiKey,
-            options.SpeechRecognitionApiKeyCredentialTarget,
-            options.SpeechRecognitionApiKeyEnvironmentVariable);
-
     // Milliseconds to byte count: samples = rate x seconds, and each 16-bit sample is 2 bytes.
     private static int BytesForMilliseconds(int milliseconds, int sampleRateHz)
     {
         var samples = (int)Math.Ceiling(sampleRateHz * (milliseconds / 1000d));
         return Math.Max(0, samples * 2);
-    }
-
-    // RMS (root mean square): square every sample, average, take the square root. It is the "average loudness" of the chunk,
-    // from 0 (silence) to 1 (full scale). 0.008 is about -42 dB relative to full scale.
-    private static double CalculateRootMeanSquareLevel(byte[] pcm16MonoChunk)
-    {
-        if (pcm16MonoChunk.Length < 2)
-        {
-            return 0;
-        }
-
-        double sumSquares = 0;
-        var sampleCount = pcm16MonoChunk.Length / 2;
-
-        for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
-        {
-            var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
-            var normalized = sample / 32768d;
-            sumSquares += normalized * normalized;
-        }
-
-        return Math.Sqrt(sumSquares / sampleCount);
-    }
-
-    // Peak: the single loudest sample in the chunk, 0..1.
-    private static double CalculatePeakLevel(byte[] pcm16MonoChunk)
-    {
-        if (pcm16MonoChunk.Length < 2)
-        {
-            return 0;
-        }
-
-        double peak = 0;
-
-        for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
-        {
-            var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
-            // Widen to int first: Math.Abs(short.MinValue) throws OverflowException on clipped audio.
-            var normalized = Math.Abs((int)sample) / 32768d;
-
-            if (normalized > peak)
-            {
-                peak = normalized;
-            }
-        }
-
-        return peak;
     }
 
     // Shortens long error text for the status bar.
@@ -915,21 +849,18 @@ internal sealed class OpenAiCompatibleTranscriptionClient
     private readonly HttpClient _httpClient;
     private readonly string _endpoint;
     private readonly string _model;
-    private readonly string _apiKey;
     private readonly string _language;
     private readonly string _prompt;
 
     public OpenAiCompatibleTranscriptionClient(
         string baseUrl,
         string model,
-        string apiKey,
         string language,
         string prompt,
         bool localAiOnly = true)
     {
         _endpoint = BuildEndpoint(baseUrl);
         _model = model;
-        _apiKey = apiKey;
         _language = language;
         _prompt = prompt;
         _httpClient = LocalAiPolicy.CreateHttpClient(localAiOnly, TimeSpan.FromSeconds(45));
@@ -1005,11 +936,6 @@ internal sealed class OpenAiCompatibleTranscriptionClient
             Content = form
         };
 
-        if (!string.IsNullOrWhiteSpace(_apiKey))
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        }
-
         using var response = await _httpClient.SendAsync(request, cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
 
@@ -1041,5 +967,56 @@ internal sealed class OpenAiCompatibleTranscriptionClient
         const int maxLength = 500;
         var value = text.Trim();
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
+    }
+}
+
+// Loudness of a chunk of 16-bit mono audio, shared by the voice pipeline, the microphone gain stage and the calibration tool.
+internal static class AudioLevels
+{
+    // RMS (root mean square): square every sample, average, take the square root. It is the "average loudness" of the chunk,
+    // from 0 (silence) to 1 (full scale). 0.008 is about -42 dB relative to full scale.
+    public static double Rms(byte[] pcm16MonoChunk)
+    {
+        if (pcm16MonoChunk.Length < 2)
+        {
+            return 0;
+        }
+
+        double sumSquares = 0;
+        var sampleCount = pcm16MonoChunk.Length / 2;
+
+        for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
+        {
+            var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
+            var normalized = sample / 32768d;
+            sumSquares += normalized * normalized;
+        }
+
+        return Math.Sqrt(sumSquares / sampleCount);
+    }
+
+    // Peak: the single loudest sample in the chunk, 0..1.
+    public static double Peak(byte[] pcm16MonoChunk)
+    {
+        if (pcm16MonoChunk.Length < 2)
+        {
+            return 0;
+        }
+
+        double peak = 0;
+
+        for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
+        {
+            var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
+            // Widen to int first: Math.Abs(short.MinValue) throws OverflowException on clipped audio.
+            var normalized = Math.Abs((int)sample) / 32768d;
+
+            if (normalized > peak)
+            {
+                peak = normalized;
+            }
+        }
+
+        return peak;
     }
 }

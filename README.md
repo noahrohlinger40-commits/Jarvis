@@ -6,7 +6,7 @@ This repository does not pretend to be the full Iron Man system. It gives you a 
 
 - An interactive assistant shell
 - A Windows operations surface with live response streaming, waveform telemetry, tray mode, approvals, and voice controls
-- Persistent memory, learned preferences, contextual summaries, structured entity memory, reminder recall, retention controls, and transcript logging
+- Persistent memory, a learned name to call you, contextual summaries, reminder recall, retention controls, and transcript logging
 - Command routing for local directives
 - Streaming speech recognition through a rolling OpenAI-compatible path
 - Manifest-backed wake-word detection on streaming voice paths, with a text-prefix fallback
@@ -25,16 +25,16 @@ This repository does not pretend to be the full Iron Man system. It gives you a 
 - `notes` lists recent memories plus upcoming reminder memory
 - `reminders` lists pending reminders, and `remind me to <task> at|on|in ...` stores time-based reminder memory
 - `forget <id-or-phrase>` removes a stored memory from active recall
-- `preferences` or `profile` shows learned phrasing, tone, app, location, habit, routine, structured relationship, device, project, place, and reminder preferences
+- `preferences` or `profile` shows what Jarvis has learned to call you, plus remembered notes and reminders
 - The live operations surface now has a memory workbench for reviewing, editing, and forgetting stored memory items without raw commands
 - Older transcript history is automatically compacted into summary memories so recall can stay useful without replaying every turn
 - `weather <location>` checks the current weather
 - `system` shows computer state, drives, and process count
 - `computer` shows the active window, visible desktop apps, workspace entries, and live machine context
-- `network`, `network scan`, `network health`, and `network <ip-or-host>` inspect local adapters, discover nearby devices, and run lightweight health checks
+- `network`, `network health`, and `network <ip-or-host>` inspect local adapters, ping nearby devices, and run lightweight health checks
 - `apps` or `apps <name>` lists discovered running and installed applications
-- `open app <name>` now focuses a running app when possible and can discover apps from Start Menu shortcuts, Desktop shortcuts and executables, Windows App Paths, installed-program registry entries, and per-user LocalAppData installs
-- `spotify`, `code`, `chrome`, `explorer`, `office`, `discord`, and `slack` expose app-specific shortcuts for media/search/navigation flows and direct Office file opens
+- `open app <name>` now focuses a running app when possible and can discover apps from Start Menu shortcuts, Windows App Paths, and everything Windows itself lists as an app
+- `spotify`, `code`, `chrome`, and `discord` expose app-specific shortcuts for media/search/navigation flows
 - `open path <target>`, `list files <path>`, `read file <path>`, and `find files <term>` handle file navigation
 - `browse <url>` and `search web <query>` drive browser actions
 - `research <query>` runs open-domain web research with citations
@@ -179,8 +179,6 @@ Recommended streaming configuration:
   "speechRecognitionProvider": "openai-compatible",
   "speechRecognitionBaseUrl": "https://api.openai.com/v1",
   "speechRecognitionModel": "gpt-4o-mini-transcribe",
-  "speechRecognitionApiKeyCredentialTarget": "Jarvis/SpeechRecognition/OpenAI",
-  "speechRecognitionApiKeyEnvironmentVariable": "OPENAI_API_KEY",
   "speechRecognitionSampleRateHz": 24000,
   "speechRecognitionLanguage": "en",
   "speechRecognitionVoiceActivityThreshold": 0.015,
@@ -190,7 +188,6 @@ Recommended streaming configuration:
   "speechRecognitionWakeWordAssetPath": "auto",
   "speechRecognitionEchoCancellationEnabled": true,
   "speechRecognitionBargeInEnabled": true,
-  "speechRecognitionBeamformingEnabled": false,
   "speechRecognitionBeamformingProfile": "auto",
   "speechRecognitionHardwareDspProfile": "auto",
   "speechRecognitionCalibrationProfiles": [],
@@ -199,8 +196,6 @@ Recommended streaming configuration:
   "voiceEnabled": true,
   "voiceProvider": "auto",
   "voiceModel": "gpt-4o-mini-tts",
-  "voiceApiKeyCredentialTarget": "Jarvis/Voice/OpenAI",
-  "voiceApiKeyEnvironmentVariable": "OPENAI_API_KEY",
   "voiceName": "coral"
 }
 ```
@@ -209,7 +204,7 @@ How it works:
 
 - The app continuously captures microphone audio
 - Jarvis sends rolling WAV-to-`/audio/transcriptions` requests
-- Streaming recognition paths now run a wake-word detector (openWakeWord through the local speech server) against captured audio before transcript routing, and the detector can auto-select dedicated wake-asset manifests for different microphone patterns
+- Streaming recognition paths now run a wake-word detector (openWakeWord through the local speech server) against captured audio before transcript routing
 - Voice output streams PCM audio from `/audio/speech` and begins playback before the full response has finished downloading
 - In `half-duplex` mode, Jarvis pauses the microphone while speaking to reduce self-transcription and wake-word feedback loops
 - In `full-duplex` mode, Jarvis keeps listening during speech output, suppresses likely playback echo before STT, and supports barge-in so user speech can interrupt active TTS
@@ -218,17 +213,15 @@ How it works:
 
 Important notes:
 
-- `speechRecognitionApiKey` can be set directly, but an environment variable is safer
-- on Windows, `speechRecognitionApiKeyCredentialTarget` can point to a Generic Credential in Credential Manager so the key does not need to live in `jarvis.settings.json`
 - `openai-compatible` still works with endpoints that only implement `/audio/transcriptions`
 - `voiceProvider: "auto"` prefers streaming `/audio/speech` and falls back to Windows speech if the remote voice path is not configured
 - The wake-word detector runs openWakeWord through the local speech server on the rolling-transcription path, but Jarvis can swap that detector for manifest-backed external wake wrappers when a local Porcupine/OpenWakeWord/ONNX or other helper process is available
-- The built-in wake-asset manifests currently cover desktop USB mics, monitor webcams, wired headsets, wireless/Bluetooth headsets, conference speakerphones, and far-field arrays; `auto` picks the closest match from the active device name plus the resolved beamforming/DSP posture
+- The built-in wake-asset manifests currently cover desktop USB mics, monitor webcams, wired headsets, wireless/Bluetooth headsets, conference speakerphones, and far-field arrays; pick one in the voice panel or pin it in settings
 - Use the microphone controls in the right-side voice panel to pick a device, choose a wake asset, choose a wake engine, tune beamforming/hardware DSP posture, and run calibration or validation for the current room
 - `speechRecognitionCalibrationProfiles` stores per-device calibration captures keyed by the effective beamforming and DSP posture, so multiple tuned baselines can coexist for one microphone
 - `speechRecognitionValidationProfiles` stores per-device wake-word and full-duplex checks keyed by wake asset, wake engine, beamforming, and hardware DSP posture, including recommended conversation mode, wake readiness, and playback-leakage headroom
-- `speechRecognitionWakeWordAssetPath` accepts `auto`, an empty value (no wake asset), or a JSON wake-asset manifest in `data\wake-word-assets`; manifests can now include per-device keyword matching in addition to alias and sensitivity tuning
-- `speechRecognitionWakeEnginePath` accepts `auto`, an empty value (transcript-only wake), or a JSON wake-engine manifest in `data\wake-engines`; those manifests can launch a local helper process and pass the captured WAV path, wake aliases, selected wake asset, and resolved mic-tuning context through placeholders and environment variables
+- `speechRecognitionWakeWordAssetPath` accepts an empty value (no wake asset), a JSON wake-asset manifest in `data\wake-word-assets`, or `auto` (the first manifest found); manifests carry alias and sensitivity tuning
+- `speechRecognitionWakeEnginePath` accepts an empty value (transcript-only wake), `auto` (the first manifest found), or a JSON wake-engine manifest in `data\wake-engines`; those manifests can launch a local helper process and pass the captured WAV path, wake aliases, selected wake asset, and resolved mic-tuning context through placeholders and environment variables
 - `speechRecognitionBeamformingProfile` selects the software tuning profile (`auto`, `off`, `desktop`, `headset`, `conference`, or `far-field-array`)
 - `speechRecognitionHardwareDspProfile` selects the expected device-stack DSP posture (`auto`, `off`, `system-aec`, `voice-processing`, `conference-array`, or `vendor-beamforming`) so Jarvis can tune capture buffering and noise-reduction hints more realistically
 - `auto` is still the safest default because it preserves the compatibility fallbacks when the preferred remote path is unavailable
@@ -278,14 +271,11 @@ The desktop layer now supports richer app control beyond launch/read:
 
 **App Adapters**
 - `spotify play`, `spotify playlist coding`, `code goto src/Jarvis.Core/JarvisDataPaths.cs:1`
-- `chrome incognito openai.com`, `explorer reveal README.md`
-- `office word docs\\notes.docx`, `office outlook`, `discord jump jarvis`, `slack jump deploys`
+- `chrome incognito openai.com`, `discord jump jarvis`
 
 **Window Discovery & Management**
 - `windows` or `windows code` - Lists visible top-level windows, optionally filtered
 - `focus app notepad`, `close app notepad`, `window state notepad maximize`
-- `move window notepad 120 80`, `resize window notepad 1280 900`
-- `snap window code left`, `snap window browser top right`
 
 **UI Automation (Win32)**
 - `click element notepad` - Clicks center of named window
@@ -293,29 +283,26 @@ The desktop layer now supports richer app control beyond launch/read:
 - `type into notepad hello` or `type into notepad :: search :: hello` - Types text into the target window or named field
 - `get element text notepad` or `get element text notepad :: status bar` - Gets text from the target window or named control
 - `send hotkey notepad ctrl+s` - Sends a keyboard shortcut to the target window
-- `scroll notepad down` - Scrolls target window
 - `wait 2` - Pauses execution
 
-**Clipboard & Media**
-- `clipboard`, `set clipboard hello world`, `clear clipboard`
-- `paste clipboard into notepad`
+**Media**
 - `media next`, `media pause`, `volume up 3`, `mute`
 
 With the planner enabled, Jarvis can also resolve short UI follow-ups from recent context, including references grounded by `screen ui` such as `click that button` or `type hello into that field`.
 
 **Context & Network**
-- `computer`, `network scan`, `system`
+- `computer`, `network`, `system`
 
 **Multi-step Example**
-`open app notepad; snap window notepad left; set clipboard Hello Jarvis!; paste clipboard into notepad`
+`open app notepad; type into notepad Hello Jarvis!`
 
-Safety: Sensitive `type into` and `set clipboard` content requires approval. `close app`, `send hotkey`, and `paste clipboard` actions also pause for approval when major-action safety is enabled.
+Safety: Sensitive `type into` content requires approval. `close app` and `send hotkey` actions also pause for approval when major-action safety is enabled.
 
 ## App Index And Spoken Shortcuts
 
 Jarvis scans every app on the PC and keeps an index of them, so "open Spotify" or "open Clock" works without a hand-written alias.
 
-- **What is scanned:** Start Menu and desktop shortcuts, the registry (installed apps and App Paths), and everything Windows itself lists as an app. That last source includes Microsoft Store apps such as Claude, ChatGPT, Clock, Photos and Snipping Tool, which have no shortcut file to find.
+- **What is scanned:** Start Menu shortcuts, the registry's App Paths, and everything Windows itself lists as an app. That last source includes Microsoft Store apps such as Claude, ChatGPT, Clock, Photos and Snipping Tool, which have no shortcut file to find.
 - **When:** in the background at every launch, cached for ten minutes in memory, with Windows' own app list refreshed every six hours. If a spoken name matches nothing, Jarvis rescans once, at most every two minutes, in case the app was just installed.
 - **The saved copy:** `%LOCALAPPDATA%\Jarvis\data\app-index.json` lists every indexed app with its launch target and the spoken names it answers to. Open it to see exactly what Jarvis knows. It is rebuilt automatically and is safe to delete.
 - **Spoken shortcuts:** each app answers to its full name and to shorter forms, so "Microsoft Edge" also answers to "edge" and "Microsoft Photos" and "Photos" both work. Filler such as "the", "my" and "app" is ignored.
@@ -361,8 +348,6 @@ Relevant settings:
 - `voiceProvider`
 - `voiceBaseUrl`
 - `voiceModel`
-- `voiceApiKeyCredentialTarget`
-- `voiceApiKeyEnvironmentVariable`
 - `voiceName`
 - `speechRecognitionEnabled`
 - `speechRecognitionProvider`
@@ -379,7 +364,6 @@ Relevant settings:
 - `speechRecognitionMinimumUtteranceMilliseconds`
 - `speechRecognitionEchoCancellationEnabled`
 - `speechRecognitionBargeInEnabled`
-- `speechRecognitionBeamformingEnabled`
 - `speechRecognitionBeamformingProfile`
 - `speechRecognitionHardwareDspProfile`
 - `speechRecognitionCalibrationProfiles`
@@ -476,12 +460,12 @@ Currently implemented:
 A large portion of this section is now in the current build.
 
 Currently implemented:
-- App discovery and launch, window discovery, focus, close, minimize/maximize/restore, move, resize, snap, and workspace-aware computer context.
-- Win32 UI actions for click, type, hotkey, scroll, wait, clipboard workflows, and media controls with approval guardrails.
+- App discovery and launch, window discovery, focus, close, minimize/maximize/restore, and workspace-aware computer context.
+- Win32 UI actions for click, type, hotkey, wait, and media controls with approval guardrails.
 - Screenshot capture, OCR-style extraction, structured UI detection, and planner grounding from live screen context.
-- Browser open/search actions plus deeper Chrome navigation, tab, history/downloads/bookmarks, find-on-page, form-fill, and login workflows.
+- Browser open/search actions plus deeper Chrome navigation, tab, history/downloads/bookmarks, and find-on-page workflows.
 - File navigation plus file create/edit/append/move/copy/delete workflows and shell execution with approvals.
-- Richer app-state introspection, and app adapters for Spotify, Discord, Slack, VS Code, Office, Chrome, and Explorer.
+- Richer app-state introspection, and app adapters for Spotify, Discord, VS Code, and Chrome.
 
 ### 5. External Integrations
 
@@ -530,7 +514,7 @@ Currently implemented:
 - Social turns such as greetings, check-ins, thanks, apologies, compliments, readiness checks, and identity questions now have direct presence-aware replies.
 - Short task replies and acknowledgements now apply stronger urgency/frustration modulation without corrupting tool-heavy outputs.
 - Streamed spoken acknowledgements and configurable voice provider/model/name are live, and presence settings now feed planner prompts.
-- Tone continuity is preserved through persisted settings plus learned preference memory.
+- Tone continuity is preserved through persisted settings.
 
 Still open:
 - Broader multi-device continuity and shared account-level presence sync across machines.
@@ -543,7 +527,7 @@ Substantial guardrails are already in place.
 Currently implemented:
 - Shell execution is opt-in, protected system paths are hard-blocked, and major shell changes require approval.
 - Sensitive memory content is blocked from automatic persistence, and off-the-record/private turns are supported.
-- Selected UI actions such as closing apps, hotkeys, clipboard paste, and sensitive typing/text entry are approval-gated.
+- Selected UI actions such as closing apps, hotkeys, and sensitive typing/text entry are approval-gated.
 - API keys can be resolved through environment variables or Windows Credential Manager targets instead of only plaintext settings.
 
 Still open:

@@ -123,20 +123,9 @@ internal sealed class MicrophonePcmStream : Stream
     // Measures peak and RMS (average loudness), then scales the samples so the loudest reaches the target peak, within limits.
     private void ApplyAutomaticGain(byte[] pcm16Mono)
     {
-        var peak = 0.0;
-        var sumSquares = 0.0;
-        var sampleCount = pcm16Mono.Length / 2;
-
-        for (var index = 0; index < pcm16Mono.Length; index += 2)
-        {
-            var sample = BitConverter.ToInt16(pcm16Mono, index) / 32768.0;
-            var magnitude = Math.Abs(sample);
-            peak = Math.Max(peak, magnitude);
-            sumSquares += sample * sample;
-        }
-
+        var peak = AudioLevels.Peak(pcm16Mono);
         // RMS: square each sample, average, square root. 0 is silence and 1 is full scale.
-        var rms = Math.Sqrt(sumSquares / Math.Max(1, sampleCount));
+        var rms = AudioLevels.Rms(pcm16Mono);
         double targetGain;
 
         if (peak < 0.004 && rms < 0.0008)

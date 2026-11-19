@@ -1,11 +1,12 @@
 // DesktopAutomation.AppIndex.cs: the "which apps can I open?" slice of DesktopAutomationService.
-// It builds and caches the catalog of apps (start menu, registry, Store apps), saves a copy to data\app-index.json,
+// It builds and caches the catalog of apps (start menu, App Paths registry, Store apps), saves a copy to data\app-index.json,
 // and works out the spoken names for each app and how close a misheard name is (typo and sound-alike matching).
 // Used by DesktopAutomation.cs (open/launch/list app); the scanning helpers it calls live in that file.
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using static Jarvis.Core.Win32UiAutomation;
 
 namespace Jarvis.Core;
 
@@ -133,10 +134,7 @@ public sealed partial class DesktopAutomationService
         foreach (var source in new Func<IEnumerable<ApplicationCandidate>>[]
                  {
                      GetStartMenuApplications,
-                     GetDesktopApplications,
-                     GetAppPathApplications,
-                     GetInstalledApplications,
-                     GetLocalUserApplications
+                     GetAppPathApplications
                  })
         {
             foreach (var candidate in source())

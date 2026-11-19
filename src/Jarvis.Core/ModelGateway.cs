@@ -12,6 +12,7 @@ using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
@@ -76,6 +77,41 @@ public interface IModelGateway
         ChatCompletionRequest request,
         ModelRoute route,
         CancellationToken cancellationToken);
+}
+
+// The one small helper for "system prompt plus one user message" calls (page summaries, lecture notes, sticky notes).
+public static partial class ModelCalls
+{
+    // One model call that gives up after the timeout, then removes any <think>...</think> reasoning block the model printed before its answer.
+    internal static async Task<string> CompleteTextAsync(
+        IModelGateway gateway,
+        string instructions,
+        string input,
+        ModelRoute route,
+        double temperature,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(timeout);
+        var response = await gateway.CompleteAsync(
+            new ChatCompletionRequest(
+                [
+                    new ChatMessage("system", [ChatMessageContentPart.FromText(instructions)]),
+                    new ChatMessage("user", [ChatMessageContentPart.FromText(input)])
+                ],
+                Temperature: temperature),
+            route,
+            timeoutSource.Token);
+
+        return StripThink(response.Content);
+    }
+
+    // Removes a <think>...</think> block across line breaks (the lazy "*?" stops at the first closing tag).
+    internal static string StripThink(string? text) => ThinkBlockRegex().Replace(text ?? string.Empty, string.Empty);
+
+    [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
+    private static partial Regex ThinkBlockRegex();
 }
 
 // Builds the right gateway from the settings. The app calls this at startup and again when settings change.
@@ -272,7 +308,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             // A timeout already cost the full HTTP timeout while holding the model slot; fail now instead of waiting again.
             catch (Exception exception) when (exception is not OperationCanceledException and not TimeoutException)
             {
-                failures.Add($"{model}: {TrimError(exception.Message)}");
+                failures.Add($"{model}: {exception.Message.Clip(320)}");
             }
         }
 
@@ -358,7 +394,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
         if (!response.IsSuccessStatusCode)
         {
-            throw new InvalidOperationException($"HTTP {(int)response.StatusCode}: {TrimError(body)}");
+            throw new InvalidOperationException($"HTTP {(int)response.StatusCode}: {body.Clip(320)}");
         }
 
         using var document = JsonDocument.Parse(body);
@@ -606,14 +642,6 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return property.ValueKind == JsonValueKind.String
             ? property.GetString()
             : property.ToString();
-    }
-
-    // Shortens long server error messages so they stay readable in logs and failure lists.
-    private static string TrimError(string text)
-    {
-        const int maxLength = 320;
-        var value = text.Trim();
-        return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
     // Maximum reply length (in tokens) for local models only, chosen per route to keep a small local model fast.

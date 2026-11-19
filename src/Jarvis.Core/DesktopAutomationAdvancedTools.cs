@@ -1,8 +1,6 @@
-// DesktopAutomationAdvancedTools.cs: the assistant tools for windows, media keys and the clipboard (windows, move/resize/snap window, media, clipboard).
+// DesktopAutomationAdvancedTools.cs: the assistant tools for listing windows and media keys (windows, media).
 // Each tool recognises typed commands (CanHandle), parses them with UiCommandParsing (bottom of this file) and calls IDesktopAutomationService.
 // The tool classes follow the IAssistantTool pattern: Name, Description (shown to the model), CanHandle (is this input mine?), ExecuteAsync (do it).
-using System.Globalization;
-
 namespace Jarvis.Core;
 
 // Tool that lists open desktop windows, optionally filtered by a word ("windows code").
@@ -28,99 +26,6 @@ public sealed class WindowsTool : IAssistantTool
     }
 }
 
-// Tool that moves a window so its top-left corner is at the given screen coordinates.
-public sealed class MoveWindowTool : IAssistantTool
-{
-    public string Name => "move window";
-
-    public string Description => "Move a window to screen coordinates. `move window notepad 120 80`.";
-
-    // Matches move window / move app / position window, but not when the target is a vague reference such as "it" or "this" (this tool cannot know which window they mean).
-    public bool CanHandle(string input)
-    {
-        var matches = ToolInputHelper.StartsWithCommand(input, Name)
-            || ToolInputHelper.StartsWithCommand(input, "move app")
-            || ToolInputHelper.StartsWithCommand(input, "position window");
-
-        return matches
-            && (!UiCommandParsing.TryParseMoveWindow(input, out var target, out _, out _)
-                || !UiCommandParsing.LooksLikeContextualReferenceTarget(target));
-    }
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!UiCommandParsing.TryParseMoveWindow(input, out var target, out var x, out var y))
-        {
-            return new ToolResult("Usage: move window <window> <x> <y>");
-        }
-
-        var result = await context.DesktopAutomation.MoveWindowAsync(target, x, y, cancellationToken);
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Moved window." : "Window move failed.");
-    }
-}
-
-// Tool that resizes a window to a width and height in pixels.
-public sealed class ResizeWindowTool : IAssistantTool
-{
-    public string Name => "resize window";
-
-    public string Description => "Resize a window in pixels. `resize window notepad 1280 900`.";
-
-    public bool CanHandle(string input)
-    {
-        var matches = ToolInputHelper.StartsWithCommand(input, Name)
-            || ToolInputHelper.StartsWithCommand(input, "resize app");
-
-        return matches
-            && (!UiCommandParsing.TryParseResizeWindow(input, out var target, out _, out _)
-                || !UiCommandParsing.LooksLikeContextualReferenceTarget(target));
-    }
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!UiCommandParsing.TryParseResizeWindow(input, out var target, out var width, out var height))
-        {
-            return new ToolResult("Usage: resize window <window> <width> <height>");
-        }
-
-        var result = await context.DesktopAutomation.ResizeWindowAsync(target, width, height, cancellationToken);
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Resized window." : "Window resize failed.");
-    }
-}
-
-// Tool that snaps a window to part of the screen (left half, a corner, centre and so on).
-public sealed class SnapWindowTool : IAssistantTool
-{
-    public string Name => "snap window";
-
-    public string Description => "Snap a window into a desktop region. `snap window code left` or `snap window code top right`.";
-
-    public bool CanHandle(string input)
-    {
-        var matches = ToolInputHelper.StartsWithCommand(input, Name)
-            || ToolInputHelper.StartsWithCommand(input, "snap app")
-            || ToolInputHelper.StartsWithCommand(input, "dock window");
-
-        return matches
-            && (!UiCommandParsing.TryParseSnapWindow(input, out var target, out _)
-                || !UiCommandParsing.LooksLikeContextualReferenceTarget(target));
-    }
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!UiCommandParsing.TryParseSnapWindow(input, out var target, out var position))
-        {
-            return new ToolResult("Usage: snap window <window> <left|right|top|bottom|top-left|top-right|bottom-left|bottom-right|center>");
-        }
-
-        var result = await context.DesktopAutomation.SnapWindowAsync(target, position, cancellationToken);
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Snapped window." : "Window snap failed.");
-    }
-}
-
 // Tool that sends the keyboard media keys (play, pause, next, previous, volume, mute) to Windows.
 public sealed class MediaTool : IAssistantTool
 {
@@ -143,39 +48,7 @@ public sealed class MediaTool : IAssistantTool
     }
 }
 
-// Tool that reads or changes the clipboard: show, set text, clear, or paste into a window.
-public sealed class ClipboardTool : IAssistantTool
-{
-    public string Name => "clipboard";
-
-    public string Description => "Inspect or change the clipboard. Use `clipboard`, `set clipboard hello`, or `paste clipboard into notepad`.";
-
-    public bool CanHandle(string input) => UiCommandParsing.TryParseClipboardCommand(input, out _, out _);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!UiCommandParsing.TryParseClipboardCommand(input, out var action, out var payload))
-        {
-            return new ToolResult("Usage: clipboard | set clipboard <text> | clear clipboard | paste clipboard into <window>");
-        }
-
-        // The first word chosen by TryParseClipboardCommand decides which service call runs. "paste" falls through to a usage message if its argument is missing.
-        var result = action switch
-        {
-            "show" => await context.DesktopAutomation.GetClipboardAsync(cancellationToken),
-            "set" => await context.DesktopAutomation.SetClipboardAsync(payload, cancellationToken),
-            "clear" => await context.DesktopAutomation.ClearClipboardAsync(cancellationToken),
-            "paste" when !string.IsNullOrWhiteSpace(payload) => await context.DesktopAutomation.PasteClipboardAsync(payload, cancellationToken),
-            "paste" => "Usage: paste clipboard into <window>",
-            _ => "Usage: clipboard | set clipboard <text> | clear clipboard | paste clipboard into <window>"
-        };
-
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Handled clipboard action." : "Clipboard action failed.");
-    }
-}
-
-// Text parsing for the commands in this file. The class is split over several files; this part handles windows, media and clipboard commands.
+// Text parsing for the commands in this file. The class is split over several files; this part handles window-list and media commands.
 internal static partial class UiCommandParsing
 {
     // "windows [filter]": whatever follows the command word becomes the filter.
@@ -186,69 +59,6 @@ internal static partial class UiCommandParsing
             || ToolInputHelper.StartsWithCommand(input, "list windows")
             || ToolInputHelper.StartsWithCommand(input, "show windows")
             || ToolInputHelper.StartsWithCommand(input, "visible windows");
-    }
-
-    // "move window <name> <x> <y>": the last two words must be numbers, everything before them is the window name.
-    public static bool TryParseMoveWindow(string input, out string target, out int x, out int y)
-    {
-        var remainder = ToolInputHelper.GetCommandTail(input, "move window", "move app", "position window");
-        return TryParseTargetAndTrailingIntegers(remainder, out target, out x, out y);
-    }
-
-    // Same shape as move but both numbers must be above zero.
-    public static bool TryParseResizeWindow(string input, out string target, out int width, out int height)
-    {
-        var remainder = ToolInputHelper.GetCommandTail(input, "resize window", "resize app");
-        return TryParseTargetAndTrailingIntegers(remainder, out target, out width, out height)
-            && width > 0
-            && height > 0;
-    }
-
-    // Snap command: accepts "name :: position" or "name position". For the plain form it tries a two-word position first (so "top right" is not read as "right") and then a one-word position.
-    public static bool TryParseSnapWindow(string input, out string target, out string position)
-    {
-        var remainder = ToolInputHelper.GetCommandTail(input, "snap window", "snap app", "dock window");
-        target = string.Empty;
-        position = string.Empty;
-
-        if (string.IsNullOrWhiteSpace(remainder))
-        {
-            return false;
-        }
-
-        var structuredParts = remainder
-            .Split(["::"], 2, StringSplitOptions.None | StringSplitOptions.TrimEntries)
-            .Select(part => part.Trim().Trim('"'))
-            .ToArray();
-
-        if (structuredParts.Length == 2)
-        {
-            target = structuredParts[0];
-            return TryNormalizeSnapPosition(structuredParts[1], out position);
-        }
-
-        // Try two-word positions before one-word positions so "code top right" gives target "code" and position "top right".
-        foreach (var candidateLength in new[] { 2, 1 })
-        {
-            var parts = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-            if (parts.Length <= candidateLength)
-            {
-                continue;
-            }
-
-            var candidatePosition = string.Join(' ', parts[^candidateLength..]);
-
-            if (!TryNormalizeSnapPosition(candidatePosition, out position))
-            {
-                continue;
-            }
-
-            target = string.Join(' ', parts[..^candidateLength]).Trim().Trim('"');
-            return !string.IsNullOrWhiteSpace(target);
-        }
-
-        return false;
     }
 
     // Turns spoken media phrases into short commands: "media next", "next track", "skip track", "volume up 3", "mute" and so on.
@@ -304,115 +114,5 @@ internal static partial class UiCommandParsing
         }
 
         return false;
-    }
-
-    // Picks which clipboard action was asked for and extracts its text.
-    public static bool TryParseClipboardCommand(string input, out string action, out string payload)
-    {
-        action = string.Empty;
-        payload = string.Empty;
-
-        if (ToolInputHelper.MatchesExact(input, "clipboard", "show clipboard", "get clipboard", "read clipboard", "clipboard show"))
-        {
-            action = "show";
-            return true;
-        }
-
-        if (ToolInputHelper.MatchesExact(input, "clear clipboard", "clipboard clear", "empty clipboard"))
-        {
-            action = "clear";
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "set clipboard")
-            || ToolInputHelper.StartsWithCommand(input, "copy to clipboard")
-            || ToolInputHelper.StartsWithCommand(input, "clipboard set"))
-        {
-            action = "set";
-            payload = ToolInputHelper.GetCommandTail(input, "set clipboard", "copy to clipboard", "clipboard set");
-            return !string.IsNullOrWhiteSpace(payload);
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "paste clipboard into")
-            || ToolInputHelper.StartsWithCommand(input, "paste clipboard")
-            || ToolInputHelper.StartsWithCommand(input, "clipboard paste"))
-        {
-            action = "paste";
-            payload = ToolInputHelper.GetCommandTail(input, "paste clipboard into", "paste clipboard", "clipboard paste");
-
-            if (payload.StartsWith("into ", StringComparison.OrdinalIgnoreCase))
-            {
-                payload = payload["into ".Length..].Trim();
-            }
-
-            payload = payload.Trim().Trim('"');
-            return true;
-        }
-
-        return false;
-    }
-
-    // Splits "<name words> <number> <number>": the last two words must parse as whole numbers (invariant culture, so no locale surprises), the rest is the name.
-    private static bool TryParseTargetAndTrailingIntegers(string remainder, out string target, out int first, out int second)
-    {
-        target = string.Empty;
-        first = 0;
-        second = 0;
-
-        if (string.IsNullOrWhiteSpace(remainder))
-        {
-            return false;
-        }
-
-        var parts = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-        if (parts.Length < 3)
-        {
-            return false;
-        }
-
-        if (!int.TryParse(parts[^2], NumberStyles.Integer, CultureInfo.InvariantCulture, out first)
-            || !int.TryParse(parts[^1], NumberStyles.Integer, CultureInfo.InvariantCulture, out second))
-        {
-            return false;
-        }
-
-        target = string.Join(' ', parts[..^2]).Trim().Trim('"');
-        return !string.IsNullOrWhiteSpace(target);
-    }
-
-    // Cleans up a snap position: lower-case, single spaces, and turns "top left" into "top-left" etc. Returns false for anything that is not one of the 9 known positions.
-    private static bool TryNormalizeSnapPosition(string value, out string position)
-    {
-        position = string.Join(
-            " ",
-            value
-                .Trim()
-                .ToLowerInvariant()
-                .Split(' ', StringSplitOptions.RemoveEmptyEntries));
-
-        switch (position)
-        {
-            case "left":
-            case "right":
-            case "top":
-            case "bottom":
-            case "center":
-                return true;
-            case "top left":
-                position = "top-left";
-                return true;
-            case "top right":
-                position = "top-right";
-                return true;
-            case "bottom left":
-                position = "bottom-left";
-                return true;
-            case "bottom right":
-                position = "bottom-right";
-                return true;
-            default:
-                return false;
-        }
     }
 }

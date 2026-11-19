@@ -26,7 +26,6 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
     private readonly OpenAiCompatibleTranscriptionClient _whisper = new(
         options.SpeechRecognitionBaseUrl,
         options.SpeechRecognitionModel,
-        OpenAiCompatibleVoiceRuntime.ResolveApiKey(options),
         options.SpeechRecognitionLanguage,
         prompt: string.Empty, localAiOnly: options.LocalAiOnly);
 

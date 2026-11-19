@@ -334,8 +334,7 @@ internal static class AppBootstrapper
         if (!options.SpeechRecognitionEnabled
             || !Uri.TryCreate(options.SpeechRecognitionBaseUrl, UriKind.Absolute, out var speechUri)
             || !speechUri.IsLoopback
-            || !(string.IsNullOrWhiteSpace(options.SpeechRecognitionProvider)
-                || options.SpeechRecognitionProvider.Trim().ToLowerInvariant() is "auto" or "openai-compatible" or "openai" or "streaming"))
+            || !SpeechProviders.IsOpenAiCompatible(options.SpeechRecognitionProvider))
         {
             return;
         }

@@ -167,7 +167,7 @@ public sealed class StatusTool : IAssistantTool
             $"Speech recognition: {(context.Options.SpeechRecognitionEnabled ? "enabled" : "disabled")}",
             $"Speech provider: {context.Options.SpeechRecognitionProvider}",
             $"Wake word gate: {(context.Options.WakeWordEnabled ? "enabled" : "disabled")}",
-            "Desktop automation: enabled for app discovery, visible-window discovery, window management, browser and form workflows, file create/edit/move/copy/delete actions, clipboard read and set, notifications, media controls, Win32 UI control, local network discovery, live computer context, system state, and app adapters for Spotify, VS Code, Office, Chrome, Explorer, Discord, and Slack",
+            "Desktop automation: enabled for app discovery, visible-window discovery, window management, browser workflows, file create/edit/move/copy/delete actions, notifications, media controls, Win32 UI control, local network discovery, live computer context, system state, and app adapters for Spotify, VS Code, Chrome, and Discord",
             $"Visual grounding: screen and window capture, monitor inventory, OCR-style text extraction, structured UI analysis, and document parsing for text/image inputs ({(string.IsNullOrWhiteSpace(context.Options.PlannerVisionModel) ? "planner vision route inherits the default model" : context.Options.PlannerVisionModel)})",
             $"Shell execution: {(context.Options.ShellExecutionEnabled ? "enabled" : "disabled")}",
             $"Action safety: {(context.Options.SafetyRequireApprovalForMajorActions ? "approval required for shell changes" : "approval disabled")} | {(context.Options.SafetyBlockProtectedSystemPaths ? "protected system paths blocked" : "protected system path blocking disabled")}",
@@ -800,19 +800,16 @@ public static partial class StickyNoteText
 
         try
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(12));
-            var response = await gateway.CompleteAsync(
-                new ChatCompletionRequest(
-                    [
-                        new ChatMessage("system", [ChatMessageContentPart.FromText(source is null ? Instructions : Instructions + SourceInstructions)]),
-                        new ChatMessage("user", [ChatMessageContentPart.FromText(source is null ? $"Dictated: {dictated}" : $"Conversation:\n{source}")])
-                    ],
-                    Temperature: 0.1),
+            var content = await ModelCalls.CompleteTextAsync(
+                gateway,
+                source is null ? Instructions : Instructions + SourceInstructions,
+                source is null ? $"Dictated: {dictated}" : $"Conversation:\n{source}",
                 ModelRoute.Fast,
-                timeout.Token);
+                0.1,
+                TimeSpan.FromSeconds(12),
+                cancellationToken);
 
-            return ResolveDays(Accept(response.Content, source ?? dictated) ?? fallback, now);
+            return ResolveDays(Accept(content, source ?? dictated) ?? fallback, now);
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
@@ -852,7 +849,7 @@ public static partial class StickyNoteText
     /// <summary>The model's note, or null when it is empty, overlong, or unrelated to what was said.</summary>
     public static string? Accept(string modelOutput, string dictated)
     {
-        var note = ThinkBlockRegex().Replace(modelOutput ?? string.Empty, string.Empty);
+        var note = ModelCalls.StripThink(modelOutput);
         note = Regex.Replace(note, @"^\s*(?:sticky\s+)?note\s*:\s*", string.Empty, RegexOptions.IgnoreCase);
         note = Regex.Replace(note, @"\s+", " ").Trim().Trim('"', '\'', '`', '*').Trim();
 
@@ -882,10 +879,6 @@ public static partial class StickyNoteText
     // The lowercase words of 3+ letters or digits, used to check that a model-written note shares words with what was said.
     private static HashSet<string> ContentWords(string text) =>
         Regex.Matches(text.ToLowerInvariant(), @"[a-z0-9]{3,}").Select(match => match.Value).ToHashSet();
-
-    // Matches a reasoning block (think tags) that some models print before the answer, so it can be removed.
-    [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
-    private static partial Regex ThinkBlockRegex();
 }
 
 // Puts the computer to sleep a few seconds after replying, so the reply can be shown and spoken first.
@@ -971,12 +964,12 @@ public sealed class ComputerContextTool : IAssistantTool
     }
 }
 
-// Network overview, device scan or health check, or details for one IP or host. The desktop service does the real work.
+// Network overview or health check, or details for one IP or host. The desktop service does the real work.
 public sealed class NetworkTool : IAssistantTool
 {
     public string Name => "network";
 
-    public string Description => "Inspect the local network. Use `network`, `network scan`, `network health`, or `network <ip-or-host>`.";
+    public string Description => "Inspect the local network. Use `network`, `network health`, or `network <ip-or-host>`.";
 
     public bool CanHandle(string input)
     {
@@ -997,7 +990,7 @@ public sealed class NetworkTool : IAssistantTool
             SummaryText: response.ReplaceLineEndings(" ").Trim());
     }
 
-    // Maps the many ways of asking onto "scan", "health", empty (overview) or a specific host.
+    // Maps the many ways of asking onto "health", empty (overview) or a specific host.
     private static string ParseNetworkTarget(string input)
     {
         var normalized = input.Trim();
@@ -1005,7 +998,6 @@ public sealed class NetworkTool : IAssistantTool
         return LocalNetworkMonitoring.ModePhrases.TryGetValue(normalized, out var mode)
             ? mode switch
             {
-                LocalNetworkMonitoring.NetworkRequestMode.Scan => "scan",
                 LocalNetworkMonitoring.NetworkRequestMode.Health => "health",
                 _ => string.Empty
             }
@@ -1308,59 +1300,32 @@ public sealed class ScreenTool : IAssistantTool
 
     public string Description => "Monitor- and window-aware screen tooling. Use `screen`, `screen monitors`, `screen capture [target]`, `screen ocr [target]`, or `screen ui [target]`.";
 
-    public bool CanHandle(string input) =>
-        ToolInputHelper.StartsWithCommand(input, "screen") ||
-        ToolInputHelper.StartsWithCommand(input, "analyze screen") ||
-        ToolInputHelper.StartsWithCommand(input, "inspect screen") ||
-        ToolInputHelper.MatchesExact(input, "monitors", "show monitors", "list monitors", "displays", "show displays", "list displays") ||
-        ToolInputHelper.StartsWithCommand(input, "screenshot") ||
-        ToolInputHelper.StartsWithCommand(input, "take screenshot") ||
-        ToolInputHelper.StartsWithCommand(input, "capture screen") ||
-        ToolInputHelper.StartsWithCommand(input, "screen capture") ||
-        ToolInputHelper.StartsWithCommand(input, "screen ocr") ||
-        ToolInputHelper.StartsWithCommand(input, "screen text") ||
-        ToolInputHelper.StartsWithCommand(input, "ocr") ||
-        ToolInputHelper.StartsWithCommand(input, "extract text from screen") ||
-        ToolInputHelper.StartsWithCommand(input, "detect ui") ||
-        ToolInputHelper.StartsWithCommand(input, "screen ui") ||
-        ToolInputHelper.StartsWithCommand(input, "screen elements");
+    private static readonly string[] MonitorCommands = ["monitors", "show monitors", "list monitors", "displays", "show displays", "list displays"];
 
-    // The first matching branch wins; with no sub-command the text after "screen" is treated as a question about the current screen.
+    // Command words (longer first, since the first match wins) and what to do with the text after them. Checked top to bottom; the last row
+    // is the fallback, so with no sub-command the text after "screen" is treated as a question about the current screen.
+    private static readonly (string[] Prefixes, Func<IVisualContextService, string, CancellationToken, Task<ToolResult>> Run)[] Handlers =
+    [
+        (["screenshot", "take screenshot", "capture screen", "screen capture"], (visual, target, token) => visual.CaptureScreenAsync(target, token)),
+        (["screen ocr", "screen text", "ocr", "extract text from screen"], (visual, target, token) => visual.ExtractScreenTextAsync(target, token)),
+        (["detect ui", "screen ui", "screen elements"], (visual, target, token) => visual.DetectScreenUiAsync(target, token)),
+        (["screen", "analyze screen", "inspect screen"], (visual, question, token) => visual.AnalyzeCurrentScreenAsync(question, token))
+    ];
+
+    public bool CanHandle(string input) =>
+        ToolInputHelper.MatchesExact(input, MonitorCommands)
+        || Handlers.Any(handler => handler.Prefixes.Any(prefix => ToolInputHelper.StartsWithCommand(input, prefix)));
+
     public Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
-        if (ToolInputHelper.MatchesExact(input, "monitors", "show monitors", "list monitors", "displays", "show displays", "list displays"))
+        if (ToolInputHelper.MatchesExact(input, MonitorCommands))
         {
             return context.VisualContextService.ListDisplaysAsync(cancellationToken);
         }
 
-        if (ToolInputHelper.StartsWithCommand(input, "screenshot")
-            || ToolInputHelper.StartsWithCommand(input, "take screenshot")
-            || ToolInputHelper.StartsWithCommand(input, "capture screen")
-            || ToolInputHelper.StartsWithCommand(input, "screen capture"))
-        {
-            var target = ToolInputHelper.GetCommandTail(input, "screenshot", "take screenshot", "capture screen", "screen capture");
-            return context.VisualContextService.CaptureScreenAsync(target, cancellationToken);
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "screen ocr")
-            || ToolInputHelper.StartsWithCommand(input, "screen text")
-            || ToolInputHelper.StartsWithCommand(input, "ocr")
-            || ToolInputHelper.StartsWithCommand(input, "extract text from screen"))
-        {
-            var target = ToolInputHelper.GetCommandTail(input, "screen ocr", "screen text", "ocr", "extract text from screen");
-            return context.VisualContextService.ExtractScreenTextAsync(target, cancellationToken);
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "detect ui")
-            || ToolInputHelper.StartsWithCommand(input, "screen ui")
-            || ToolInputHelper.StartsWithCommand(input, "screen elements"))
-        {
-            var target = ToolInputHelper.GetCommandTail(input, "detect ui", "screen ui", "screen elements");
-            return context.VisualContextService.DetectScreenUiAsync(target, cancellationToken);
-        }
-
-        var question = ToolInputHelper.GetCommandTail(input, "screen", "analyze screen", "inspect screen");
-        return context.VisualContextService.AnalyzeCurrentScreenAsync(question, cancellationToken);
+        // Anything that matches no row falls to the last one (a question about the current screen).
+        var (prefixes, run) = Handlers.FirstOrDefault(row => row.Prefixes.Any(prefix => ToolInputHelper.StartsWithCommand(input, prefix)), Handlers[^1]);
+        return run(context.VisualContextService, ToolInputHelper.GetCommandTail(input, prefixes), cancellationToken);
     }
 }
 

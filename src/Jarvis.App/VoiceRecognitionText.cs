@@ -268,7 +268,7 @@ internal static partial class VoiceRecognitionText
             $"Primary wake phrase: {options.WakePhrase}.",
             $"Treat these as equivalent wake words: {string.Join(", ", wakeAliases)}.",
             "Preserve command phrases and app names accurately.",
-            "Common commands include: help, status, time, notes, weather, system, computer, apps, open app, focus app, close app, window state, send hotkey, open path, list files, read file, find files, browse, search web, screen, analyze document, analyze image, click element, type into, get element text, scroll, wait, run.",
+            "Common commands include: help, status, time, notes, weather, system, computer, apps, open app, focus app, close app, window state, send hotkey, open path, list files, read file, find files, browse, search web, screen, analyze document, analyze image, click element, type into, get element text, wait, run.",
             "If you hear Jervis, Jarviss, or Jarvice, transcribe it as Jarvis."
         };
 

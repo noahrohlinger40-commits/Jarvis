@@ -1,6 +1,6 @@
 // DesktopAutomation.cs: the main slice of DesktopAutomationService, the class behind every "computer" tool Jarvis can call
-// (open/launch apps, files, windows, clipboard, notifications, system status). The model's tool calls arrive here through
-// IDesktopAutomationService. Window/keyboard/clipboard work is handed to Win32UiAutomation; file and app lookup lives here.
+// (open/launch apps, files, windows, notifications, system status). The model's tool calls arrive here through
+// IDesktopAutomationService. Window/keyboard work is handed to Win32UiAutomation; file and app lookup lives here.
 // Other slices of the same class: DesktopAutomation.AppIndex.cs (installed-app catalog) and DesktopAutomation.Workflows.cs.
 using System.Text.RegularExpressions;
 using System.Diagnostics;
@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text;
 using Microsoft.Win32;
+using static Jarvis.Core.Win32UiAutomation;
 
 namespace Jarvis.Core;
 
@@ -60,12 +61,6 @@ public interface IDesktopAutomationService
 
     Task<string> SetWindowStateAsync(string targetApp, string state, CancellationToken cancellationToken);
 
-    Task<string> MoveWindowAsync(string targetApp, int x, int y, CancellationToken cancellationToken);
-
-    Task<string> ResizeWindowAsync(string targetApp, int width, int height, CancellationToken cancellationToken);
-
-    Task<string> SnapWindowAsync(string targetApp, string position, CancellationToken cancellationToken);
-
     Task<string> SendHotkeyAsync(string targetApp, string hotkey, CancellationToken cancellationToken);
 
     Task<string> ClickElementAsync(string targetApp, string elementName, CancellationToken cancellationToken);
@@ -76,17 +71,7 @@ public interface IDesktopAutomationService
 
     Task<string> GetElementTextAsync(string targetApp, string elementName, CancellationToken cancellationToken);
 
-    Task<string> ScrollWindowAsync(string targetApp, string direction, CancellationToken cancellationToken);
-
     Task<string> ControlMediaAsync(string command, CancellationToken cancellationToken);
-
-    Task<string> GetClipboardAsync(CancellationToken cancellationToken);
-
-    Task<string> SetClipboardAsync(string text, CancellationToken cancellationToken);
-
-    Task<string> ClearClipboardAsync(CancellationToken cancellationToken);
-
-    Task<string> PasteClipboardAsync(string targetApp, CancellationToken cancellationToken);
 
     Task<string> SendNotificationAsync(string title, string message, CancellationToken cancellationToken);
 
@@ -99,18 +84,6 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
 {
     // Win32 ShowWindow command number 9 = SW_RESTORE: bring a minimised window back to its normal size.
     private const int SwRestore = 9;
-    // File types the shell can run when the user asks to open a launcher: shortcuts, internet shortcuts, ClickOnce links, programs, scripts and Microsoft Management Console snap-ins.
-    private static readonly string[] DesktopLaunchableExtensions =
-    [
-        ".lnk",
-        ".url",
-        ".appref-ms",
-        ".exe",
-        ".bat",
-        ".cmd",
-        ".msc"
-    ];
-
     // Spoken app names mapped to what Windows should run. Values that end in ":" are URI schemes (the app registers itself with Windows); bare names like "chrome" are resolved by the shell.
     // "spots" is here because speech recognition tends to hear "Spotify" that way.
     private static readonly IReadOnlyDictionary<string, string> BuiltInAppAliases =
@@ -215,24 +188,6 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         return Win32UiAutomation.ListWindowsAsync(target);
     }
 
-    public Task<string> MoveWindowAsync(string targetApp, int x, int y, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.MoveWindowAsync(targetApp, x, y);
-    }
-
-    public Task<string> ResizeWindowAsync(string targetApp, int width, int height, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.ResizeWindowAsync(targetApp, width, height);
-    }
-
-    public Task<string> SnapWindowAsync(string targetApp, string position, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.SnapWindowAsync(targetApp, position);
-    }
-
     public Task<string> SendHotkeyAsync(string targetApp, string hotkey, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -257,40 +212,10 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         return Win32UiAutomation.GetElementTextAsync(targetApp, elementName);
     }
 
-    public Task<string> ScrollWindowAsync(string targetApp, string direction, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.ScrollWindowAsync(targetApp, direction);
-    }
-
     public Task<string> ControlMediaAsync(string command, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return Win32UiAutomation.ControlMediaAsync(command);
-    }
-
-    public Task<string> GetClipboardAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.GetClipboardTextAsync();
-    }
-
-    public Task<string> SetClipboardAsync(string text, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.SetClipboardTextAsync(text);
-    }
-
-    public Task<string> ClearClipboardAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.ClearClipboardAsync();
-    }
-
-    public Task<string> PasteClipboardAsync(string targetApp, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Win32UiAutomation.PasteClipboardAsync(targetApp);
     }
 
     // Waiting does not need the cancellation check up front; Win32UiAutomation.WaitAsync observes the token itself while it sleeps.
@@ -1226,13 +1151,9 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         {
             "running app" => 7,
             "start menu" => 6,
-            "desktop shortcut" => 6,
-            "desktop executable" => 6,
             "app paths" => 6,
-            "installed app" => 5,
             "store app" => 5,
             "start app" => 5,
-            "local app data" => 5,
             "alias" => 1,
             _ => 2
         };
@@ -1244,11 +1165,7 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         return candidate.Source switch
         {
             "app paths" => 8,
-            "local app data" => 8,
-            "installed app" => 7,
             "start menu" => 7,
-            "desktop executable" => 7,
-            "desktop shortcut" => 6,
             "running app" => 5,
             "alias" => 4,
             _ => GetCandidatePriority(candidate)
@@ -1349,63 +1266,6 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         }
     }
 
-    // Finds launchable items placed on the Desktop (this user's and the shared one), top level only.
-    private IEnumerable<ApplicationCandidate> GetDesktopApplications()
-    {
-        foreach (var root in new[]
-                 {
-                     Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-                     Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory)
-                 })
-        {
-            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
-            {
-                continue;
-            }
-
-            IEnumerable<string> files;
-
-            try
-            {
-                files = Directory.EnumerateFiles(root, "*", SearchOption.TopDirectoryOnly)
-                    .Where(IsLaunchableDesktopEntry);
-            }
-            catch
-            {
-                continue;
-            }
-
-            foreach (var path in files)
-            {
-                var name = Path.GetFileNameWithoutExtension(path);
-
-                if (string.IsNullOrWhiteSpace(name))
-                {
-                    continue;
-                }
-
-                var source = Path.GetExtension(path).Equals(".exe", StringComparison.OrdinalIgnoreCase)
-                    ? "desktop executable"
-                    : "desktop shortcut";
-
-                yield return new ApplicationCandidate(name, path, source, false, IntPtr.Zero, 0, name, string.Empty);
-            }
-        }
-    }
-
-    // True when the file has one of the launchable extensions listed in DesktopLaunchableExtensions.
-    private static bool IsLaunchableDesktopEntry(string path)
-    {
-        var extension = Path.GetExtension(path);
-
-        if (string.IsNullOrWhiteSpace(extension))
-        {
-            return false;
-        }
-
-        return DesktopLaunchableExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase);
-    }
-
     // Reads the "App Paths" registry entries, where installers register program names so Windows can run them by short name (like "chrome").
     private static IEnumerable<ApplicationCandidate> GetAppPathApplications()
     {
@@ -1418,149 +1278,6 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         {
             yield return candidate;
         }
-    }
-
-    // Reads the "Uninstall" registry entries (the list behind Settings > Installed apps), in both the 64-bit and 32-bit views for this user and for all users.
-    private static IEnumerable<ApplicationCandidate> GetInstalledApplications()
-    {
-        foreach (var candidate in ReadInstalledApplications(RegistryHive.CurrentUser, RegistryView.Registry64))
-        {
-            yield return candidate;
-        }
-
-        foreach (var candidate in ReadInstalledApplications(RegistryHive.CurrentUser, RegistryView.Registry32))
-        {
-            yield return candidate;
-        }
-
-        foreach (var candidate in ReadInstalledApplications(RegistryHive.LocalMachine, RegistryView.Registry64))
-        {
-            yield return candidate;
-        }
-
-        foreach (var candidate in ReadInstalledApplications(RegistryHive.LocalMachine, RegistryView.Registry32))
-        {
-            yield return candidate;
-        }
-    }
-
-    // Finds per-user apps installed under AppData\Local (Discord, Slack style installers), which often do not appear in the Start menu list.
-    private IEnumerable<ApplicationCandidate> GetLocalUserApplications()
-    {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-
-        if (string.IsNullOrWhiteSpace(localAppData) || !Directory.Exists(localAppData))
-        {
-            yield break;
-        }
-
-        IEnumerable<string> directories;
-
-        try
-        {
-            directories = Directory.EnumerateDirectories(localAppData, "*", SearchOption.TopDirectoryOnly);
-        }
-        catch
-        {
-            yield break;
-        }
-
-        foreach (var directory in directories)
-        {
-            if (ShouldSkipLocalApplicationDirectory(directory))
-            {
-                continue;
-            }
-
-            // Those installers keep each version in an "app-1.2.3" subfolder (Squirrel); this picks the newest one.
-            var launchDirectory = ResolveLatestSquirrelApplicationDirectory(directory);
-
-            if (string.IsNullOrWhiteSpace(launchDirectory))
-            {
-                continue;
-            }
-
-            var displayName = Path.GetFileName(directory);
-            var launchTarget = FindBestExecutableInInstallLocation(launchDirectory, displayName, 1);
-
-            if (string.IsNullOrWhiteSpace(launchTarget))
-            {
-                continue;
-            }
-
-            yield return new ApplicationCandidate(
-                displayName,
-                launchTarget,
-                "local app data",
-                false,
-                IntPtr.Zero,
-                0,
-                displayName,
-                string.Empty);
-        }
-    }
-
-    // Reads one registry view of the Uninstall list and turns each named entry into an app candidate. Any registry error ends that view quietly.
-    private static IReadOnlyList<ApplicationCandidate> ReadInstalledApplications(RegistryHive hive, RegistryView view)
-    {
-        var candidates = new List<ApplicationCandidate>();
-        RegistryKey? baseKey = null;
-        RegistryKey? uninstallKey = null;
-
-        try
-        {
-            baseKey = RegistryKey.OpenBaseKey(hive, view);
-            uninstallKey = baseKey.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall");
-
-            if (uninstallKey is null)
-            {
-                return candidates;
-            }
-
-            foreach (var subKeyName in uninstallKey.GetSubKeyNames())
-            {
-                using var subKey = uninstallKey.OpenSubKey(subKeyName);
-
-                if (subKey is null)
-                {
-                    continue;
-                }
-
-                var displayName = (subKey.GetValue("DisplayName") as string)?.Trim();
-
-                if (string.IsNullOrWhiteSpace(displayName) || ShouldSkipInstalledApplication(displayName))
-                {
-                    continue;
-                }
-
-                var launchTarget = ResolveInstalledApplicationLaunchTarget(subKey, displayName);
-
-                if (string.IsNullOrWhiteSpace(launchTarget))
-                {
-                    continue;
-                }
-
-                candidates.Add(new ApplicationCandidate(
-                    displayName,
-                    launchTarget,
-                    "installed app",
-                    false,
-                    IntPtr.Zero,
-                    0,
-                    displayName,
-                    string.Empty));
-            }
-        }
-        catch
-        {
-        }
-        finally
-        {
-            uninstallKey?.Dispose();
-            baseKey?.Dispose();
-        }
-
-        return candidates;
     }
 
     // Reads one App Paths registry hive: each sub-key name (like chrome.exe) maps to the full program path stored as its default value.
@@ -1594,362 +1311,21 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         }
     }
 
-    // Hides uninstall-list entries that are not apps a person would ask to open (runtime libraries, Windows updates, OneDrive/Edge updaters).
-    private static bool ShouldSkipInstalledApplication(string displayName)
-    {
-        var normalized = displayName.Trim();
-
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return true;
-        }
-
-        var noisyPrefixes = new[]
-        {
-            "Microsoft Visual C++",
-            "Security Update for",
-            "Update for",
-            "Hotfix for",
-            "NVIDIA PhysX",
-            "Microsoft Edge Update",
-            "Microsoft OneDrive"
-        };
-
-        return noisyPrefixes.Any(prefix => normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-    }
-
-    // Works out which program to run for an Uninstall-list entry: first the program named by its icon path, else the best-looking .exe in its install folder.
-    private static string ResolveInstalledApplicationLaunchTarget(RegistryKey subKey, string displayName)
-    {
-        var displayIcon = (subKey.GetValue("DisplayIcon") as string)?.Trim();
-        var installLocation = (subKey.GetValue("InstallLocation") as string)?.Trim();
-
-        if (TryExtractLaunchablePath(displayIcon, out var launchTarget))
-        {
-            return launchTarget;
-        }
-
-        if (!string.IsNullOrWhiteSpace(installLocation))
-        {
-            var candidate = FindBestExecutableInInstallLocation(installLocation, displayName);
-
-            if (!string.IsNullOrWhiteSpace(candidate))
-            {
-                return candidate;
-            }
-        }
-
-        return string.Empty;
-    }
-
-    // Pulls a real file path out of a registry value such as "C:\Program Files\App\app.exe",0 (quoted, or with trailing icon index/arguments).
-    // Returns false unless the result is an absolute path to a file that exists.
-    private static bool TryExtractLaunchablePath(string? rawValue, out string launchTarget)
-    {
-        launchTarget = string.Empty;
-
-        if (string.IsNullOrWhiteSpace(rawValue))
-        {
-            return false;
-        }
-
-        var trimmed = Environment.ExpandEnvironmentVariables(rawValue.Trim());
-        string candidate;
-
-        if (trimmed.StartsWith('"'))
-        {
-            var closingQuoteIndex = trimmed.IndexOf('"', 1);
-
-            if (closingQuoteIndex <= 1)
-            {
-                return false;
-            }
-
-            candidate = trimmed[1..closingQuoteIndex];
-        }
-        else
-        {
-            var matchedPath = TrySlicePathToKnownExtension(trimmed);
-
-            if (string.IsNullOrWhiteSpace(matchedPath))
-            {
-                return false;
-            }
-
-            candidate = matchedPath;
-        }
-
-        if (!Path.IsPathRooted(candidate))
-        {
-            return false;
-        }
-
-        candidate = Path.GetFullPath(candidate);
-
-        if (!File.Exists(candidate))
-        {
-            return false;
-        }
-
-        launchTarget = candidate;
-        return true;
-    }
-
-    // For an unquoted value, cuts the text off right after the last known program extension, dropping any trailing arguments or icon index.
-    private static string TrySlicePathToKnownExtension(string value)
-    {
-        var extensions = new[] { ".exe", ".bat", ".cmd", ".lnk", ".appref-ms", ".msc", ".url" };
-        var bestEndIndex = -1;
-
-        foreach (var extension in extensions)
-        {
-            var index = value.IndexOf(extension, StringComparison.OrdinalIgnoreCase);
-
-            if (index < 0)
-            {
-                continue;
-            }
-
-            var candidateEnd = index + extension.Length;
-
-            if (candidateEnd > bestEndIndex)
-            {
-                bestEndIndex = candidateEnd;
-            }
-        }
-
-        return bestEndIndex <= 0 ? string.Empty : value[..bestEndIndex];
-    }
-
-    // Looks through an install folder (a few levels deep, breadth-first) and picks the .exe whose name best matches the app's name; the one at the top level gets a small bonus.
-    private static string FindBestExecutableInInstallLocation(string installLocation, string displayName, int maxDepth = 2)
-    {
-        if (string.IsNullOrWhiteSpace(installLocation))
-        {
-            return string.Empty;
-        }
-
-        var expandedLocation = Environment.ExpandEnvironmentVariables(installLocation);
-
-        if (!Directory.Exists(expandedLocation))
-        {
-            return string.Empty;
-        }
-
-        var displayTokens = NormalizeForMatching(displayName)
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        var queue = new Queue<(string Directory, int Depth)>();
-        var scoredCandidates = new List<(string Path, int Score)>();
-        queue.Enqueue((expandedLocation, 0));
-
-        while (queue.Count > 0)
-        {
-            var (directory, depth) = queue.Dequeue();
-
-            try
-            {
-                foreach (var filePath in Directory.EnumerateFiles(directory, "*.exe", SearchOption.TopDirectoryOnly))
-                {
-                    var fileName = Path.GetFileNameWithoutExtension(filePath);
-
-                    if (ShouldSkipExecutableCandidate(fileName))
-                    {
-                        continue;
-                    }
-
-                    var normalizedFileName = NormalizeForMatching(fileName);
-                    var score = 0;
-
-                    if (normalizedFileName == NormalizeForMatching(displayName))
-                    {
-                        score += 100;
-                    }
-
-                    if (normalizedFileName.Contains(NormalizeForMatching(displayName), StringComparison.OrdinalIgnoreCase))
-                    {
-                        score += 45;
-                    }
-
-                    foreach (var token in displayTokens)
-                    {
-                        if (normalizedFileName.Contains(token, StringComparison.OrdinalIgnoreCase))
-                        {
-                            score += 18;
-                        }
-                    }
-
-                    if (directory.Equals(expandedLocation, StringComparison.OrdinalIgnoreCase))
-                    {
-                        score += 10;
-                    }
-
-                    scoredCandidates.Add((filePath, score));
-                }
-
-                if (depth >= maxDepth)
-                {
-                    continue;
-                }
-
-                foreach (var childDirectory in Directory.EnumerateDirectories(directory))
-                {
-                    queue.Enqueue((childDirectory, depth + 1));
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        return scoredCandidates
-            .OrderByDescending(candidate => candidate.Score)
-            .ThenBy(candidate => candidate.Path, StringComparer.OrdinalIgnoreCase)
-            .Select(candidate => candidate.Path)
-            .FirstOrDefault() ?? string.Empty;
-    }
-
-    // Skips helper programs that would be the wrong thing to launch: uninstallers, setup/update programs and crash handlers.
-    private static bool ShouldSkipExecutableCandidate(string fileName)
-    {
-        var normalized = fileName.Trim();
-
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return true;
-        }
-
-        var noisyNames = new[]
-        {
-            "uninstall",
-            "unins000",
-            "unins001",
-            "gamelaunchhelper",
-            "setup",
-            "update",
-            "updater",
-            "crashpad_handler"
-        };
-
-        return noisyNames.Any(noisy =>
-            normalized.Contains(noisy, StringComparison.OrdinalIgnoreCase));
-    }
-
-    // Skips AppData\Local folders that hold caches, system data or vendor files rather than a user-launchable app.
-    private static bool ShouldSkipLocalApplicationDirectory(string directory)
-    {
-        var name = Path.GetFileName(directory);
-
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            return true;
-        }
-
-        var noisyNames = new[]
-        {
-            "Temp",
-            "Packages",
-            "Package Cache",
-            "CrashDumps",
-            "ConnectedDevicesPlatform",
-            "D3DSCache",
-            "Microsoft",
-            "NVIDIA",
-            "PlaceholderTileLogoFolder",
-            "Publishers",
-            "SquirrelTemp"
-        };
-
-        return noisyNames.Any(noisy => string.Equals(name, noisy, StringComparison.OrdinalIgnoreCase));
-    }
-
-    // Discord and Slack style installers keep each release in a folder named "app-1.2.3"; this returns the folder with the highest version number.
-    private static string ResolveLatestSquirrelApplicationDirectory(string directory)
-    {
-        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
-        {
-            return string.Empty;
-        }
-
-        IEnumerable<string> appDirectories;
-
-        try
-        {
-            appDirectories = Directory.EnumerateDirectories(directory, "app-*", SearchOption.TopDirectoryOnly);
-        }
-        catch
-        {
-            return string.Empty;
-        }
-
-        return appDirectories
-            .Select(path => new
-            {
-                Path = path,
-                Version = ParseSquirrelVersion(Path.GetFileName(path))
-            })
-            .OrderByDescending(item => item.Version is not null)
-            .ThenByDescending(item => item.Version)
-            .ThenByDescending(item => item.Path, StringComparer.OrdinalIgnoreCase)
-            .Select(item => item.Path)
-            .FirstOrDefault() ?? string.Empty;
-    }
-
-    // Turns a folder name like "app-1.0.9" into a Version object; null when it does not look like that.
-    private static Version? ParseSquirrelVersion(string? directoryName)
-    {
-        if (string.IsNullOrWhiteSpace(directoryName)
-            || !directoryName.StartsWith("app-", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-
-        return Version.TryParse(directoryName[4..], out var version)
-            ? version
-            : null;
-    }
-
     // Asks Windows which window is in front and which program owns it (name, process id, title). Returns null when that is not available.
     private ForegroundWindowInfo? TryGetForegroundWindowInfo()
     {
-        try
-        {
-            var handle = GetForegroundWindow();
+        var handle = GetForegroundWindow();
 
-            if (handle == IntPtr.Zero)
-            {
-                return null;
-            }
-
-            // Windows API GetWindowThreadProcessId: given a window handle, tells us the id of the process that owns it.
-            _ = GetWindowThreadProcessId(handle, out var processId);
-
-            if (processId == 0)
-            {
-                return null;
-            }
-
-            using var process = Process.GetProcessById((int)processId);
-            return new ForegroundWindowInfo(process.ProcessName, (int)processId, ReadWindowTitle(handle));
-        }
-        catch
+        if (handle == IntPtr.Zero)
         {
             return null;
         }
-    }
 
-    // Reads a window's title bar text. GetWindowTextLength says how long it is, GetWindowText copies it into a buffer (+1 for the end-of-string character).
-    private static string ReadWindowTitle(IntPtr handle)
-    {
-        var length = GetWindowTextLength(handle);
+        var processName = TryGetProcessName(handle, out var processId);
 
-        if (length <= 0)
-        {
-            return string.Empty;
-        }
-
-        var builder = new StringBuilder(length + 1);
-        _ = GetWindowText(handle, builder, builder.Capacity);
-        return builder.ToString();
+        return processName.Length == 0
+            ? null
+            : new ForegroundWindowInfo(processName, processId, ReadWindowText(handle));
     }
 
     // Top-level entries (folders and files) of the workspace root, for the context snapshot.
@@ -1984,39 +1360,8 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         return drives.Length == 0 ? "No ready drives found." : string.Join(" | ", drives);
     }
 
-    // Makes names comparable: lower-case, every character that is not a letter, digit or space becomes a space, and runs of spaces collapse to one. "Visual-Studio  Code!" becomes "visual studio code".
-    private static string NormalizeForMatching(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var chars = value
-            .ToLowerInvariant()
-            .Select(character => char.IsLetterOrDigit(character) || char.IsWhiteSpace(character) ? character : ' ')
-            .ToArray();
-
-        return string.Join(' ', new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries));
-    }
-
     // P/Invoke declarations: these let C# call functions in Windows' own user32.dll. SetLastError = true lets .NET record the Windows error code if a call fails.
-    // GetForegroundWindow returns the handle (a numeric id) of the window the user is currently typing into.
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr GetForegroundWindow();
-
-    // GetWindowText copies a window's title bar text into a StringBuilder buffer. CharSet.Unicode = use the wide-character version so non-English titles survive.
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
-    // GetWindowTextLength returns how many characters the window's title has.
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern int GetWindowTextLength(IntPtr hWnd);
-
-    // GetWindowThreadProcessId returns the thread that owns a window and, through the out parameter, the process id.
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
+    // (The window-title and foreground-window calls live in Win32UiAutomation and are shared through `using static`.)
     // SetForegroundWindow asks Windows to bring a window to the front and give it keyboard focus. Windows may refuse if another program is currently in front.
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -2055,12 +1400,6 @@ public sealed partial class DesktopAutomationService : IDesktopAutomationService
         return string.IsNullOrWhiteSpace(snapshot.ActiveApplication)
             ? "Unavailable"
             : snapshot.ActiveApplication.Trim();
-    }
-
-    // Returns "Unavailable" for blank text, otherwise the trimmed text.
-    private static string OrUnavailable(string value)
-    {
-        return string.IsNullOrWhiteSpace(value) ? "Unavailable" : value.Trim();
     }
 
     // One launchable thing in the app catalog: its name, what to run, where the entry came from (see GetCandidatePriority), whether a window is open now (with its handle and process), and optional command-line arguments.

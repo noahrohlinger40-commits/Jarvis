@@ -1,6 +1,6 @@
 # whisper-server.py: a small local web server (FastAPI + uvicorn) that gives Jarvis its speech features
 # without any cloud service. It listens on http://127.0.0.1:8178 by default (JARVIS_WHISPER_PORT) and serves:
-#   POST /v1/audio/transcriptions  speech-to-text (faster-whisper); returns the spoken words as text
+#   POST /v1/audio/transcriptions  speech-to-text (faster-whisper); returns JSON (add response_format=verbose_json for segment times)
 #   POST /v1/audio/speech          text-to-speech (Kokoro); streams spoken audio back
 #   POST /v1/wake                  wake-word check: was "hey Jarvis" said in this clip? (openWakeWord)
 #   GET  /health, GET /v1/models   liveness checks (/health also says whether the voice has finished loading)
@@ -44,7 +44,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from faster_whisper import WhisperModel
 from faster_whisper.utils import download_model
 
@@ -336,11 +336,11 @@ def list_models() -> dict[str, object]:
     return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "local"}]}
 
 
-# Plain def: FastAPI runs it in a worker thread, so a long transcription can't block /health.
+# Plain def: FastAPI runs it in a worker thread, so a long transcription can't block /health. The server always uses its own
+# model, so a "model" field in the request is ignored.
 @app.post("/v1/audio/transcriptions")
 def create_transcription(
     file: UploadFile = File(...),
-    model: str = Form(default=""),  # accepted for API compatibility; the server's own model is used
     language: str | None = Form(default=None),
     prompt: str | None = Form(default=None),
     response_format: str = Form(default="json"),
@@ -360,9 +360,6 @@ def create_transcription(
         raise HTTPException(status_code=422, detail=f"Could not transcribe audio: {exc}") from exc
 
     print(f"[whisper] {len(audio) / 1024:.0f} KiB -> {seconds:.2f}s: {text!r}", flush=True)
-
-    if response_format == "text":
-        return PlainTextResponse(text)
 
     if response_format == "verbose_json":  # OpenAI's shape; lecture notes use the segment times
         return JSONResponse({"text": text, "segments": timed})

@@ -253,11 +253,6 @@ public sealed class ToolSafetyService
     // in the steps below: blocked list first, then protected system paths, then read-only commands pass, and anything else asks for approval.
     internal SafetyDecision Assess(string toolName, string normalizedCommand)
     {
-        if (string.Equals(toolName, "chrome", StringComparison.OrdinalIgnoreCase))
-        {
-            return AssessChromeCommand(normalizedCommand);
-        }
-
         if (toolName is "write file" or "append file" or "replace in file" or "move path" or "copy path" or "delete path")
         {
             return AssessFileMutationCommand(toolName, normalizedCommand);
@@ -283,14 +278,8 @@ public sealed class ToolSafetyService
             return AssessSensitiveUiTyping(normalizedCommand);
         }
 
-        if (string.Equals(toolName, "clipboard", StringComparison.OrdinalIgnoreCase))
-        {
-            return AssessClipboardCommand(normalizedCommand);
-        }
-
         if (string.Equals(toolName, "code", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(toolName, "discord", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(toolName, "slack", StringComparison.OrdinalIgnoreCase))
+            || string.Equals(toolName, "discord", StringComparison.OrdinalIgnoreCase))
         {
             return AssessSensitiveAppTextEntry(toolName, normalizedCommand);
         }
@@ -355,7 +344,7 @@ public sealed class ToolSafetyService
 
     // Prompt-injection guard. Tools whose output is text written by outsiders (web pages, mail, the screen, files...).
     // A planner turn that has read one is "marked"; after that, only IsReadOnlyCall tools run without asking.
-    // clipboard and calendar are multi-action, so ReadsOutsideContent handles them by action.
+    // calendar is multi-action, so ReadsOutsideContent handles it by action.
     private static readonly HashSet<string> OutsideContentTools = new(StringComparer.OrdinalIgnoreCase)
     {
         "browse", "search web", "research", "page", "get element text", "read file", "screen", "analyze image",
@@ -366,13 +355,12 @@ public sealed class ToolSafetyService
     private static readonly HashSet<string> ReadOnlyTools = new(OutsideContentTools.Concat(
     [
         "list files", "find files", "windows", "app state", "computer", "apps", "status", "time", "help", "weather",
-        "network", "system", "recall", "notes", "preferences", "scroll", "wait"
+        "network", "system", "recall", "notes", "preferences", "wait"
     ]), StringComparer.OrdinalIgnoreCase);
 
-    // Whether a call reads text that outsiders wrote (web page, mail, screen). Chrome, clipboard and calendar depend on the action used.
+    // Whether a call reads text that outsiders wrote (web page, mail, screen). Chrome and calendar depend on the action used.
     internal static bool ReadsOutsideContent(string toolName, string normalizedCommand) => toolName.ToLowerInvariant() switch
     {
-        "clipboard" => UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var clip, out _) && clip == "show",
         "calendar" => IsReadOnlyCall(toolName, normalizedCommand),
         _ => OutsideContentTools.Contains(toolName)
     };
@@ -389,8 +377,6 @@ public sealed class ToolSafetyService
                 return AppIntegrationParsing.TryParseChrome(normalizedCommand, out var chrome)
                     && chrome.Action is "status" or "open-url" or "navigate-current" or "new-tab" or "new-window" or "back" or "forward" or "reload"
                         or "next-tab" or "previous-tab" or "history" or "downloads" or "bookmarks" or "find";
-            case "clipboard":
-                return UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var clip, out _) && clip == "show";
             case "calendar":
                 return !tail.Equals("add", StringComparison.OrdinalIgnoreCase)
                     && !tail.StartsWith("add ", StringComparison.OrdinalIgnoreCase)
@@ -426,7 +412,7 @@ public sealed class ToolSafetyService
     // Asks first when the text typed into a window looks like a password or key.
     private static SafetyDecision AssessSensitiveUiTyping(string normalizedCommand)
     {
-        if (!UiCommandParsing.TryParseTypeInto(normalizedCommand, out var target, out var text)
+        if (!UiCommandParsing.TryParseTypeInto(normalizedCommand, out var target, out _, out var text)
             || string.IsNullOrWhiteSpace(text)
             || !LooksLikeSensitiveUiPayload(text))
         {
@@ -516,40 +502,7 @@ public sealed class ToolSafetyService
             "Approval required for a UI hotkey action.");
     }
 
-    // Clipboard: copying something that looks secret, or pasting into a window, needs approval.
-    private SafetyDecision AssessClipboardCommand(string normalizedCommand)
-    {
-        if (!UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var action, out var payload))
-        {
-            return new SafetyDecision(SafetyDecisionKind.Allow);
-        }
-
-        if (string.Equals(action, "set", StringComparison.OrdinalIgnoreCase)
-            && !string.IsNullOrWhiteSpace(payload)
-            && LooksLikeSensitiveUiPayload(payload))
-        {
-            return RequireUiApproval(
-                $"copy sensitive-looking text to the clipboard ({DescribeSensitivePayload(payload)})",
-                "Copying sensitive-looking text to the clipboard is paused pending approval.",
-                "Approval required before I copy that sensitive text to the clipboard.",
-                "Approval required for sensitive clipboard content.");
-        }
-
-        if (!_options.SafetyRequireApprovalForMajorActions
-            || !string.Equals(action, "paste", StringComparison.OrdinalIgnoreCase)
-            || string.IsNullOrWhiteSpace(payload))
-        {
-            return new SafetyDecision(SafetyDecisionKind.Allow);
-        }
-
-        return RequireUiApproval(
-            $"paste clipboard contents into `{TrimForDisplay(payload)}`",
-            $"Pasting clipboard contents into `{TrimForInline(payload)}` is paused pending approval.",
-            "Approval required before I paste clipboard contents into that window.",
-            "Approval required for a clipboard paste action.");
-    }
-
-    // For code editors, Discord and Slack: asks first when the text to enter looks like a password or key.
+    // For code editors and Discord: asks first when the text to enter looks like a password or key.
     private static SafetyDecision AssessSensitiveAppTextEntry(string toolName, string normalizedCommand)
     {
         if (!AppIntegrationParsing.TryExtractSensitiveTextPayload(toolName, normalizedCommand, out var targetApp, out var text)
@@ -563,37 +516,6 @@ public sealed class ToolSafetyService
             $"Sending sensitive-looking text to `{TrimForInline(targetApp)}` is paused pending approval.",
             "Approval required before I send that sensitive text into the app.",
             "Approval required for sensitive app text entry.");
-    }
-
-    // Chrome: asks first for logins and sensitive form fill.
-    private SafetyDecision AssessChromeCommand(string normalizedCommand)
-    {
-        if (!AppIntegrationParsing.TryParseChrome(normalizedCommand, out var command))
-        {
-            return new SafetyDecision(SafetyDecisionKind.Allow);
-        }
-
-        if (command.Action == "login" && !string.IsNullOrWhiteSpace(command.Payload))
-        {
-            return RequireUiApproval(
-                "fill login credentials into Chrome",
-                "Chrome login automation is paused pending approval.",
-                "Approval required before I fill login credentials in Chrome.",
-                "Approval required for Chrome login automation.");
-        }
-
-        if ((command.Action == "fill" || command.Action == "form")
-            && !string.IsNullOrWhiteSpace(command.Payload)
-            && LooksLikeSensitiveUiPayload(command.Payload))
-        {
-            return RequireUiApproval(
-                $"fill sensitive-looking text into Chrome ({DescribeSensitivePayload(command.Payload)})",
-                "Sensitive Chrome form-fill content is paused pending approval.",
-                "Approval required before I fill that sensitive text in Chrome.",
-                "Approval required for sensitive Chrome form fill.");
-        }
-
-        return new SafetyDecision(SafetyDecisionKind.Allow);
     }
 
     // File tools (write, append, replace, move, copy, delete): protected system paths are blocked, everything else asks first.

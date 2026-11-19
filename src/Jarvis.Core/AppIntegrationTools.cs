@@ -1,9 +1,11 @@
-// AppIntegrationTools.cs: tools that control specific desktop apps (Spotify, VS Code, Chrome, File Explorer, Office, Discord, Slack).
+// AppIntegrationTools.cs: tools that control specific desktop apps (Spotify, VS Code, Chrome, Discord).
 // Each tool follows the same three steps: a parser in AppIntegrationParsing turns the typed command into an AppIntegrationCommand
 // (an Action name plus a text Payload), the tool's switch picks a helper for that action, and AppIntegrationHelpers does the work by
 // calling context.DesktopAutomation (focus a window, send a keyboard shortcut, send text, launch a program).
 // Most actions are therefore simulated keystrokes into the real app, with short fixed pauses between steps; there is no app-specific API.
-// ActionSafety.cs checks the same parsed commands to decide when to ask first (logins, form fills, sensitive text).
+// ActionSafety.cs checks the same parsed commands to decide when to ask first (sensitive text).
+using static Jarvis.Core.Win32UiAutomation;
+
 namespace Jarvis.Core;
 
 // Spotify: open or focus the app, show status, play/pause/skip/volume, or search. A bare "spotify <words>" is treated as a search.
@@ -114,11 +116,26 @@ public sealed class CodeTool : IAssistantTool
 public sealed class ChromeTool : IAssistantTool
 {
     // Help text shown for a bad Chrome command.
-    private const string Usage = "Usage: chrome [status|open <url-or-query>|search <query>|go <url>|new window [target]|new tab [target]|incognito [target]|back|forward|reload|close tab|reopen tab|duplicate tab|next tab|previous tab|history|downloads|bookmarks|devtools|find <query>|fill <text>|form <value1> ;; <value2>|login <username> :: <password> [:: submit]|submit]";
+    private const string Usage = "Usage: chrome [status|open <url-or-query>|search <query>|go <url>|new window [target]|new tab [target]|incognito [target]|back|forward|reload|close tab|reopen tab|duplicate tab|next tab|previous tab|history|downloads|bookmarks|devtools|find <query>|submit]";
+
+    // Actions that are just one Chrome shortcut: the key combo to press and the line reported back.
+    private static readonly Dictionary<string, (string Hotkey, string Message)> HotkeyActions = new()
+    {
+        ["back"] = ("alt+left", "Moved back in Chrome."),
+        ["forward"] = ("alt+right", "Moved forward in Chrome."),
+        ["reload"] = ("ctrl+r", "Reloaded the current Chrome tab."),
+        ["close-tab"] = ("ctrl+w", "Closed the current Chrome tab."),
+        ["reopen-tab"] = ("ctrl+shift+t", "Reopened the last closed Chrome tab."),
+        ["next-tab"] = ("ctrl+tab", "Moved to the next Chrome tab."),
+        ["previous-tab"] = ("ctrl+shift+tab", "Moved to the previous Chrome tab."),
+        ["devtools"] = ("ctrl+shift+i", "Opened Chrome DevTools."),
+        ["focus-address-bar"] = ("ctrl+l", "Focused the Chrome address bar."),
+        ["submit"] = ("enter", "Submitted the active Chrome form.")
+    };
 
     public string Name => "chrome";
 
-    public string Description => "Chrome adapter for navigation, tabs, history, downloads, bookmarks, find-on-page, and form or login filling, using keyboard shortcuts.";
+    public string Description => "Chrome adapter for navigation, tabs, history, downloads, bookmarks and find-on-page, using keyboard shortcuts.";
 
     public bool CanHandle(string input) => AppIntegrationParsing.TryParseChrome(input, out _);
 
@@ -164,29 +181,8 @@ public sealed class ChromeTool : IAssistantTool
             case "new-tab":
                 result = await AppIntegrationHelpers.NavigateBrowserAsync("chrome", command.Payload, openNewTab: true, context, cancellationToken);
                 break;
-            case "back":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "alt+left", context, cancellationToken, "Moved back in Chrome.");
-                break;
-            case "forward":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "alt+right", context, cancellationToken, "Moved forward in Chrome.");
-                break;
-            case "reload":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+r", context, cancellationToken, "Reloaded the current Chrome tab.");
-                break;
-            case "close-tab":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+w", context, cancellationToken, "Closed the current Chrome tab.");
-                break;
-            case "reopen-tab":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+shift+t", context, cancellationToken, "Reopened the last closed Chrome tab.");
-                break;
             case "duplicate-tab":
                 result = await AppIntegrationHelpers.DuplicateBrowserTabAsync("chrome", context, cancellationToken);
-                break;
-            case "next-tab":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+tab", context, cancellationToken, "Moved to the next Chrome tab.");
-                break;
-            case "previous-tab":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+shift+tab", context, cancellationToken, "Moved to the previous Chrome tab.");
                 break;
             case "history":
                 result = await AppIntegrationHelpers.NavigateBrowserAsync("chrome", "chrome://history", openNewTab: false, context, cancellationToken);
@@ -197,29 +193,13 @@ public sealed class ChromeTool : IAssistantTool
             case "bookmarks":
                 result = await AppIntegrationHelpers.NavigateBrowserAsync("chrome", "chrome://bookmarks", openNewTab: false, context, cancellationToken);
                 break;
-            case "devtools":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+shift+i", context, cancellationToken, "Opened Chrome DevTools.");
-                break;
-            case "focus-address-bar":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "ctrl+l", context, cancellationToken, "Focused the Chrome address bar.");
-                break;
             case "find":
                 result = await AppIntegrationHelpers.RunBrowserFindAsync("chrome", command.Payload, context, cancellationToken);
                 break;
-            case "fill":
-                result = await AppIntegrationHelpers.FillFocusedFieldAsync("chrome", command.Payload, context, cancellationToken);
-                break;
-            case "form":
-                result = await AppIntegrationHelpers.FillBrowserFormAsync("chrome", command.Payload, context, cancellationToken);
-                break;
-            case "login":
-                result = await AppIntegrationHelpers.FillBrowserLoginAsync("chrome", command.Payload, context, cancellationToken);
-                break;
-            case "submit":
-                result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "enter", context, cancellationToken, "Submitted the active Chrome form.");
-                break;
             default:
-                result = Usage;
+                result = HotkeyActions.TryGetValue(command.Action, out var hotkeyAction)
+                    ? await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", hotkeyAction.Hotkey, context, cancellationToken, hotkeyAction.Message)
+                    : Usage;
                 break;
         }
 
@@ -228,127 +208,12 @@ public sealed class ChromeTool : IAssistantTool
     }
 }
 
-// File Explorer: open or focus, open a path, or open a folder with a file selected ("reveal").
-public sealed class ExplorerAppTool : IAssistantTool
-{
-    public string Name => "explorer";
-
-    public string Description => "Explorer adapter. Use `explorer`, `explorer status`, `explorer downloads`, `explorer open <path>`, or `explorer reveal <path>`.";
-
-    public bool CanHandle(string input) => AppIntegrationParsing.TryParseExplorer(input, out _);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!AppIntegrationParsing.TryParseExplorer(input, out var command))
-        {
-            return new ToolResult("Usage: explorer [status|open <path>|reveal <path>|downloads|desktop|documents|workspace]");
-        }
-
-        string result;
-
-        // Each case is an action name produced by AppIntegrationParsing.TryParseExplorer.
-        switch (command.Action)
-        {
-            case "open":
-                result = await AppIntegrationHelpers.OpenOrFocusAsync("explorer", context, cancellationToken);
-                break;
-            case "status":
-                result = await AppIntegrationHelpers.GetAppStatusAsync("Explorer", ["explorer", "file explorer"], context, cancellationToken);
-                break;
-            case "open-path":
-                result = await context.DesktopAutomation.OpenPathAsync(command.Payload, cancellationToken);
-                break;
-            case "reveal":
-            {
-                var resolvedPath = AppIntegrationHelpers.ResolvePath(command.Payload, context.WorkspaceRoot);
-
-                if (!File.Exists(resolvedPath) && !Directory.Exists(resolvedPath))
-                {
-                    result = $"Path not found: {resolvedPath}";
-                    break;
-                }
-
-                result = await context.DesktopAutomation.LaunchApplicationAsync("explorer", $"/select,\"{resolvedPath}\"", cancellationToken);
-                break;
-            }
-            default:
-                result = "Usage: explorer [status|open <path>|reveal <path>|downloads|desktop|documents|workspace]";
-                break;
-        }
-
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Handled Explorer action." : "Explorer action failed.");
-    }
-}
-
-// Microsoft Office: Word, Excel, PowerPoint (open a file or just the app) and Outlook (open only), or a combined status.
-public sealed class OfficeTool : IAssistantTool
-{
-    public string Name => "office";
-
-    public string Description => "Office adapter. Use `office status`, `office word`, `office word <path>`, `office excel <path>`, `office powerpoint <path>`, or `office outlook`.";
-
-    public bool CanHandle(string input) => AppIntegrationParsing.TryParseOffice(input, out _);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!AppIntegrationParsing.TryParseOffice(input, out var command))
-        {
-            return new ToolResult("Usage: office [status|word [path]|excel [path]|powerpoint [path]|outlook]");
-        }
-
-        string result;
-
-        // Action names are "status", or "open-<app>" / "status-<app>" for each Office app.
-        switch (command.Action)
-        {
-            case "status":
-                result = await AppIntegrationHelpers.GetSuiteStatusAsync(
-                    "Office",
-                    context,
-                    cancellationToken,
-                    ("Word", ["word", "microsoft word"]),
-                    ("Excel", ["excel", "microsoft excel"]),
-                    ("PowerPoint", ["powerpoint", "power point", "microsoft powerpoint"]),
-                    ("Outlook", ["outlook", "microsoft outlook"]));
-                break;
-            case "open-word":
-                result = await AppIntegrationHelpers.OpenFileInAppAsync("word", command.Payload, context, cancellationToken);
-                break;
-            case "status-word":
-                result = await AppIntegrationHelpers.GetAppStatusAsync("Word", ["word", "microsoft word"], context, cancellationToken);
-                break;
-            case "open-excel":
-                result = await AppIntegrationHelpers.OpenFileInAppAsync("excel", command.Payload, context, cancellationToken);
-                break;
-            case "status-excel":
-                result = await AppIntegrationHelpers.GetAppStatusAsync("Excel", ["excel", "microsoft excel"], context, cancellationToken);
-                break;
-            case "open-powerpoint":
-                result = await AppIntegrationHelpers.OpenFileInAppAsync("powerpoint", command.Payload, context, cancellationToken);
-                break;
-            case "status-powerpoint":
-                result = await AppIntegrationHelpers.GetAppStatusAsync("PowerPoint", ["powerpoint", "power point", "microsoft powerpoint"], context, cancellationToken);
-                break;
-            case "open-outlook":
-                result = await AppIntegrationHelpers.OpenOrFocusAsync("outlook", context, cancellationToken);
-                break;
-            case "status-outlook":
-                result = await AppIntegrationHelpers.GetAppStatusAsync("Outlook", ["outlook", "microsoft outlook"], context, cancellationToken);
-                break;
-            default:
-                result = "Usage: office [status|word [path]|excel [path]|powerpoint [path]|outlook]";
-                break;
-        }
-
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Handled Office action." : "Office action failed.");
-    }
-}
-
 // Discord: open or focus, status, and two shortcut-driven searches: the quick switcher (Ctrl+K) to jump to a channel or person, and message search (Ctrl+F).
 public sealed class DiscordTool : IAssistantTool
 {
+    // The two Discord searches differ only in the shortcut that opens the box: Ctrl+K is the quick switcher (jump), Ctrl+F is message search.
+    private static readonly Dictionary<string, string> SearchHotkeys = new() { ["jump"] = "ctrl+k", ["search"] = "ctrl+f" };
+
     public string Name => "discord";
 
     public string Description => "Discord adapter. Use `discord`, `discord status`, `discord jump <query>`, or `discord search <query>`.";
@@ -373,59 +238,15 @@ public sealed class DiscordTool : IAssistantTool
             case "status":
                 result = await AppIntegrationHelpers.GetAppStatusAsync("Discord", ["discord"], context, cancellationToken);
                 break;
-            case "jump":
-                result = await AppIntegrationHelpers.RunTextEntryWorkflowAsync("discord", "ctrl+k", command.Payload, context, cancellationToken);
-                break;
-            case "search":
-                result = await AppIntegrationHelpers.RunTextEntryWorkflowAsync("discord", "ctrl+f", command.Payload, context, cancellationToken);
-                break;
             default:
-                result = "Usage: discord [status|jump <query>|search <query>]";
+                result = SearchHotkeys.TryGetValue(command.Action, out var hotkey)
+                    ? await AppIntegrationHelpers.RunTextEntryWorkflowAsync("discord", hotkey, command.Payload, context, cancellationToken)
+                    : "Usage: discord [status|jump <query>|search <query>]";
                 break;
         }
 
         var success = !UiCommandParsing.LooksLikeFailure(result);
         return new ToolResult(result, VerificationText: result, SummaryText: success ? "Handled Discord action." : "Discord action failed.");
-    }
-}
-
-// Slack: open or focus, status, and jump to a channel or person with the quick switcher (Ctrl+K).
-public sealed class SlackTool : IAssistantTool
-{
-    public string Name => "slack";
-
-    public string Description => "Slack adapter. Use `slack`, `slack status`, or `slack jump <query>`.";
-
-    public bool CanHandle(string input) => AppIntegrationParsing.TryParseSlack(input, out _);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (!AppIntegrationParsing.TryParseSlack(input, out var command))
-        {
-            return new ToolResult("Usage: slack [status|jump <query>]");
-        }
-
-        string result;
-
-        // Each case is an action name produced by AppIntegrationParsing.TryParseSlack.
-        switch (command.Action)
-        {
-            case "open":
-                result = await AppIntegrationHelpers.OpenOrFocusAsync("slack", context, cancellationToken);
-                break;
-            case "status":
-                result = await AppIntegrationHelpers.GetAppStatusAsync("Slack", ["slack"], context, cancellationToken);
-                break;
-            case "jump":
-                result = await AppIntegrationHelpers.RunTextEntryWorkflowAsync("slack", "ctrl+k", command.Payload, context, cancellationToken);
-                break;
-            default:
-                result = "Usage: slack [status|jump <query>]";
-                break;
-        }
-
-        var success = !UiCommandParsing.LooksLikeFailure(result);
-        return new ToolResult(result, VerificationText: result, SummaryText: success ? "Handled Slack action." : "Slack action failed.");
     }
 }
 
@@ -505,38 +326,6 @@ internal static class AppIntegrationHelpers
             $"- Active now: {(active ? "yes" : "no")}",
             $"- Visible windows: {string.Join(" | ", visible)}"
         };
-
-        if (!string.IsNullOrWhiteSpace(snapshot.ActiveWindow))
-        {
-            lines.Add($"- Foreground window: {snapshot.ActiveWindow}");
-        }
-
-        return string.Join(Environment.NewLine, lines);
-    }
-
-    // Same as above for a group of apps (used for the Office suite).
-    public static async Task<string> GetSuiteStatusAsync(
-        string displayName,
-        ToolContext context,
-        CancellationToken cancellationToken,
-        params (string AppName, string[] MatchTerms)[] apps)
-    {
-        var snapshot = await context.DesktopAutomation.GetContextSnapshotAsync(cancellationToken);
-        var lines = new List<string> { $"{displayName} status:" };
-
-        foreach (var (appName, matchTerms) in apps)
-        {
-            var active = MatchesAny(snapshot.ActiveApplication, matchTerms) || MatchesAny(snapshot.ActiveWindow, matchTerms);
-            var visible = snapshot.VisibleApplications.Where(value => MatchesAny(value, matchTerms)).Take(2).ToArray();
-            var state = visible.Length == 0
-                ? "not visible"
-                : active
-                    ? "active"
-                    : "visible";
-            var detail = visible.Length == 0 ? string.Empty : $" ({string.Join(" | ", visible)})";
-
-            lines.Add($"- {appName}: {state}{detail}");
-        }
 
         if (!string.IsNullOrWhiteSpace(snapshot.ActiveWindow))
         {
@@ -734,150 +523,6 @@ internal static class AppIntegrationHelpers
         return await RunTextEntryWorkflowAsync(appTarget, "ctrl+f", query, context, cancellationToken);
     }
 
-    // Types text into whatever field currently has focus in the app.
-    public static async Task<string> FillFocusedFieldAsync(
-        string appTarget,
-        string text,
-        ToolContext context,
-        CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return "A field value is required.";
-        }
-
-        var openResult = await OpenOrFocusAsync(appTarget, context, cancellationToken);
-
-        if (UiCommandParsing.LooksLikeFailure(openResult))
-        {
-            return openResult;
-        }
-
-        await context.DesktopAutomation.WaitAsync(0.2, cancellationToken);
-
-        var textResult = await context.DesktopAutomation.SendTextAsync(appTarget, text, cancellationToken);
-
-        if (UiCommandParsing.LooksLikeFailure(textResult))
-        {
-            return textResult;
-        }
-
-        return string.Join(Environment.NewLine, openResult, textResult, "Filled the focused field.");
-    }
-
-    // Parses "value ;; value ;; value [:: submit]" and fills the fields in order.
-    public static async Task<string> FillBrowserFormAsync(
-        string appTarget,
-        string payload,
-        ToolContext context,
-        CancellationToken cancellationToken)
-    {
-        if (!TryParseFormValues(payload, out var values, out var submit))
-        {
-            return "Usage: chrome form <value1> ;; <value2> [;; <value3>] [:: submit]";
-        }
-
-        return await FillFieldSequenceAsync(appTarget, values, submit, context, cancellationToken, "Filled Chrome form fields.");
-    }
-
-    // Parses "username :: password [:: submit]" and fills the two fields. The password passes through as text; ActionSafety.cs asks for approval first.
-    public static async Task<string> FillBrowserLoginAsync(
-        string appTarget,
-        string payload,
-        ToolContext context,
-        CancellationToken cancellationToken)
-    {
-        if (!TryParseLoginValues(payload, out var username, out var password, out var submit))
-        {
-            return "Usage: chrome login <username> :: <password> [:: submit]";
-        }
-
-        return await FillFieldSequenceAsync(appTarget, [username, password], submit, context, cancellationToken, "Filled Chrome login fields.");
-    }
-
-    // Types each value, pressing Tab between them to reach the next field, and optionally presses Enter at the end.
-    private static async Task<string> FillFieldSequenceAsync(
-        string appTarget,
-        IReadOnlyList<string> values,
-        bool submit,
-        ToolContext context,
-        CancellationToken cancellationToken,
-        string successSummary)
-    {
-        var openResult = await OpenOrFocusAsync(appTarget, context, cancellationToken);
-
-        if (UiCommandParsing.LooksLikeFailure(openResult))
-        {
-            return openResult;
-        }
-
-        var details = new List<string> { openResult };
-
-        for (var index = 0; index < values.Count; index++)
-        {
-            await context.DesktopAutomation.WaitAsync(0.15, cancellationToken);
-            var textResult = await context.DesktopAutomation.SendTextAsync(appTarget, values[index], cancellationToken);
-
-            if (UiCommandParsing.LooksLikeFailure(textResult))
-            {
-                return textResult;
-            }
-
-            details.Add(textResult);
-
-            if (index < values.Count - 1)
-            {
-                await context.DesktopAutomation.WaitAsync(0.08, cancellationToken);
-                var tabResult = await context.DesktopAutomation.SendHotkeyAsync(appTarget, "tab", cancellationToken);
-
-                if (UiCommandParsing.LooksLikeFailure(tabResult))
-                {
-                    return tabResult;
-                }
-
-                details.Add(tabResult);
-            }
-        }
-
-        if (submit)
-        {
-            await context.DesktopAutomation.WaitAsync(0.08, cancellationToken);
-            var submitResult = await context.DesktopAutomation.SendHotkeyAsync(appTarget, "enter", cancellationToken);
-
-            if (UiCommandParsing.LooksLikeFailure(submitResult))
-            {
-                return submitResult;
-            }
-
-            details.Add(submitResult);
-        }
-
-        details.Add(successSummary);
-        return string.Join(Environment.NewLine, details);
-    }
-
-    // Opens a file in an Office app. With no path it just opens or focuses the app; a missing file is reported.
-    public static async Task<string> OpenFileInAppAsync(
-        string appTarget,
-        string path,
-        ToolContext context,
-        CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return await OpenOrFocusAsync(appTarget, context, cancellationToken);
-        }
-
-        var resolvedPath = ResolvePath(path, context.WorkspaceRoot);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return $"Path not found: {resolvedPath}";
-        }
-
-        return await context.DesktopAutomation.LaunchApplicationAsync(appTarget, $"\"{resolvedPath}\"", cancellationToken);
-    }
-
     // Maps what the user said to a playlist remembered in structured memory (best name match), otherwise keeps their words.
     public static async Task<string> ResolveSpotifyQuery(string query, ToolContext context, CancellationToken cancellationToken)
     {
@@ -983,64 +628,6 @@ internal static class AppIntegrationHelpers
         return $"https://www.bing.com/search?q={Uri.EscapeDataString(trimmed)}";
     }
 
-    // Splits the form payload at ";;" and notes a trailing ":: submit" request.
-    private static bool TryParseFormValues(string payload, out string[] values, out bool submit)
-    {
-        submit = false;
-        values = [];
-
-        if (string.IsNullOrWhiteSpace(payload))
-        {
-            return false;
-        }
-
-        var normalizedPayload = payload.Trim();
-        const string submitMarker = ":: submit";
-
-        if (normalizedPayload.EndsWith(submitMarker, StringComparison.OrdinalIgnoreCase))
-        {
-            submit = true;
-            normalizedPayload = normalizedPayload[..^submitMarker.Length].TrimEnd();
-        }
-
-        values = normalizedPayload
-            .Split([";;"], StringSplitOptions.None | StringSplitOptions.TrimEntries)
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .ToArray();
-        return values.Length > 0;
-    }
-
-    // Splits "username :: password :: submit" (the last part is optional; "submit" or "enter" turns it on).
-    private static bool TryParseLoginValues(string payload, out string username, out string password, out bool submit)
-    {
-        username = string.Empty;
-        password = string.Empty;
-        submit = false;
-
-        if (string.IsNullOrWhiteSpace(payload))
-        {
-            return false;
-        }
-
-        var parts = payload.Split(["::"], 3, StringSplitOptions.None | StringSplitOptions.TrimEntries);
-
-        if (parts.Length < 2)
-        {
-            return false;
-        }
-
-        username = parts[0];
-        password = parts[1];
-
-        if (parts.Length > 2)
-        {
-            submit = parts[2].Equals("submit", StringComparison.OrdinalIgnoreCase)
-                || parts[2].Equals("enter", StringComparison.OrdinalIgnoreCase);
-        }
-
-        return !string.IsNullOrWhiteSpace(username) && !string.IsNullOrWhiteSpace(password);
-    }
-
     // The friendly name used in replies, for example "VS Code" for the target "code".
     private static string ResolveFriendlyAppName(string appTarget)
     {
@@ -1048,14 +635,8 @@ internal static class AppIntegrationHelpers
         {
             "code" => "VS Code",
             "chrome" => "Chrome",
-            "explorer" => "Explorer",
             "spotify" => "Spotify",
             "discord" => "Discord",
-            "slack" => "Slack",
-            "word" => "Word",
-            "excel" => "Excel",
-            "powerpoint" => "PowerPoint",
-            "outlook" => "Outlook",
             _ => string.IsNullOrWhiteSpace(appTarget) ? "The app" : appTarget.Trim()
         };
     }
@@ -1067,14 +648,8 @@ internal static class AppIntegrationHelpers
         {
             "code" => ["code", "visual studio code", "vs code"],
             "chrome" => ["chrome", "google chrome"],
-            "explorer" => ["explorer", "file explorer"],
             "spotify" => ["spotify"],
             "discord" => ["discord"],
-            "slack" => ["slack"],
-            "word" => ["word", "microsoft word"],
-            "excel" => ["excel", "microsoft excel"],
-            "powerpoint" => ["powerpoint", "power point", "microsoft powerpoint"],
-            "outlook" => ["outlook", "microsoft outlook"],
             _ => [appTarget, displayName]
         };
     }
@@ -1174,30 +749,11 @@ internal static class AppIntegrationHelpers
                 && normalizedValue.Contains(normalizedTerm, StringComparison.OrdinalIgnoreCase);
         });
     }
-
-    // Lowercases and turns punctuation into spaces so names compare reliably.
-    private static string NormalizeForMatching(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var chars = value
-            .ToLowerInvariant()
-            .Select(character => char.IsLetterOrDigit(character) || char.IsWhiteSpace(character) ? character : ' ')
-            .ToArray();
-
-        return string.Join(' ', new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries));
-    }
-
-    private static string OrUnavailable(string value) =>
-        string.IsNullOrWhiteSpace(value) ? "Unavailable" : value.Trim();
 }
 
 // Parsers: each TryParse... reads a command like "chrome new tab" and fills in the AppIntegrationCommand. They return false when the
 // text is not for that tool. Several are catch-alls: once the tool word matches, unrecognised text becomes a default action
-// (Spotify: search; VS Code: open path; Chrome: open url or search; Discord and Slack: jump; Explorer: open path).
+// (Spotify: search; VS Code: open path; Chrome: open url or search; Discord: jump).
 internal static class AppIntegrationParsing
 {
     public static bool TryParseSpotify(string input, out AppIntegrationCommand command)
@@ -1314,9 +870,6 @@ internal static class AppIntegrationParsing
                 ("new window", "new-window"),
                 ("new tab", "new-tab"),
                 ("find", "find"),
-                ("fill", "fill"),
-                ("form", "form"),
-                ("login", "login"),
                 ("incognito", "incognito")))
         {
             return true;
@@ -1378,88 +931,19 @@ internal static class AppIntegrationParsing
                 return true;
         }
 
+        // The removed form/login/fill commands must not fall through to the search below, or a typed password would end up in a Bing address.
+        // The first word is compared without trailing punctuation, so "login, user :: pass" (speech often adds the comma) is caught too.
+        var firstWord = tail.Split(' ', 2)[0].TrimEnd(',', ';', ':', '.');
+        if (firstWord.Equals("fill", StringComparison.OrdinalIgnoreCase)
+            || firstWord.Equals("form", StringComparison.OrdinalIgnoreCase)
+            || firstWord.Equals("login", StringComparison.OrdinalIgnoreCase))
+        {
+            command = new AppIntegrationCommand(string.Empty);
+            return false;
+        }
+
         // Anything else after "chrome" is treated as a URL or search text.
         command = new AppIntegrationCommand("open-url", tail);
-        return true;
-    }
-
-    // Office: "office ...", or the app name on its own ("word report.docx", "excel", "ppt", "outlook").
-    public static bool TryParseOffice(string input, out AppIntegrationCommand command)
-    {
-        if (TryGetTail(input, out var officeTail, "office"))
-        {
-            if (string.IsNullOrWhiteSpace(officeTail)
-                || officeTail.Equals("status", StringComparison.OrdinalIgnoreCase))
-            {
-                command = new AppIntegrationCommand("status");
-                return true;
-            }
-
-            if (TryParseOfficePrefixedCommand(officeTail, out command))
-            {
-                return true;
-            }
-
-            command = new AppIntegrationCommand(string.Empty);
-            return false;
-        }
-
-        if (TryGetTail(input, out var wordTail, "word"))
-        {
-            command = ParseStandaloneOfficeApp(wordTail, "word");
-            return true;
-        }
-
-        if (TryGetTail(input, out var excelTail, "excel"))
-        {
-            command = ParseStandaloneOfficeApp(excelTail, "excel");
-            return true;
-        }
-
-        if (TryGetTail(input, out var powerpointTail, "powerpoint", "power point", "ppt"))
-        {
-            command = ParseStandaloneOfficeApp(powerpointTail, "powerpoint");
-            return true;
-        }
-
-        if (TryGetTail(input, out var outlookTail, "outlook"))
-        {
-            command = ParseStandaloneOfficeApp(outlookTail, "outlook");
-            return true;
-        }
-
-        command = new AppIntegrationCommand(string.Empty);
-        return false;
-    }
-
-    public static bool TryParseExplorer(string input, out AppIntegrationCommand command)
-    {
-        if (!TryGetTail(input, out var tail, "explorer", "file explorer"))
-        {
-            command = new AppIntegrationCommand(string.Empty);
-            return false;
-        }
-
-        if (string.IsNullOrWhiteSpace(tail))
-        {
-            command = new AppIntegrationCommand("open");
-            return true;
-        }
-
-        if (IsSimpleAction(tail, out var simpleAction))
-        {
-            command = new AppIntegrationCommand(simpleAction);
-            return true;
-        }
-
-        if (TryParsePrefixedPayload(tail, out command,
-                ("open", "open-path"),
-                ("reveal", "reveal")))
-        {
-            return true;
-        }
-
-        command = new AppIntegrationCommand("open-path", tail);
         return true;
     }
 
@@ -1495,37 +979,6 @@ internal static class AppIntegrationParsing
         return true;
     }
 
-    public static bool TryParseSlack(string input, out AppIntegrationCommand command)
-    {
-        if (!TryGetTail(input, out var tail, "slack"))
-        {
-            command = new AppIntegrationCommand(string.Empty);
-            return false;
-        }
-
-        if (string.IsNullOrWhiteSpace(tail))
-        {
-            command = new AppIntegrationCommand("open");
-            return true;
-        }
-
-        if (IsSimpleAction(tail, out var simpleAction))
-        {
-            command = new AppIntegrationCommand(simpleAction);
-            return true;
-        }
-
-        if (TryParsePrefixedPayload(tail, out command,
-                ("jump", "jump"),
-                ("switch", "jump")))
-        {
-            return true;
-        }
-
-        command = new AppIntegrationCommand("jump", tail);
-        return true;
-    }
-
     // Used by ActionSafety.cs. Pulls out the text that would be typed into an app, so it can be checked for passwords or keys before it is sent.
     public static bool TryExtractSensitiveTextPayload(string toolName, string input, out string targetApp, out string text)
     {
@@ -1550,32 +1003,6 @@ internal static class AppIntegrationParsing
             targetApp = "discord";
             text = command.Payload;
             return !string.IsNullOrWhiteSpace(text);
-        }
-
-        if (string.Equals(toolName, "slack", StringComparison.OrdinalIgnoreCase)
-            && TryParseSlack(input, out command)
-            && command.Action == "jump")
-        {
-            targetApp = "slack";
-            text = command.Payload;
-            return !string.IsNullOrWhiteSpace(text);
-        }
-
-        if (string.Equals(toolName, "chrome", StringComparison.OrdinalIgnoreCase)
-            && TryParseChrome(input, out command))
-        {
-            switch (command.Action)
-            {
-                case "fill":
-                case "form":
-                    targetApp = "chrome";
-                    text = command.Payload;
-                    return !string.IsNullOrWhiteSpace(text);
-                case "login":
-                    targetApp = "chrome";
-                    text = command.Payload;
-                    return !string.IsNullOrWhiteSpace(text);
-            }
         }
 
         return false;
@@ -1682,81 +1109,5 @@ internal static class AppIntegrationParsing
                 command = string.Empty;
                 return false;
         }
-    }
-
-    // Parses "office word ...", "office open word ..." and similar.
-    private static bool TryParseOfficePrefixedCommand(string tail, out AppIntegrationCommand command)
-    {
-        if (TryResolveOfficeAppPrefix(tail, out var appName, out var remainder))
-        {
-            command = ParseStandaloneOfficeApp(remainder, appName);
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(tail, "open"))
-        {
-            var openTail = ToolInputHelper.GetCommandTail(tail, "open");
-
-            if (TryResolveOfficeAppPrefix(openTail, out appName, out remainder))
-            {
-                command = ParseStandaloneOfficeApp(remainder, appName);
-                return true;
-            }
-        }
-
-        command = new AppIntegrationCommand(string.Empty);
-        return false;
-    }
-
-    // Finds which Office app name starts the text. PowerPoint's spellings are listed first so they win.
-    private static bool TryResolveOfficeAppPrefix(string input, out string appName, out string remainder)
-    {
-        foreach (var prefix in new[]
-                 {
-                     ("powerpoint", "powerpoint"),
-                     ("power point", "powerpoint"),
-                     ("ppt", "powerpoint"),
-                     ("outlook", "outlook"),
-                     ("excel", "excel"),
-                     ("word", "word")
-                 })
-        {
-            if (!ToolInputHelper.StartsWithCommand(input, prefix.Item1))
-            {
-                continue;
-            }
-
-            appName = prefix.Item2;
-            remainder = ToolInputHelper.GetCommandTail(input, prefix.Item1);
-            return true;
-        }
-
-        appName = string.Empty;
-        remainder = string.Empty;
-        return false;
-    }
-
-    // Builds the action for one Office app: open (optionally with a file path) or status. Outlook ignores a path.
-    private static AppIntegrationCommand ParseStandaloneOfficeApp(string tail, string appName)
-    {
-        var normalizedTail = tail.Trim();
-        var openAction = $"open-{appName}";
-        var statusAction = $"status-{appName}";
-
-        if (string.IsNullOrWhiteSpace(normalizedTail)
-            || normalizedTail.Equals("open", StringComparison.OrdinalIgnoreCase)
-            || normalizedTail.Equals("focus", StringComparison.OrdinalIgnoreCase))
-        {
-            return new AppIntegrationCommand(openAction);
-        }
-
-        if (normalizedTail.Equals("status", StringComparison.OrdinalIgnoreCase))
-        {
-            return new AppIntegrationCommand(statusAction);
-        }
-
-        return appName == "outlook"
-            ? new AppIntegrationCommand(openAction)
-            : new AppIntegrationCommand(openAction, normalizedTail);
     }
 }

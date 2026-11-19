@@ -143,25 +143,17 @@ public sealed class JarvisAssistant
         tools.Add(new SpotifyTool());
         tools.Add(new CodeTool());
         tools.Add(new ChromeTool());
-        tools.Add(new ExplorerAppTool());
-        tools.Add(new OfficeTool());
         tools.Add(new DiscordTool());
-        tools.Add(new SlackTool());
         tools.Add(new WindowsTool());
         tools.Add(new AppStateTool());
         tools.Add(new FocusAppTool());
         tools.Add(new CloseAppTool());
         tools.Add(new WindowStateTool());
-        tools.Add(new MoveWindowTool());
-        tools.Add(new ResizeWindowTool());
-        tools.Add(new SnapWindowTool());
         tools.Add(new SendHotkeyTool());
         tools.Add(new ClickElementTool());
         tools.Add(new TypeIntoElementTool());
         tools.Add(new GetElementTextTool());
-        tools.Add(new ScrollWindowTool());
         tools.Add(new MediaTool());
-        tools.Add(new ClipboardTool());
         tools.Add(new NotifyTool());
         tools.Add(new WaitTool());
         tools.Add(new ResearchTool());
@@ -744,7 +736,7 @@ public sealed class JarvisAssistant
                 Environment.NewLine,
                 "Agent runtime is active, but I could not confidently complete that request.",
                 "Try rephrasing it naturally or use `help` to inspect the current command surface.",
-                "I currently handle memory, live computer context, app discovery and launch, app adapters for Spotify, VS Code, Chrome, Explorer, Discord, and Slack, window management, clipboard and media controls, Win32 UI automation, file create/edit/move/copy/delete actions, browser and form workflows, notifications, web research, user-state context, visual analysis for screens and documents, system state, and optional shell execution.");
+                "I currently handle memory, live computer context, app discovery and launch, app adapters for Spotify, VS Code, Chrome, and Discord, window management, media controls, Win32 UI automation, file create/edit/move/copy/delete actions, browser workflows, notifications, web research, user-state context, visual analysis for screens and documents, system state, and optional shell execution.");
         }
 
         return string.Join(
@@ -968,7 +960,7 @@ public sealed class JarvisAssistant
             "microphone startup failed"
         };
 
-        // Only the start counts: a reply that reads text back (a clipboard saying "command not found") is not a failure.
+        // Only the start counts: a reply that reads text back (a control's text saying "command not found") is not a failure.
         return errorPrefixes.Concat(UiCommandParsing.NotFoundPrefixes).Any(prefix => responseText.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
     }
 
@@ -1246,28 +1238,13 @@ public sealed class JarvisAssistant
             "chrome" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Chrome adapter for navigation, tabs, history/downloads/bookmarks, find-on-page, and form/login workflows specifically in Chrome.",
+                "Chrome adapter for navigation, tabs, history/downloads/bookmarks, and find-on-page specifically in Chrome.",
                 "Chrome action only."),
-            "explorer" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Explorer adapter for opening folders and revealing files.",
-                "Explorer action only."),
-            "office" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Office adapter for Word, Excel, PowerPoint, and Outlook launch/status actions plus opening files directly in Office apps.",
-                "Office action only."),
             "discord" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Discord adapter for focus, status, quick-jump, and in-app search.",
                 "Discord action only."),
-            "slack" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Slack adapter for focus, status, and quick-jump routing.",
-                "Slack action only."),
             "windows" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
@@ -1293,21 +1270,6 @@ public sealed class JarvisAssistant
                 tool.Name,
                 "Minimize, maximize, or restore a window.",
                 "Target window plus state payload."),
-            "move window" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Move a visible window to explicit screen coordinates.",
-                "Target window and X/Y coordinates."),
-            "resize window" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Resize a visible window to the requested dimensions.",
-                "Target window and width/height payload."),
-            "snap window" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Snap a visible window into a desktop region such as left, right, or top-right.",
-                "Target window and snap position."),
             "send hotkey" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
@@ -1348,21 +1310,11 @@ public sealed class JarvisAssistant
                 tool.Name,
                 "Read text from a named UI element.",
                 "UI target only."),
-            "scroll" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Scroll the active window or target area.",
-                "Direction or target payload only."),
             "media" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Send system media controls such as play/pause, next track, or volume adjustments.",
                 "Media action only."),
-            "clipboard" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Read, set or clear the clipboard, or paste it into a target window.",
-                "Clipboard subcommand payload only."),
             "notify" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,

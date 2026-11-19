@@ -402,28 +402,9 @@ public static partial class LectureNoteText
             .ToList();
 
     // Sends one prompt to the local model with a 90-second limit and removes any <think> block from the reply.
-    private static async Task<string> CompleteAsync(IModelGateway gateway, string instructions, string input, CancellationToken cancellationToken)
-    {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(90));
-        var response = await gateway.CompleteAsync(
-            new ChatCompletionRequest(
-                [
-                    new ChatMessage("system", [ChatMessageContentPart.FromText(instructions)]),
-                    new ChatMessage("user", [ChatMessageContentPart.FromText(input)])
-                ],
-                // 0, not the usual 0.2: notes should repeat the facts, not vary them.
-                Temperature: 0),
-            // Reasoning allows 384 tokens on the local model; Fast's 256 could cut the notes off.
-            ModelRoute.Reasoning,
-            timeout.Token);
-
-        return ThinkBlockRegex().Replace(response.Content ?? string.Empty, string.Empty);
-    }
-
-    // Matches a '<think>...</think>' block, the reasoning text some local models print before the answer.
-    [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
-    private static partial Regex ThinkBlockRegex();
+    // Temperature 0, not the usual 0.2: notes should repeat the facts, not vary them. Reasoning allows 384 tokens on the local model; Fast's 256 could cut the notes off.
+    private static Task<string> CompleteAsync(IModelGateway gateway, string instructions, string input, CancellationToken cancellationToken) =>
+        ModelCalls.CompleteTextAsync(gateway, instructions, input, ModelRoute.Reasoning, 0, TimeSpan.FromSeconds(90), cancellationToken);
 
     // Matches a reply that means 'nothing found': 'none', 'n/a', 'there are/were/is no ...', or 'no <up to 3 words> mentioned/found/given/listed'.
     // "none", "There are no deadlines.", "No assignments were mentioned."

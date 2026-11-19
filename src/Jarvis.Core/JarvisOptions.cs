@@ -36,13 +36,6 @@ public sealed record JarvisOptions
 
     public string VoiceModel { get; init; } = "gpt-4o-mini-tts";
 
-    // Key lookup for the voice service, in order: this value, the Windows Credential Manager entry, then the environment variable (see ApiKeyResolver).
-    public string VoiceApiKey { get; init; } = string.Empty;
-
-    public string VoiceApiKeyCredentialTarget { get; init; } = string.Empty;
-
-    public string VoiceApiKeyEnvironmentVariable { get; init; } = "OPENAI_API_KEY";
-
     public string VoiceName { get; init; } = "coral";
 
     // Speech recognition (Jarvis listening). Settings starting with SpeechRecognition cover the engine, language, wake word,
@@ -56,12 +49,6 @@ public sealed record JarvisOptions
     public string SpeechRecognitionBaseUrl { get; init; } = "https://api.openai.com/v1";
 
     public string SpeechRecognitionModel { get; init; } = "gpt-4o-mini-transcribe";
-
-    public string SpeechRecognitionApiKey { get; init; } = string.Empty;
-
-    public string SpeechRecognitionApiKeyCredentialTarget { get; init; } = string.Empty;
-
-    public string SpeechRecognitionApiKeyEnvironmentVariable { get; init; } = "OPENAI_API_KEY";
 
     public string SpeechRecognitionLanguage { get; init; } = "en";
 
@@ -123,8 +110,6 @@ public sealed record JarvisOptions
     /// speaker Jarvis hears its own voice and cuts itself off. Saying "Jarvis ..." interrupts either way.
     /// </summary>
     public bool SpeechRecognitionBargeInEnabled { get; init; } = false;
-
-    public bool SpeechRecognitionBeamformingEnabled { get; init; } = false;
 
     public string SpeechRecognitionBeamformingProfile { get; init; } = "auto";
 

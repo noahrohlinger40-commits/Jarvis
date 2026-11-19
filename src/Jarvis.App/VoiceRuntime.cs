@@ -206,10 +206,9 @@ internal static class VoiceRuntimeFactory
                     StatusText: "Speech recognition is disabled in jarvis.settings.json."));
         }
 
-        var provider = NormalizeProvider(options.SpeechRecognitionProvider);
         var status = $"Speech recognition provider '{options.SpeechRecognitionProvider}' is not supported; use \"openai-compatible\".";
 
-        if (provider is "auto" or "openai-compatible" or "openai" or "streaming"
+        if (SpeechProviders.IsOpenAiCompatible(options.SpeechRecognitionProvider)
             && OpenAiCompatibleVoiceRuntime.TryCreate(options, out var runtime, out status))
         {
             return runtime!;
@@ -221,17 +220,6 @@ internal static class VoiceRuntimeFactory
                 IsListening: false,
                 IsArmed: false,
                 StatusText: status));
-    }
-
-    // Lower-cases the provider setting; empty means "auto".
-    private static string NormalizeProvider(string? provider)
-    {
-        if (string.IsNullOrWhiteSpace(provider))
-        {
-            return "auto";
-        }
-
-        return provider.Trim().ToLowerInvariant();
     }
 }
 

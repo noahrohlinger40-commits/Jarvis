@@ -1,7 +1,6 @@
 // OpenAiCompatibleStreamingSpeaker.cs: Jarvis's preferred voice. Sends the reply text to an OpenAI-style /audio/speech
 // endpoint (the local Kokoro server on 127.0.0.1:8178) and plays the audio as it arrives, so speech starts before the whole
 // sentence is rendered. Created by SpeakerFactory (Speech.cs). Falls back to the Windows voice (WindowsSpeechSpeaker) if the server fails.
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Jarvis.Core;
@@ -28,7 +27,6 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
     private readonly string _endpoint;
     private readonly string _model;
     private readonly string _voice;
-    private readonly string _apiKey;
     // Windows voice used if the speech server cannot be reached.
     private readonly WindowsSpeechSpeaker _fallbackSpeaker;
     // Lets Interrupt stop the reply currently playing.
@@ -38,14 +36,12 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         JarvisOptions options,
         string endpoint,
         string model,
-        string voice,
-        string apiKey)
+        string voice)
     {
         _options = options;
         _endpoint = endpoint;
         _model = model;
         _voice = voice;
-        _apiKey = apiKey;
         _fallbackSpeaker = new WindowsSpeechSpeaker(options);
         _httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, Timeout.InfiniteTimeSpan);
     }
@@ -69,21 +65,12 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
 
         var baseUrl = ResolveVoiceBaseUrl(options);
 
-        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri))
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out _))
         {
             return false;
         }
 
         if (options.LocalAiOnly && !LocalAiPolicy.IsLoopbackHttpEndpoint(baseUrl)) return false;
-
-        var apiKey = ResolveVoiceApiKey(options);
-
-        if (string.IsNullOrWhiteSpace(apiKey)
-            && !string.Equals(baseUri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(baseUri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
 
         // Default voice name when none is configured.
         var voice = string.IsNullOrWhiteSpace(options.VoiceName)
@@ -94,8 +81,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
             options,
             BuildEndpoint(baseUrl),
             model,
-            voice,
-            apiKey);
+            voice);
         return true;
     }
 
@@ -185,7 +171,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         _fallbackSpeaker.Interrupt();
     }
 
-    // Builds the POST request: model, voice, the text and the raw PCM format as JSON, plus a bearer key if one is set.
+    // Builds the POST request: model, voice, the text and the raw PCM format as JSON. No Authorization header: the speech server is local.
     private HttpRequestMessage BuildRequest(string message)
     {
         var payload = new Dictionary<string, object?>
@@ -200,11 +186,6 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         {
             Content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8, "application/json")
         };
-
-        if (!string.IsNullOrWhiteSpace(_apiKey))
-        {
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        }
 
         return request;
     }
@@ -320,25 +301,6 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         return string.IsNullOrWhiteSpace(options.VoiceBaseUrl)
             ? options.SpeechRecognitionBaseUrl
             : options.VoiceBaseUrl;
-    }
-
-    // Uses the voice-specific API key, or falls back to the transcription key.
-    private static string ResolveVoiceApiKey(JarvisOptions options)
-    {
-        var voiceApiKey = ApiKeyResolver.Resolve(
-            options.VoiceApiKey,
-            options.VoiceApiKeyCredentialTarget,
-            options.VoiceApiKeyEnvironmentVariable);
-
-        if (!string.IsNullOrWhiteSpace(voiceApiKey))
-        {
-            return voiceApiKey;
-        }
-
-        return ApiKeyResolver.Resolve(
-            options.SpeechRecognitionApiKey,
-            options.SpeechRecognitionApiKeyCredentialTarget,
-            options.SpeechRecognitionApiKeyEnvironmentVariable);
     }
 
     // Shortens error bodies to 500 characters.

@@ -83,7 +83,7 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
                 query.Trim(),
                 Array.Empty<AssistantCitation>(),
                 IsOffline: true,
-                $"Web research is unavailable right now: {TrimError(exception.Message)}");
+                $"Web research is unavailable right now: {exception.Message.Clip(240)}");
         }
     }
 
@@ -173,13 +173,5 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
 
         var noTags = Regex.Replace(value, "<.*?>", string.Empty);
         return WebUtility.HtmlDecode(noTags).Trim();
-    }
-
-    // Shortens an error message to 240 characters for display.
-    private static string TrimError(string text)
-    {
-        const int maxLength = 240;
-        var value = text.Trim();
-        return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 }

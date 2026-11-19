@@ -494,23 +494,10 @@ public static partial class PageSummarizer
     }
 
     // One model call with a system prompt and a user message. Gives up after 90 seconds, then cleans the reply.
+    // Reasoning, not Fast: Fast's 256-token cap can cut summaries off mid-sentence. Reasoning allows 384 on the local model.
     private static async Task<string> CompleteAsync(IModelGateway gateway, string instructions, string input, CancellationToken cancellationToken)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(90));
-        var response = await gateway.CompleteAsync(
-            new ChatCompletionRequest(
-                [
-                    new ChatMessage("system", [ChatMessageContentPart.FromText(instructions)]),
-                    new ChatMessage("user", [ChatMessageContentPart.FromText(input)])
-                ],
-                Temperature: 0.2),
-            // Reasoning, not Fast: Fast's 256-token cap can cut summaries off mid-sentence. Reasoning allows 384 on the local model.
-            ModelRoute.Reasoning,
-            timeout.Token);
-
-        // Remove any <think>...</think> reasoning that some models print before the answer.
-        var text = ThinkBlockRegex().Replace(response.Content ?? string.Empty, string.Empty);
+        var text = await ModelCalls.CompleteTextAsync(gateway, instructions, input, ModelRoute.Reasoning, 0.2, TimeSpan.FromSeconds(90), cancellationToken);
         // Read aloud, so markdown symbols would be spoken or mangled.
         // Removes list markers at the start of a line ("- ", "* ", "1. ") and markdown characters (* # _ `).
         text = Regex.Replace(text, @"^\s*(?:[-*•]|\d+\.)\s+|[*#_`]+", string.Empty, RegexOptions.Multiline);
@@ -548,10 +535,6 @@ public static partial class PageSummarizer
         Uri.TryCreate(url.Contains("://", StringComparison.Ordinal) ? url : "https://" + url, UriKind.Absolute, out var uri)
             ? uri.Host
             : url;
-
-    // Matches a <think>...</think> block across line breaks (the lazy "*?" stops at the first closing tag).
-    [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
-    private static partial Regex ThinkBlockRegex();
 }
 
 /// <summary>Reads aloud or summarizes the page open in the browser.</summary>

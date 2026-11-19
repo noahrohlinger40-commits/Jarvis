@@ -204,8 +204,8 @@ internal sealed class MicrophoneCalibrationService
 
             var chunk = new byte[eventArgs.BytesRecorded];
             Buffer.BlockCopy(eventArgs.Buffer, 0, chunk, 0, eventArgs.BytesRecorded);
-            rmsLevels.Add(CalculateRootMeanSquareLevel(chunk));
-            peakLevels.Add(CalculatePeakLevel(chunk));
+            rmsLevels.Add(AudioLevels.Rms(chunk));
+            peakLevels.Add(AudioLevels.Peak(chunk));
         }
 
         void OnRecordingStopped(object? sender, StoppedEventArgs eventArgs)
@@ -344,51 +344,5 @@ internal sealed class MicrophoneCalibrationService
         var ordered = values.OrderBy(value => value).ToArray();
         var index = Math.Clamp((int)Math.Round((ordered.Length - 1) * percentile), 0, ordered.Length - 1);
         return ordered[index];
-    }
-
-    // RMS (root mean square) of a chunk: the typical sample size, 0 = silent, 1 = full scale. Same maths as the live pipeline.
-    private static double CalculateRootMeanSquareLevel(byte[] pcm16MonoChunk)
-    {
-        if (pcm16MonoChunk.Length < 2)
-        {
-            return 0;
-        }
-
-        double sumSquares = 0;
-        var sampleCount = pcm16MonoChunk.Length / 2;
-
-        for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
-        {
-            var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
-            var normalized = sample / 32768d;
-            sumSquares += normalized * normalized;
-        }
-
-        return Math.Sqrt(sumSquares / sampleCount);
-    }
-
-    // Peak of a chunk: the biggest single sample, 0..1.
-    private static double CalculatePeakLevel(byte[] pcm16MonoChunk)
-    {
-        if (pcm16MonoChunk.Length < 2)
-        {
-            return 0;
-        }
-
-        double peak = 0;
-
-        for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
-        {
-            var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
-            // Widen to int first: Math.Abs(short.MinValue) throws OverflowException on clipped audio.
-            var normalized = Math.Abs((int)sample) / 32768d;
-
-            if (normalized > peak)
-            {
-                peak = normalized;
-            }
-        }
-
-        return peak;
     }
 }

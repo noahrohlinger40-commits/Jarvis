@@ -47,9 +47,7 @@ internal static class SpeakerFactory
             return new NullSpeaker();
         }
 
-        var provider = NormalizeProvider(options.VoiceProvider);
-
-        if (provider is "auto" or "openai-compatible" or "openai" or "streaming")
+        if (SpeechProviders.IsOpenAiCompatible(options.VoiceProvider))
         {
             if (OpenAiCompatibleStreamingSpeaker.TryCreate(options, out var speaker))
             {
@@ -59,17 +57,15 @@ internal static class SpeakerFactory
 
         return new WindowsSpeechSpeaker(options);
     }
+}
 
-    // Lower-cases the voice provider setting; empty means "auto".
-    private static string NormalizeProvider(string? provider)
-    {
-        if (string.IsNullOrWhiteSpace(provider))
-        {
-            return "auto";
-        }
-
-        return provider.Trim().ToLowerInvariant();
-    }
+// The one place that knows which provider settings mean "the local OpenAI-compatible speech server" (used for both
+// hearing and speaking). Empty means "auto"; anything else is not handled and falls back to the Windows voice or a silent runtime.
+internal static class SpeechProviders
+{
+    public static bool IsOpenAiCompatible(string? provider) =>
+        string.IsNullOrWhiteSpace(provider)
+        || provider.Trim().ToLowerInvariant() is "auto" or "openai-compatible" or "openai" or "streaming";
 }
 
 // A speaker that says nothing, used when voice output is switched off.
