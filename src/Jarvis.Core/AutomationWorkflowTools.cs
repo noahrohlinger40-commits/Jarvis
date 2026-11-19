@@ -182,12 +182,12 @@ public sealed class AppStateTool : IAssistantTool
     }
 }
 
-// Sends a Jarvis notification (toast), lists the recent ones, or clears them.
+// Sends a Jarvis notification (toast).
 public sealed class NotifyTool : IAssistantTool
 {
     public string Name => "notify";
 
-    public string Description => "Send or inspect Jarvis notifications. Use `notify <title> :: <message>`, `notifications`, or `clear notifications`.";
+    public string Description => "Send a Jarvis notification. Use `notify <title> :: <message>`.";
 
     public bool CanHandle(string input) => AutomationWorkflowParsing.TryParseNotification(input, out _);
 
@@ -195,31 +195,24 @@ public sealed class NotifyTool : IAssistantTool
     {
         if (!AutomationWorkflowParsing.TryParseNotification(input, out var command))
         {
-            return new ToolResult("Usage: notify <title> :: <message> | notifications | clear notifications", Succeeded: false, SummaryText: "Missing notification command.");
+            return new ToolResult("Usage: notify <title> :: <message>", Succeeded: false, SummaryText: "Missing notification command.");
         }
 
-        if (command.Action == "send"
-            && string.IsNullOrWhiteSpace(command.Title)
+        if (string.IsNullOrWhiteSpace(command.Title)
             && string.IsNullOrWhiteSpace(command.Message))
         {
             return new ToolResult("Usage: notify <title> :: <message> | notify <message>", Succeeded: false, SummaryText: "Missing notification content.");
         }
 
-        var result = command.Action switch
-        {
-            "send" => await context.DesktopAutomation.SendNotificationAsync(command.Title, command.Message, cancellationToken),
-            "list" => await context.DesktopAutomation.ListNotificationsAsync(cancellationToken),
-            "clear" => await context.DesktopAutomation.ClearNotificationsAsync(cancellationToken),
-            _ => "Usage: notify <title> :: <message> | notifications | clear notifications"
-        };
+        var result = await context.DesktopAutomation.SendNotificationAsync(command.Title, command.Message, cancellationToken);
 
-        var success = !result.StartsWith("Usage:", StringComparison.OrdinalIgnoreCase);
-        return new ToolResult(result, Succeeded: success, VerificationText: result, SummaryText: success ? "Handled notification action." : "Notification action failed.");
+        var success = result.StartsWith("Sent notification", StringComparison.OrdinalIgnoreCase);
+        return new ToolResult(result, Succeeded: success, VerificationText: result, SummaryText: success ? "Sent notification." : "Notification failed.");
     }
 }
 
-// A parsed notification command. Action is "send", "list" or "clear"; Title and Message only matter for "send".
-internal sealed record NotificationCommand(string Action, string Title = "", string Message = "");
+// A parsed notification command: the toast title and message.
+internal sealed record NotificationCommand(string Title = "", string Message = "");
 
 // Parsers for the "::"-separated command formats above. Shared by the tools and by ActionSafety.cs.
 internal static class AutomationWorkflowParsing
@@ -301,22 +294,10 @@ internal static class AutomationWorkflowParsing
         return !string.IsNullOrWhiteSpace(source) && !string.IsNullOrWhiteSpace(destination);
     }
 
-    // Recognises "notifications" (list), "clear notifications", and "notify ..." (send). With a single part, e.g. "notify dinner is ready",
+    // Recognises "notify ..." and "notification ...". With a single part, e.g. "notify dinner is ready",
     // the title defaults to "Jarvis". Returns false for anything else, so CanHandle can use it directly.
     public static bool TryParseNotification(string input, out NotificationCommand command)
     {
-        if (ToolInputHelper.MatchesExact(input, "notifications", "show notifications", "list notifications"))
-        {
-            command = new NotificationCommand("list");
-            return true;
-        }
-
-        if (ToolInputHelper.MatchesExact(input, "clear notifications", "notifications clear"))
-        {
-            command = new NotificationCommand("clear");
-            return true;
-        }
-
         if (ToolInputHelper.StartsWithCommand(input, "notify")
             || ToolInputHelper.StartsWithCommand(input, "notification"))
         {
@@ -324,18 +305,18 @@ internal static class AutomationWorkflowParsing
 
             if (string.IsNullOrWhiteSpace(payload))
             {
-                command = new NotificationCommand("send");
+                command = new NotificationCommand();
                 return true;
             }
 
             var parts = payload.Split(["::"], 2, StringSplitOptions.None | StringSplitOptions.TrimEntries);
             command = parts.Length == 1
-                ? new NotificationCommand("send", "Jarvis", parts[0])
-                : new NotificationCommand("send", string.IsNullOrWhiteSpace(parts[0]) ? "Jarvis" : parts[0], parts[1]);
+                ? new NotificationCommand("Jarvis", parts[0])
+                : new NotificationCommand(string.IsNullOrWhiteSpace(parts[0]) ? "Jarvis" : parts[0], parts[1]);
             return true;
         }
 
-        command = new NotificationCommand(string.Empty);
+        command = new NotificationCommand();
         return false;
     }
 }

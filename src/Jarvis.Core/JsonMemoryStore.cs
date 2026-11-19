@@ -30,12 +30,6 @@ public sealed class JsonMemoryStore
         _filePath = filePath;
     }
 
-    // Shortcut: remember a piece of plain text using all default settings.
-    public Task AddAsync(string content, CancellationToken cancellationToken)
-    {
-        return AddAsync(new MemoryWriteRequest(content), cancellationToken);
-    }
-
     // Saves a note. If an equivalent note already exists it is updated (counted as seen once more) instead of duplicated; see UpsertNote.
     public async Task AddAsync(MemoryWriteRequest request, CancellationToken cancellationToken)
     {
@@ -111,12 +105,6 @@ public sealed class JsonMemoryStore
         {
             _gate.Release();
         }
-    }
-
-    // Search with no extra desktop context (the 'context' is just the query text).
-    public Task<IReadOnlyList<MemoryNote>> SearchAsync(string query, int maxResults, CancellationToken cancellationToken)
-    {
-        return SearchAsync(query, new MemoryQueryContext(query), maxResults, cancellationToken);
     }
 
     // Search that also uses the current situation (time of day, active app, ...) so notes learned in a similar situation rank higher.
@@ -255,48 +243,6 @@ public sealed class JsonMemoryStore
         }
     }
 
-    // Pending reminders due now or within the next 18 hours, so Jarvis can mention tomorrow-morning items the evening before.
-    public async Task<IReadOnlyList<MemoryNote>> GetDueRemindersAsync(DateTimeOffset nowUtc, int maxResults, CancellationToken cancellationToken)
-    {
-        await _gate.WaitAsync(cancellationToken);
-
-        try
-        {
-            var notes = await LoadAsync(cancellationToken);
-            return GetActiveNotes(notes, nowUtc)
-                .Where(note => MemoryPolicies.IsDueReminder(note, nowUtc, TimeSpan.FromHours(18)))
-                .OrderBy(note => note.ReminderAtUtc)
-                .ThenByDescending(note => note.ImportanceScore)
-                .Take(Math.Max(0, maxResults))
-                .ToArray();
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
-
-    // Finds one note by id, including forgotten or expired ones (so a note can still be inspected).
-    public async Task<MemoryNote?> GetByIdAsync(string id, CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(id))
-        {
-            return null;
-        }
-
-        await _gate.WaitAsync(cancellationToken);
-
-        try
-        {
-            var notes = await LoadAsync(cancellationToken);
-            return notes.FirstOrDefault(note => string.Equals(note.Id, id.Trim(), StringComparison.OrdinalIgnoreCase));
-        }
-        finally
-        {
-            _gate.Release();
-        }
-    }
-
     // Replaces the editable fields of an existing note (used by the memory tool). Returns null if the id is unknown.
     public async Task<MemoryNote?> UpdateAsync(MemoryUpdateRequest request, CancellationToken cancellationToken)
     {
@@ -396,20 +342,23 @@ public sealed class JsonMemoryStore
     // Reads the whole file (an empty list if it does not exist yet). Callers must already hold _gate.
     private async Task<List<MemoryNote>> LoadAsync(CancellationToken cancellationToken)
     {
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         if (!File.Exists(_filePath))
         {
             return new List<MemoryNote>();
         }
 
-        return await ReadNotesFromJsonAsync(_filePath, cancellationToken);
+        // The file is the bare array SaveAsync writes. Empty files and null elements load as nothing.
+        var text = await File.ReadAllTextAsync(_filePath, cancellationToken);
+        var notes = string.IsNullOrWhiteSpace(text) ? null : JsonSerializer.Deserialize<List<MemoryNote>>(text, JsonOptions);
+        return notes?.Where(note => note is not null).Select(NormalizeNote).ToList() ?? new List<MemoryNote>();
     }
 
     // Overwrites the whole file with the cleaned-up notes, oldest first. Callers must already hold _gate.
     private async Task SaveAsync(List<MemoryNote> notes, CancellationToken cancellationToken)
     {
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         var normalized = notes
             .Select(NormalizeNote)
@@ -591,8 +540,7 @@ public sealed class JsonMemoryStore
             note.Id,
             string.IsNullOrWhiteSpace(note.ReminderText) ? note.Content.Trim() : note.ReminderText.Trim(),
             note.ReminderAtUtc ?? note.CreatedAtUtc,
-            MemoryPolicies.NormalizeReminderStatus(note.ReminderStatus),
-            note.Id);
+            MemoryPolicies.NormalizeReminderStatus(note.ReminderStatus));
     }
 
     // Picks the retention policy for a repeated note without downgrading one the user explicitly approved.
@@ -648,53 +596,6 @@ public sealed class JsonMemoryStore
         }
 
         return -1;
-    }
-
-    // Reads memory.json tolerantly: accepts a JSON array, an object with an 'items' array, or a single note object (older file shapes).
-    private static async Task<List<MemoryNote>> ReadNotesFromJsonAsync(string path, CancellationToken cancellationToken)
-    {
-        var text = await File.ReadAllTextAsync(path, cancellationToken);
-
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return new List<MemoryNote>();
-        }
-
-        using var document = JsonDocument.Parse(text);
-
-        return document.RootElement.ValueKind switch
-        {
-            JsonValueKind.Array => DeserializeArray(document.RootElement),
-            JsonValueKind.Object when TryGetProperty(document.RootElement, "items", out var items) && items.ValueKind == JsonValueKind.Array => DeserializeArray(items),
-            JsonValueKind.Object => DeserializeSingle(document.RootElement),
-            _ => new List<MemoryNote>()
-        };
-    }
-
-    // Reads each element as a note, skipping nulls and cleaning each one.
-    private static List<MemoryNote> DeserializeArray(JsonElement element)
-    {
-        var notes = new List<MemoryNote>();
-
-        foreach (var item in element.EnumerateArray())
-        {
-            var note = item.Deserialize<MemoryNote>(JsonOptions);
-
-            if (note is not null)
-            {
-                notes.Add(NormalizeNote(note));
-            }
-        }
-
-        return notes;
-    }
-
-    private static List<MemoryNote> DeserializeSingle(JsonElement element)
-    {
-        var note = element.Deserialize<MemoryNote>(JsonOptions);
-        return note is null
-            ? new List<MemoryNote>()
-            : new List<MemoryNote> { NormalizeNote(note) };
     }
 
     // Cleans a note loaded from disk or about to be saved: trims, converts times to UTC, fills a missing id and labels, and works out
@@ -996,37 +897,5 @@ public sealed class JsonMemoryStore
                 .Select(attribute => $"{attribute.Key}:{attribute.Value}"));
 
         return $"{NormalizeLabel(kind, "other")}|{string.Join("/", normalizedNames)}|{discriminator}";
-    }
-
-    private void EnsureParentDirectoryExists()
-    {
-        EnsureDirectoryExists(Path.GetDirectoryName(_filePath));
-    }
-
-    private static void EnsureDirectoryExists(string? directory)
-    {
-        if (!string.IsNullOrWhiteSpace(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-    }
-
-    // Case-insensitive JSON property lookup (JsonElement.TryGetProperty is case-sensitive).
-    private static bool TryGetProperty(JsonElement element, string propertyName, out JsonElement value)
-    {
-        if (element.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var property in element.EnumerateObject())
-            {
-                if (string.Equals(property.Name, propertyName, StringComparison.OrdinalIgnoreCase))
-                {
-                    value = property.Value;
-                    return true;
-                }
-            }
-        }
-
-        value = default;
-        return false;
     }
 }

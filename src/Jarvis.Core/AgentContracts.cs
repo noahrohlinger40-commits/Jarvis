@@ -23,7 +23,6 @@ public enum AssistantActivityKind
     Planning,
     ToolStart,
     ToolComplete,
-    Reflection,
     Clarification,
     Background,
     Summary,

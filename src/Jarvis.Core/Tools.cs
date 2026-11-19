@@ -167,8 +167,7 @@ public sealed class StatusTool : IAssistantTool
             $"Speech recognition: {(context.Options.SpeechRecognitionEnabled ? "enabled" : "disabled")}",
             $"Speech provider: {context.Options.SpeechRecognitionProvider}",
             $"Wake word gate: {(context.Options.WakeWordEnabled ? "enabled" : "disabled")}",
-            $"Recognizer culture: {context.Options.RecognizerCulture}",
-            "Desktop automation: enabled for app discovery, visible-window discovery, window management, browser, form, and Chrome DOM workflows, file create/edit/move/copy/delete actions, clipboard history and restore, notifications, media controls, Win32 UI control, local network discovery, live computer context, system state, and app adapters for Spotify, VS Code, Office, Chrome, Explorer, Discord, and Slack",
+            "Desktop automation: enabled for app discovery, visible-window discovery, window management, browser and form workflows, file create/edit/move/copy/delete actions, clipboard read and set, notifications, media controls, Win32 UI control, local network discovery, live computer context, system state, and app adapters for Spotify, VS Code, Office, Chrome, Explorer, Discord, and Slack",
             $"Visual grounding: screen and window capture, monitor inventory, OCR-style text extraction, structured UI analysis, and document parsing for text/image inputs ({(string.IsNullOrWhiteSpace(context.Options.PlannerVisionModel) ? "planner vision route inherits the default model" : context.Options.PlannerVisionModel)})",
             $"Shell execution: {(context.Options.ShellExecutionEnabled ? "enabled" : "disabled")}",
             $"Action safety: {(context.Options.SafetyRequireApprovalForMajorActions ? "approval required for shell changes" : "approval disabled")} | {(context.Options.SafetyBlockProtectedSystemPaths ? "protected system paths blocked" : "protected system path blocking disabled")}",
@@ -178,6 +177,7 @@ public sealed class StatusTool : IAssistantTool
             $"Natural language understanding: {(context.PlannerAvailable ? "multi-step, structured tool-calling, verification-aware, and context-aware" : "command-driven only")}",
             $"Web research: {(context.Options.PlannerWebResearchEnabled ? "enabled" : "disabled")}",
             "Additional context: short-term session state, recent turns, recent tool results, learned preferences, local user state, reminders, and optional visual understanding",
+            "Privacy: `remember private <note>` keeps a note off disk, `off the record` skips logging and memory capture for that turn, and passwords, keys and card numbers are never saved automatically",
             $"Default weather location: {(string.IsNullOrWhiteSpace(context.Options.DefaultWeatherLocation) ? "not set" : context.Options.DefaultWeatherLocation)}",
             $"Stored memories: {memoryCount} | learned preferences: {profile.PreferenceCount} | summaries: {profile.SummaryCount} | structured: {profile.StructuredMemoryCount} | pending reminders: {profile.PendingReminderCount}",
             $"Transcript turns: {transcriptCount}",
@@ -532,33 +532,6 @@ public sealed class MemoryProfileTool : IAssistantTool
     {
         var profile = await context.MemoryStore.GetProfileAsync(cancellationToken);
         return new ToolResult(profile.ToDisplayText());
-    }
-}
-
-// Explains what Jarvis does and does not keep.
-public sealed class PrivacyTool : IAssistantTool
-{
-    public string Name => "privacy";
-
-    public string Description => "Explain memory privacy boundaries and off-the-record behavior.";
-
-    public bool CanHandle(string input) =>
-        input.Equals("privacy", StringComparison.OrdinalIgnoreCase)
-        || input.Equals("privacy help", StringComparison.OrdinalIgnoreCase)
-        || input.Equals("privacy boundaries", StringComparison.OrdinalIgnoreCase)
-        || input.Equals("memory privacy", StringComparison.OrdinalIgnoreCase);
-
-    public Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var response = string.Join(
-            Environment.NewLine,
-            "Privacy boundaries:",
-            "- Use `remember private <note>` to keep a note off disk.",
-            "- Prefix a request with `off the record` to skip transcript logging and automatic memory capture for that turn.",
-            "- Sensitive content such as passwords, tokens, API keys, SSNs, OTP codes, and card-like numbers is blocked from automatic persistence.",
-            "- Memory retention can be shortened, extended, edited, or forgotten later from the memory UI.");
-
-        return Task.FromResult(new ToolResult(response));
     }
 }
 
@@ -1009,17 +982,8 @@ public sealed class NetworkTool : IAssistantTool
     {
         var normalized = input.Trim();
 
-        return normalized.Equals("network", StringComparison.OrdinalIgnoreCase)
-            || normalized.StartsWith("network ", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("local network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("network devices", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("network scan", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("network health", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("scan my network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("devices on my network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("discover devices on my network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("check network health", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("check my network", StringComparison.OrdinalIgnoreCase);
+        return LocalNetworkMonitoring.ModePhrases.ContainsKey(normalized)
+            || normalized.StartsWith("network ", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
@@ -1038,29 +1002,14 @@ public sealed class NetworkTool : IAssistantTool
     {
         var normalized = input.Trim();
 
-        if (normalized.Equals("scan my network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("devices on my network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("discover devices on my network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("network scan", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("network devices", StringComparison.OrdinalIgnoreCase))
-        {
-            return "scan";
-        }
-
-        if (normalized.Equals("network health", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("check network health", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("check my network", StringComparison.OrdinalIgnoreCase))
-        {
-            return "health";
-        }
-
-        if (normalized.Equals("network", StringComparison.OrdinalIgnoreCase)
-            || normalized.Equals("local network", StringComparison.OrdinalIgnoreCase))
-        {
-            return string.Empty;
-        }
-
-        return ToolInputHelper.GetCommandTail(normalized, "network");
+        return LocalNetworkMonitoring.ModePhrases.TryGetValue(normalized, out var mode)
+            ? mode switch
+            {
+                LocalNetworkMonitoring.NetworkRequestMode.Scan => "scan",
+                LocalNetworkMonitoring.NetworkRequestMode.Health => "health",
+                _ => string.Empty
+            }
+            : ToolInputHelper.GetCommandTail(normalized, "network");
     }
 }
 

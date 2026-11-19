@@ -113,7 +113,6 @@ internal sealed partial class JarvisMainForm : Form
     private PendingApprovalAction? _pendingApproval;
     private Button _presenceButton = null!;
     private Label _promptEchoLabel = null!;
-    private Button _pushToTalkButton = null!;
     // A voice command that arrived while Jarvis was busy; it is run after the current one finishes.
     private QueuedVoiceDirective? _queuedVoiceDirective;
     private TransparentTableLayoutPanel _rightColumnLayout = null!;
@@ -514,7 +513,6 @@ internal sealed partial class JarvisMainForm : Form
         _approveButton.Click += async (_, _) => await HandleApprovalDecisionAsync(true);
         _denyButton.Click += async (_, _) => await HandleApprovalDecisionAsync(false);
         _micToggleButton.Click += async (_, _) => await ToggleMicrophoneAsync();
-        _pushToTalkButton.Click += async (_, _) => await TogglePushToTalkAsync();
         _deviceRefreshButton.Click += (_, _) => RefreshAudioDevices();
         _calibrateMicButton.Click += async (_, _) => await CalibrateMicrophoneAsync();
         _validateMicButton.Click += async (_, _) => await ValidateMicrophoneAsync();

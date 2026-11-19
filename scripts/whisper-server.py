@@ -44,7 +44,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from faster_whisper import WhisperModel
 from faster_whisper.utils import download_model
 
@@ -232,7 +232,7 @@ def synthesize_pcm(sentence: str, voice: str, speed: float) -> bytes:
     return (samples.clip(-1, 1) * 32767).astype("<i2").tobytes()
 
 
-# Text-to-speech endpoint. Expects JSON like {"input": "text", "voice": "af_heart", "speed": 1.0, "response_format": "wav"}.
+# Text-to-speech endpoint. Expects JSON like {"input": "text", "voice": "af_heart", "speed": 1.0}. Always answers with raw PCM.
 @app.post("/v1/audio/speech")
 def create_speech(payload: dict = Body(...)):
     """OpenAI-shaped text-to-speech. Returns 24 kHz 16-bit mono PCM, streamed one sentence at a time
@@ -252,17 +252,7 @@ def create_speech(payload: dict = Body(...)):
     # Clamp the speed to Kokoro's sensible range of half to double.
     speed = min(max(float(payload.get("speed") or 1.0), 0.5), 2.0)
 
-    # "wav" returns one finished WAV file; anything else streams raw audio.
-    if payload.get("response_format") == "wav":
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as output:
-            output.setnchannels(1)
-            output.setsampwidth(2)
-            output.setframerate(24000)
-            output.writeframes(SENTENCE_PAUSE.join(synthesize_pcm(s, voice, speed) for s in sentences))
-        return Response(buffer.getvalue(), media_type="audio/wav")
-
-    # Streaming mode: generate and send sentence by sentence so the app can start playing right away.
+    # Generate and send sentence by sentence so the app can start playing right away.
     def stream():
         started = time.perf_counter()
         for index, sentence in enumerate(sentences):

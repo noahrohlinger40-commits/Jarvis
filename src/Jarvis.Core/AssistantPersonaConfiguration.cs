@@ -1,6 +1,6 @@
 // AssistantPersonaConfiguration.cs: turns the personality settings in JarvisOptions (persona text, presence preset,
-// response style, nickname, pronunciation hints) into the instruction text that is put into the model's prompt and
-// into the voice's speaking instructions. Everything here only builds strings or picks valid values; nothing is
+// response style, nickname, pronunciation hints) into the instruction text that is put into the model's prompt, and picks the
+// speaking speed of the built-in Windows voice. Everything here only builds strings or picks valid values; nothing is
 // sent anywhere. Learned habits come in from the memory profile (MemoryProfileSnapshot).
 namespace Jarvis.Core;
 
@@ -225,36 +225,6 @@ public static class AssistantPersonaConfiguration
 
         lines.Add("Warmth and emotional tone may flex slightly with context, but stay technically grounded and avoid theatrical overreaction.");
         return string.Join(Environment.NewLine, lines);
-    }
-
-    // Instructions for how the text-to-speech voice should sound. An explicit VoiceInstructions setting wins;
-    // otherwise they are assembled from the persona, preset, style, small-talk setting, nickname and pronunciation hints.
-    public static string ResolveVoiceInstructions(JarvisOptions options)
-    {
-        ArgumentNullException.ThrowIfNull(options);
-
-        var configuredVoiceInstructions = options.VoiceInstructions?.Trim() ?? string.Empty;
-
-        if (!string.IsNullOrWhiteSpace(configuredVoiceInstructions))
-        {
-            return configuredVoiceInstructions;
-        }
-
-        var style = ResolveResponseStyle(options);
-        var preset = ResolvePresencePreset(options);
-        var address = ResolvePreferredUserAddress(options);
-        var pronunciationHints = ResolvePronunciationHints(options);
-        var smallTalk = options.AssistantSmallTalkEnabled
-            ? "Brief friendly acknowledgements are allowed when they feel natural."
-            : "Keep spoken small talk minimal and stay focused.";
-        var addressInstruction = string.IsNullOrWhiteSpace(address)
-            ? string.Empty
-            : $" If you address the user, prefer {address} and do not overuse it.";
-        var pronunciationInstruction = pronunciationHints.Count == 0
-            ? string.Empty
-            : $" Pronounce these items as directed when they appear: {string.Join("; ", pronunciationHints)}.";
-
-        return $"Speak in a way that matches this assistant persona: {Resolve(options)} Presence preset: {DescribePresencePreset(preset)} Response style: {DescribeResponseStyle(style)}. {smallTalk}{addressInstruction}{pronunciationInstruction}";
     }
 
     // Speaking speed for the built-in Windows voice, from -10 (slow) to 10 (fast): whisper mode is slightly slow,

@@ -1,5 +1,5 @@
 // DesktopAutomation.AppIndex.cs: the "which apps can I open?" slice of DesktopAutomationService.
-// It builds and caches the catalog of apps (start menu, registry, game launchers, Store apps), saves a copy to data\app-index.json,
+// It builds and caches the catalog of apps (start menu, registry, Store apps), saves a copy to data\app-index.json,
 // and works out the spoken names for each app and how close a misheard name is (typo and sound-alike matching).
 // Used by DesktopAutomation.cs (open/launch/list app); the scanning helpers it calls live in that file.
 using System.Diagnostics;
@@ -136,12 +136,7 @@ public sealed partial class DesktopAutomationService
                      GetDesktopApplications,
                      GetAppPathApplications,
                      GetInstalledApplications,
-                     GetLocalUserApplications,
-                     GetEpicLibraryApplications,
-                     GetRiotLibraryApplications,
-                     GetXboxLibraryApplications,
-                     GetBattleNetLibraryApplications,
-                     GetSteamLibraryApplications
+                     GetLocalUserApplications
                  })
         {
             foreach (var candidate in source())

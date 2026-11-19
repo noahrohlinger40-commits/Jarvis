@@ -1,6 +1,6 @@
-// VoiceRecognitionText.cs: text-side helpers for speech. Cleans up what whisper (or the Windows recogniser) heard, spots the
+// VoiceRecognitionText.cs: text-side helpers for speech. Cleans up what whisper heard, spots the
 // wake word ("Jarvis") in a transcript and strips it to leave the command, builds the vocabulary hint sent to whisper, and
-// recognises yes/no answers. Used by both voice runtimes (OpenAiCompatibleVoiceRuntime, SpeechRecognitionVoiceRuntime).
+// recognises yes/no answers. Used by OpenAiCompatibleVoiceRuntime, WakeWordDetector and the main form.
 // Whisper often mis-spells the name ("Jervis", "Garbus"), so matching is deliberately forgiving here.
 using System.Text.RegularExpressions;
 using Jarvis.Core;
@@ -232,7 +232,7 @@ internal static partial class VoiceRecognitionText
         return false;
     }
 
-    // All spoken forms of the wake word (and with greetings) for the Windows recogniser's wake grammar.
+    // All spoken forms of the wake word (and with greetings) for the wake-word detector.
     public static IReadOnlyList<string> BuildWakeGrammarChoices(JarvisOptions options)
     {
         var phrases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

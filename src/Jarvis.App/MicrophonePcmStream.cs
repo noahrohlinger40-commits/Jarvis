@@ -1,15 +1,14 @@
-// MicrophonePcmStream.cs: a "microphone as a Stream" adapter used by the Windows System.Speech fallback
-// (SpeechRecognitionVoiceRuntime in VoiceRuntime.cs) and by LectureRecorder. NAudio records a chosen microphone and queues
+// MicrophonePcmStream.cs: a "microphone as a Stream" adapter used by LectureRecorder. NAudio records a chosen microphone and queues
 // the chunks; Stream.Read blocks until audio arrives. Also boosts quiet microphones (automatic gain) and reports a level for the meter.
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using NAudio.Wave;
 
 namespace Jarvis.App;
 
 /// <summary>
 /// Captures 16 kHz mono PCM from a specific input device, applies a gentle automatic gain boost,
-/// and exposes the audio as a blocking <see cref="Stream"/> so System.Speech can consume it.
-/// System.Speech otherwise only listens to the Windows default microphone with no gain control.
+/// and exposes the audio as a blocking <see cref="Stream"/>.
 /// </summary>
 internal sealed class MicrophonePcmStream : Stream
 {
@@ -22,7 +21,7 @@ internal sealed class MicrophonePcmStream : Stream
     // Conversational speech sits around 0.05-0.10 RMS; this maps it to roughly 0.25-0.5 for the meter.
     private const double LevelDisplayScale = 5.0;
 
-    // Thread-safe queue between the recording thread (producer) and the recognizer's Read call (consumer).
+    // Thread-safe queue between the recording thread (producer) and the reader's Read call (consumer).
     private readonly BlockingCollection<byte[]> _chunks = new(MaxQueuedChunks);
     private readonly WaveInEvent _waveIn;
     // Most the automatic gain may multiply the volume by, and the peak level (0..1) it aims for.
@@ -57,8 +56,7 @@ internal sealed class MicrophonePcmStream : Stream
     public string DeviceName { get; }
 
     /// <summary>
-    /// Raised for every captured buffer with a 0-1 level (scaled RMS after gain). System.Speech does not
-    /// raise its own audio-level events for custom streams, so the voice meter and barge-in use this.
+    /// Raised for every captured buffer with a 0-1 level (scaled RMS after gain).
     /// </summary>
     public event Action<double>? LevelMeasured;
 
@@ -113,7 +111,7 @@ internal sealed class MicrophonePcmStream : Stream
 
         try
         {
-            // Drop the chunk rather than block the capture thread if the recognizer falls far behind.
+            // Drop the chunk rather than block the capture thread if the reader falls far behind.
             _chunks.TryAdd(chunk);
         }
         catch (InvalidOperationException)
@@ -165,17 +163,21 @@ internal sealed class MicrophonePcmStream : Stream
             return;
         }
 
-        // Multiply each sample, clamp to the 16-bit range, and write the two bytes back (little-endian).
-        for (var index = 0; index < pcm16Mono.Length; index += 2)
+        ScalePcm16Mono(pcm16Mono, pcm16Mono.Length, _smoothedGain);
+    }
+
+    // Multiplies every 16-bit sample in the first byteCount bytes by the gain and clamps to the 16-bit range so it cannot wrap around into noise.
+    internal static void ScalePcm16Mono(byte[] pcmBuffer, int byteCount, double gain)
+    {
+        var samples = MemoryMarshal.Cast<byte, short>(pcmBuffer.AsSpan(0, Math.Max(0, byteCount)));
+
+        for (var index = 0; index < samples.Length; index++)
         {
-            var amplified = (int)Math.Round(BitConverter.ToInt16(pcm16Mono, index) * _smoothedGain);
-            amplified = Math.Clamp(amplified, short.MinValue, short.MaxValue);
-            pcm16Mono[index] = (byte)(amplified & 0xFF);
-            pcm16Mono[index + 1] = (byte)((amplified >> 8) & 0xFF);
+            samples[index] = (short)Math.Clamp((int)Math.Round(samples[index] * gain), short.MinValue, short.MaxValue);
         }
     }
 
-    // Called by System.Speech. Fills the whole requested buffer, waiting for more microphone audio if needed.
+    // Fills the whole requested buffer, waiting for more microphone audio if needed.
     public override int Read(byte[] buffer, int offset, int count)
     {
         if (count <= 0)
@@ -183,7 +185,7 @@ internal sealed class MicrophonePcmStream : Stream
             return 0;
         }
 
-        // System.Speech treats a short read as end-of-stream, so block until the whole request is
+        // A short read looks like end-of-stream to callers, so block until the whole request is
         // filled. Only a stopped capture (queue completed and drained) may return fewer bytes.
         var totalCopied = 0;
 
@@ -239,8 +241,8 @@ internal sealed class MicrophonePcmStream : Stream
 
     public override bool CanWrite => false;
 
-    // System.Speech queries Length when it wraps the stream. A live microphone has no fixed length.
-    public override long Length => long.MaxValue;
+    // A live microphone has no fixed length.
+    public override long Length => throw new NotSupportedException();
 
     public override long Position
     {
@@ -253,15 +255,7 @@ internal sealed class MicrophonePcmStream : Stream
     }
 
     public override long Seek(long offset, SeekOrigin origin)
-    {
-        // System.Speech probes the current position with Seek(0, Current) and fails silently if that throws.
-        if (origin == SeekOrigin.Current && offset == 0)
-        {
-            return _totalBytesRead;
-        }
-
-        throw new NotSupportedException();
-    }
+        => throw new NotSupportedException();
 
     public override void SetLength(long value) => throw new NotSupportedException();
 

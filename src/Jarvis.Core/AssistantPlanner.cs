@@ -638,7 +638,7 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
                         activity,
                         ModelRoute.Reasoning,
                         cancellationToken)
-                    : new ChatCompletionResponse(string.Empty, [], string.Empty, "offline");
+                    : new ChatCompletionResponse(string.Empty, [], string.Empty);
             }
             // A model failure (other than the user cancelling) ends the loop with a fallback answer built from what is known so far.
             catch (Exception exception) when (exception is not OperationCanceledException)

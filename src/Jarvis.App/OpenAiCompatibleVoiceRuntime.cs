@@ -1,11 +1,10 @@
 // OpenAiCompatibleVoiceRuntime.cs: Jarvis's main microphone pipeline. See the step-by-step path in VoiceRuntime.cs.
 // It records the microphone, cuts the audio into utterances, sends each one to a local whisper server (an "OpenAI-compatible"
 // /audio/transcriptions endpoint, normally 127.0.0.1:8178), and raises CommandRecognized with the cleaned text.
-// Also contains OpenAiCompatibleTranscriptionClient (the HTTP call) and Pcm16WavWriter (wraps raw audio as a WAV file).
+// Also contains OpenAiCompatibleTranscriptionClient (the HTTP call).
 // Audio basics used throughout: samples are 16-bit whole numbers (-32768..32767), two bytes each; "level" is a sample divided
 // by 32768 so it falls between -1 and 1; sample rate 16,000 means 16,000 samples (32,000 bytes) per second.
 using System.Net.Http.Headers;
-using System.Text;
 using System.Text.Json;
 using Jarvis.Core;
 using NAudio.Wave;
@@ -125,7 +124,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         // Local-only mode refuses to send voice to anything but a loopback (this computer) address.
         if (options.LocalAiOnly && !LocalAiPolicy.IsLoopbackHttpEndpoint(options.SpeechRecognitionBaseUrl))
         {
-            status = "Local-only AI mode blocked remote transcription. Configure a local speech endpoint or Windows speech.";
+            status = "Local-only AI mode blocked remote transcription. Configure a local speech endpoint.";
             return false;
         }
 
@@ -496,10 +495,9 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return;
         }
 
-        // No name in the transcript. A manifest wake engine (openWakeWord) may still hear the name whisper misheard;
-        // it only opens the follow-up window and never runs this text. The recognizer-grammar default is never
-        // consulted here: its misfires ran room speech as commands.
-        if (utteranceBytes is not null && !_isArmed && _wakeWordDetector is { UsesExternalEngine: true }
+        // No name in the transcript. The wake engine (openWakeWord) may still hear the name whisper misheard;
+        // it only opens the follow-up window and never runs this text.
+        if (utteranceBytes is not null && !_isArmed && _wakeWordDetector is not null
             && _wakeWordDetector.Detect(utteranceBytes, _options.SpeechRecognitionSampleRateHz).IsDetected)
         {
             ArmWakeWindow();
@@ -623,11 +621,6 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             : $"microphone \"{_options.SpeechRecognitionDeviceName}\"";
         var modeLabel = _options.SpeechRecognitionMode?.Trim() ?? "half-duplex";
         var tuningLabel = _audioProcessing.BuildStatusLabel();
-
-        if (_options.SpeechRecognitionPushToTalkEnabled)
-        {
-            return $"Push-to-talk ready with {providerLabel} on {deviceLabel} ({modeLabel}).";
-        }
 
         return _options.WakeWordEnabled
             ? _wakeWordDetector is null
@@ -983,8 +976,14 @@ internal sealed class OpenAiCompatibleTranscriptionClient
     {
         using var form = new MultipartFormDataContent();
 
-        var wavBytes = Pcm16WavWriter.WrapPcm16Mono(pcm16MonoAudio, sampleRateHz);
-        var audioContent = new ByteArrayContent(wavBytes);
+        // The server expects a WAV file, not raw samples: wrap the audio as 16-bit mono PCM. The writer closes the stream it wraps.
+        var wavStream = new MemoryStream();
+        using (var wavWriter = new WaveFileWriter(wavStream, new WaveFormat(sampleRateHz, 16, 1)))
+        {
+            wavWriter.Write(pcm16MonoAudio, 0, pcm16MonoAudio.Length);
+        }
+
+        var audioContent = new ByteArrayContent(wavStream.ToArray());
         audioContent.Headers.ContentType = new MediaTypeHeaderValue("audio/wav");
 
         form.Add(audioContent, "file", "speech.wav");
@@ -1042,39 +1041,5 @@ internal sealed class OpenAiCompatibleTranscriptionClient
         const int maxLength = 500;
         var value = text.Trim();
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
-    }
-}
-
-// Writes the 44-byte WAV header in front of raw 16-bit mono audio, because the server expects a WAV file, not raw samples.
-internal static class Pcm16WavWriter
-{
-    public static byte[] WrapPcm16Mono(byte[] pcm16MonoAudio, int sampleRateHz)
-    {
-        using var stream = new MemoryStream();
-        using var writer = new BinaryWriter(stream, Encoding.ASCII, leaveOpen: true);
-
-        const short channels = 1;
-        const short bitsPerSample = 16;
-        var byteRate = sampleRateHz * channels * bitsPerSample / 8;
-        var blockAlign = (short)(channels * bitsPerSample / 8);
-
-        // Standard WAV layout: RIFF header, "fmt " format block (PCM, 1 channel, sample rate, bytes per second, 16 bits), then the "data" block.
-        writer.Write(Encoding.ASCII.GetBytes("RIFF"));
-        writer.Write(36 + pcm16MonoAudio.Length);
-        writer.Write(Encoding.ASCII.GetBytes("WAVE"));
-        writer.Write(Encoding.ASCII.GetBytes("fmt "));
-        writer.Write(16);
-        writer.Write((short)1);
-        writer.Write(channels);
-        writer.Write(sampleRateHz);
-        writer.Write(byteRate);
-        writer.Write(blockAlign);
-        writer.Write(bitsPerSample);
-        writer.Write(Encoding.ASCII.GetBytes("data"));
-        writer.Write(pcm16MonoAudio.Length);
-        writer.Write(pcm16MonoAudio);
-        writer.Flush();
-
-        return stream.ToArray();
     }
 }

@@ -4,6 +4,7 @@
 // covered by the local-only AI setting. If DuckDuckGo changes its page layout, the regexes below will stop matching.
 using System.Net;
 using System.Text.RegularExpressions;
+using System.Web;
 
 namespace Jarvis.Core;
 
@@ -156,22 +157,7 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
             return rawUrl;
         }
 
-        var query = redirectUri.Query.TrimStart('?')
-            .Split('&', StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var part in query)
-        {
-            var segments = part.Split('=', 2);
-
-            if (segments.Length != 2 || !string.Equals(segments[0], "uddg", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            return Uri.UnescapeDataString(segments[1]);
-        }
-
-        return rawUrl;
+        return HttpUtility.ParseQueryString(redirectUri.Query)["uddg"] ?? rawUrl;
     }
 
     // Turns HTML entities such as &amp; back into normal characters.

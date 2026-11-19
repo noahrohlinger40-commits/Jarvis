@@ -11,71 +11,12 @@ namespace Jarvis.Core;
 internal static class MemorySemanticSearch
 {
     // Very common words ignored in matching ('the', 'my', 'what'...), because they say nothing about meaning.
-    private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "a",
-        "an",
-        "about",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "but",
-        "by",
-        "did",
-        "do",
-        "for",
-        "from",
-        "had",
-        "have",
-        "how",
-        "i",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "me",
-        "my",
-        "of",
-        "on",
-        "or",
-        "our",
-        "so",
-        "that",
-        "the",
-        "their",
-        "them",
-        "there",
-        "they",
-        "this",
-        "to",
-        "up",
-        "us",
-        "was",
-        "we",
-        "what",
-        "when",
-        "where",
-        "who",
-        "why",
-        "with",
-        "you",
-        "your"
-    };
+    private static readonly HashSet<string> StopWords = new(
+        "a an about and are as at be but by did do for from had have how i if in into is it me my of on or our so that the their them there they this to up us was we what when where who why with you your".Split(' '),
+        StringComparer.OrdinalIgnoreCase);
 
     // Synonym table (word -> group's first word) built once at startup; see BuildCanonicalTerms.
     private static readonly Dictionary<string, string> CanonicalTerms = BuildCanonicalTerms();
-
-    public static IReadOnlyList<MemoryNote> Search(
-        IReadOnlyList<MemoryNote> notes,
-        string query,
-        int maxResults)
-    {
-        // Same search with the query itself as the only context.
-        return Search(notes, query, maxResults, new MemoryQueryContext(query));
-    }
 
     public static IReadOnlyList<MemoryNote> Search(
         IReadOnlyList<MemoryNote> notes,

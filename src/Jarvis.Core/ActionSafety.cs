@@ -258,11 +258,6 @@ public sealed class ToolSafetyService
             return AssessChromeCommand(normalizedCommand);
         }
 
-        if (string.Equals(toolName, "memory", StringComparison.OrdinalIgnoreCase))
-        {
-            return AssessMemoryCommand(normalizedCommand);
-        }
-
         if (toolName is "write file" or "append file" or "replace in file" or "move path" or "copy path" or "delete path")
         {
             return AssessFileMutationCommand(toolName, normalizedCommand);
@@ -360,7 +355,7 @@ public sealed class ToolSafetyService
 
     // Prompt-injection guard. Tools whose output is text written by outsiders (web pages, mail, the screen, files...).
     // A planner turn that has read one is "marked"; after that, only IsReadOnlyCall tools run without asking.
-    // chrome, clipboard and calendar are multi-action, so ReadsOutsideContent handles them by action.
+    // clipboard and calendar are multi-action, so ReadsOutsideContent handles them by action.
     private static readonly HashSet<string> OutsideContentTools = new(StringComparer.OrdinalIgnoreCase)
     {
         "browse", "search web", "research", "page", "get element text", "read file", "screen", "analyze image",
@@ -371,14 +366,13 @@ public sealed class ToolSafetyService
     private static readonly HashSet<string> ReadOnlyTools = new(OutsideContentTools.Concat(
     [
         "list files", "find files", "windows", "app state", "computer", "apps", "status", "time", "help", "weather",
-        "network", "system", "recall", "notes", "preferences", "privacy", "scroll", "wait"
+        "network", "system", "recall", "notes", "preferences", "scroll", "wait"
     ]), StringComparer.OrdinalIgnoreCase);
 
     // Whether a call reads text that outsiders wrote (web page, mail, screen). Chrome, clipboard and calendar depend on the action used.
     internal static bool ReadsOutsideContent(string toolName, string normalizedCommand) => toolName.ToLowerInvariant() switch
     {
-        "chrome" => AppIntegrationParsing.TryParseChrome(normalizedCommand, out var chrome) && chrome.Action is "dom-page" or "dom-read" or "dom-tabs" or "dom-verify",
-        "clipboard" => UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var clip, out _) && clip is "show" or "history",
+        "clipboard" => UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var clip, out _) && clip == "show",
         "calendar" => IsReadOnlyCall(toolName, normalizedCommand),
         _ => OutsideContentTools.Contains(toolName)
     };
@@ -394,10 +388,9 @@ public sealed class ToolSafetyService
                 // ponytail: navigation passes, so a page can still smuggle data out in a URL; scope the allowed hosts if that matters.
                 return AppIntegrationParsing.TryParseChrome(normalizedCommand, out var chrome)
                     && chrome.Action is "status" or "open-url" or "navigate-current" or "new-tab" or "new-window" or "back" or "forward" or "reload"
-                        or "next-tab" or "previous-tab" or "history" or "downloads" or "bookmarks" or "find" or "dom-status" or "dom-tabs"
-                        or "dom-select" or "dom-open" or "dom-new-tab" or "dom-page" or "dom-read" or "dom-wait" or "dom-verify";
+                        or "next-tab" or "previous-tab" or "history" or "downloads" or "bookmarks" or "find";
             case "clipboard":
-                return UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var clip, out _) && clip is "show" or "history";
+                return UiCommandParsing.TryParseClipboardCommand(normalizedCommand, out var clip, out _) && clip == "show";
             case "calendar":
                 return !tail.Equals("add", StringComparison.OrdinalIgnoreCase)
                     && !tail.StartsWith("add ", StringComparison.OrdinalIgnoreCase)
@@ -408,10 +401,6 @@ public sealed class ToolSafetyService
                 return tail is "" or "status";
             case "reminders":
                 return tail is "" or "show" or "list" or "show reminders" or "list reminders";
-            case "notify":
-                return AutomationWorkflowParsing.TryParseNotification(normalizedCommand, out var notice) && notice.Action == "list";
-            case "memory":
-                return MemoryCommandParsing.TryParse(normalizedCommand, out var memory) && memory.Action is "help" or "review";
             default:
                 return ReadOnlyTools.Contains(toolName);
         }
@@ -567,7 +556,7 @@ public sealed class ToolSafetyService
             "Approval required for sensitive app text entry.");
     }
 
-    // Chrome: asks first for logins, sensitive form fill, and typing into password-like page fields.
+    // Chrome: asks first for logins and sensitive form fill.
     private SafetyDecision AssessChromeCommand(string normalizedCommand)
     {
         if (!AppIntegrationParsing.TryParseChrome(normalizedCommand, out var command))
@@ -595,47 +584,7 @@ public sealed class ToolSafetyService
                 "Approval required for sensitive Chrome form fill.");
         }
 
-        if (command.Action == "dom-type"
-            && ChromeDevToolsAutomation.TryParseSelectorAndText(command.Payload, out var selector, out var domText)
-            && (LooksLikeSensitiveUiPayload(domText)
-                || selector.Contains("password", StringComparison.OrdinalIgnoreCase)))
-        {
-            return RequireUiApproval(
-                $"fill sensitive-looking text into Chrome DOM target `{TrimForDisplay(selector)}`",
-                "Sensitive Chrome DOM text entry is paused pending approval.",
-                "Approval required before I fill that sensitive text in Chrome.",
-                "Approval required for sensitive Chrome DOM text entry.");
-        }
-
         return new SafetyDecision(SafetyDecisionKind.Allow);
-    }
-
-    // Memory: only commands that change retention or importance of saved memory need approval; reading is free.
-    private SafetyDecision AssessMemoryCommand(string normalizedCommand)
-    {
-        if (!_options.SafetyRequireApprovalForMajorActions
-            || !MemoryCommandParsing.TryParse(normalizedCommand, out var command))
-        {
-            return new SafetyDecision(SafetyDecisionKind.Allow);
-        }
-
-        var impact = command.Action switch
-        {
-            "set-retention" => "change memory retention",
-            "set-importance" => "change memory importance",
-            _ => string.Empty
-        };
-
-        if (string.IsNullOrWhiteSpace(impact))
-        {
-            return new SafetyDecision(SafetyDecisionKind.Allow);
-        }
-
-        return RequireUiApproval(
-            impact,
-            "The memory update is paused pending approval.",
-            "Approval required before I change persisted memory data.",
-            "Approval required for a memory mutation command.");
     }
 
     // File tools (write, append, replace, move, copy, delete): protected system paths are blocked, everything else asks first.

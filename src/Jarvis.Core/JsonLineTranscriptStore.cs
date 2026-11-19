@@ -23,7 +23,7 @@ public sealed class JsonLineTranscriptStore
     // Adds one turn as a new line at the end of the file.
     public async Task AppendAsync(AssistantTurn turn, CancellationToken cancellationToken)
     {
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         await _gate.WaitAsync(cancellationToken);
 
@@ -48,7 +48,7 @@ public sealed class JsonLineTranscriptStore
     // Every logged turn, oldest first.
     public async Task<IReadOnlyList<AssistantTurn>> GetAllAsync(CancellationToken cancellationToken)
     {
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         await _gate.WaitAsync(cancellationToken);
 
@@ -70,7 +70,7 @@ public sealed class JsonLineTranscriptStore
             return Array.Empty<AssistantTurn>();
         }
 
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         await _gate.WaitAsync(cancellationToken);
 
@@ -118,18 +118,5 @@ public sealed class JsonLineTranscriptStore
         return turns
             .OrderBy(turn => turn.TimestampUtc)
             .ToList();
-    }
-
-    private void EnsureParentDirectoryExists()
-    {
-        EnsureDirectory(Path.GetDirectoryName(_filePath));
-    }
-
-    private static void EnsureDirectory(string? directory)
-    {
-        if (!string.IsNullOrWhiteSpace(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
     }
 }

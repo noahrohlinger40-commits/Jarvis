@@ -34,8 +34,9 @@ public static class RequestSurface
 
 internal sealed partial class StructuredAssistantPlanner
 {
-    // Entry point that checks for cancellation, then does the real work in ClassifyIntentCoreAsync.
-    private Task<IntentDecision> ClassifyIntentAsync(
+    // Picks the route. A resumed workflow always goes to the planner; otherwise the keyword guess is used, and a fast model call
+    // may override it when the guess is shaky.
+    private async Task<IntentDecision> ClassifyIntentAsync(
         string input,
         AssistantPlanningRequest request,
         PersistedAgentSession? pendingSession,
@@ -45,20 +46,6 @@ internal sealed partial class StructuredAssistantPlanner
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return ClassifyIntentCoreAsync(input, request, pendingSession, resumedSession, sessionId, activity, cancellationToken);
-    }
-
-    // Picks the route. A resumed workflow always goes to the planner; otherwise the keyword guess is used, and a fast model call
-    // may override it when the guess is shaky.
-    private async Task<IntentDecision> ClassifyIntentCoreAsync(
-        string input,
-        AssistantPlanningRequest request,
-        PersistedAgentSession? pendingSession,
-        PersistedAgentSession? resumedSession,
-        string sessionId,
-        IProgress<AssistantActivityEvent> activity,
-        CancellationToken cancellationToken)
-    {
         IntentDecision decision;
 
         if (resumedSession is not null)

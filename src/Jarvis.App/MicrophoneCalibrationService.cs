@@ -42,13 +42,6 @@ internal sealed class MicrophoneCalibrationService
             cancellationToken);
     }
 
-    // Quick room-noise measurement (0.8 s): the larger of the average and the 90th-percentile level.
-    public async Task<double> GetCurrentAmbientRmsAsync(JarvisOptions options, CancellationToken cancellationToken = default)
-    {
-        var snapshot = await CaptureSampleAsync(options, 800, cancellationToken);
-        return Math.Max(snapshot.AverageRms, snapshot.Rms90);
-    }
-
     // Turns an ambient (quiet room) sample and a speech sample into a profile. Key numbers: the speech threshold sits between
     // the room level and the speech level (at least 2.6x the room noise, within 0.003 - 0.040); the target peak is a bit lower for
     // loud speakers and higher for quiet ones (0.28 - 0.44); the maximum gain is target / speech peak (1.25x - 4.8x).

@@ -19,28 +19,8 @@ public sealed record InteractionContextSnapshot(
     // A shared 'no context' value (its time is when the type was first used).
     public static InteractionContextSnapshot Empty { get; } = new(DateTimeOffset.UtcNow);
 
-    // VisibleApps, or an empty array if it is null.
-    public string[] SafeVisibleApps => VisibleApps ?? Array.Empty<string>();
-
     // RecentActivity, or an empty array if it is null.
     public string[] SafeRecentActivity => RecentActivity ?? Array.Empty<string>();
-
-    // Multi-line version of the context for the language model prompt.
-    public string ToPromptText()
-    {
-        var lines = new List<string>
-        {
-            $"Observed at: {ObservedAtUtc:yyyy-MM-dd HH:mm}Z",
-            $"Time of day: {OrNone(TimeOfDay)}",
-            $"Location: {OrNone(Location)}",
-            $"Active app: {OrNone(ActiveApp)}",
-            $"Active window: {OrNone(ActiveWindow)}",
-            $"Visible apps: {JoinOrNone(SafeVisibleApps)}",
-            $"Recent activity: {JoinOrNone(SafeRecentActivity)}"
-        };
-
-        return string.Join(Environment.NewLine, lines);
-    }
 
     // One-line version of the context for logs and tool output; shows at most 3 recent activities.
     public string ToInlineText()
@@ -67,16 +47,6 @@ public sealed record InteractionContextSnapshot(
         {
             parts.Add($"{label} {value.Trim()}");
         }
-    }
-
-    private static string JoinOrNone(IReadOnlyList<string> values)
-    {
-        return values.Count == 0 ? "none" : string.Join(" | ", values);
-    }
-
-    private static string OrNone(string value)
-    {
-        return string.IsNullOrWhiteSpace(value) ? "none" : value.Trim();
     }
 }
 
@@ -143,8 +113,7 @@ public sealed record ReminderSnapshot(
     string Id,
     string Text,
     DateTimeOffset ReminderAtUtc,
-    string Status,
-    string SourceMemoryId);
+    string Status);
 
 // One entity as shown in the profile, with how many times it was seen.
 public sealed record StructuredMemorySummary(

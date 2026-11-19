@@ -2,6 +2,7 @@
 // point; it returns a block of text. It actively probes the home/office network: it lists this PC's active adapters, pings
 // nearby addresses, looks up host names and MAC addresses, tries a few common TCP ports, and guesses what each device is
 // (router, printer, NAS...). The sweep only targets private addresses on the local network (host names typed by the user are looked up in DNS).
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
@@ -43,6 +44,26 @@ internal static class LocalNetworkMonitoring
         @"^\s*(?<ip>(?:\d{1,3}\.){3}\d{1,3})\s+(?<mac>(?:[0-9a-f]{2}-){5}[0-9a-f]{2})\s+(?<type>\w+)\s*$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
+    // Whole phrases that ask for a mode rather than naming a device. NetworkTool matches what the user said against them, and
+    // ParseRequest matches the target text it receives against "network <target>" (so the target "scan" is the phrase "network scan").
+    internal static readonly IReadOnlyDictionary<string, NetworkRequestMode> ModePhrases =
+        new Dictionary<string, NetworkRequestMode>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["network"] = NetworkRequestMode.Overview,
+            ["local network"] = NetworkRequestMode.Overview,
+            ["network scan"] = NetworkRequestMode.Scan,
+            ["network devices"] = NetworkRequestMode.Scan,
+            ["network discover"] = NetworkRequestMode.Scan,
+            ["network discovery"] = NetworkRequestMode.Scan,
+            ["scan my network"] = NetworkRequestMode.Scan,
+            ["devices on my network"] = NetworkRequestMode.Scan,
+            ["discover devices on my network"] = NetworkRequestMode.Scan,
+            ["network health"] = NetworkRequestMode.Health,
+            ["network status"] = NetworkRequestMode.Health,
+            ["check network health"] = NetworkRequestMode.Health,
+            ["check my network"] = NetworkRequestMode.Health
+        };
+
     // Main entry point. An empty target gives an overview, "scan"/"devices" lists devices, "health"/"status" adds service checks,
     // and anything else (an IP address or host name) inspects that one device.
     public static async Task<string> GetStatusAsync(string target, CancellationToken cancellationToken)
@@ -74,19 +95,10 @@ internal static class LocalNetworkMonitoring
         }
 
         var trimmed = target.Trim();
-        var normalized = trimmed.ToLowerInvariant();
 
-        if (normalized is "scan" or "devices" or "discover" or "discovery")
-        {
-            return new NetworkRequest(NetworkRequestMode.Scan, string.Empty);
-        }
-
-        if (normalized is "health" or "status")
-        {
-            return new NetworkRequest(NetworkRequestMode.Health, string.Empty);
-        }
-
-        return new NetworkRequest(NetworkRequestMode.Inspect, trimmed);
+        return ModePhrases.TryGetValue("network " + trimmed, out var mode)
+            ? new NetworkRequest(mode, string.Empty)
+            : new NetworkRequest(NetworkRequestMode.Inspect, trimmed);
     }
 
     // Sweeps the network once: works out which addresses to try, probes them, and packages the adapters and devices found.
@@ -166,15 +178,7 @@ internal static class LocalNetworkMonitoring
             return false;
         }
 
-        var mask = unicast.IPv4Mask;
-
-        if (mask is null || mask.Equals(IPAddress.Any))
-        {
-            adapter = default!;
-            return false;
-        }
-
-        var prefixLength = CountMaskBits(mask);
+        var prefixLength = unicast.PrefixLength;
 
         if (prefixLength <= 0 || prefixLength > 30)
         {
@@ -191,7 +195,7 @@ internal static class LocalNetworkMonitoring
             .Where(address => address.AddressFamily == AddressFamily.InterNetwork)
             .Distinct()
             .ToArray();
-        var networkAddress = GetNetworkAddress(unicast.Address, mask);
+        var networkAddress = FromUInt32(ToUInt32(unicast.Address) & (uint.MaxValue << (32 - prefixLength)));
 
         adapter = new ActiveAdapter(
             networkInterface.Name.Trim(),
@@ -713,62 +717,14 @@ internal static class LocalNetworkMonitoring
         return bytes.Length == 4 && bytes[0] == 169 && bytes[1] == 254;
     }
 
-    // Counts the leading 1 bits of a subnet mask, e.g. 255.255.255.0 gives 24 (the "/24" prefix length).
-    private static int CountMaskBits(IPAddress mask)
-    {
-        var count = 0;
-
-        foreach (var value in mask.GetAddressBytes())
-        {
-            var current = value;
-
-            for (var bit = 0; bit < 8; bit++)
-            {
-                if ((current & 0x80) == 0x80)
-                {
-                    count++;
-                    current <<= 1;
-                    continue;
-                }
-
-                return count;
-            }
-        }
-
-        return count;
-    }
-
-    // Bitwise AND of address and mask gives the first address of the subnet (192.168.1.57 with /24 gives 192.168.1.0).
-    private static IPAddress GetNetworkAddress(IPAddress address, IPAddress mask)
-    {
-        var addressBytes = address.GetAddressBytes();
-        var maskBytes = mask.GetAddressBytes();
-        var networkBytes = new byte[4];
-
-        for (var index = 0; index < 4; index++)
-        {
-            networkBytes[index] = (byte)(addressBytes[index] & maskBytes[index]);
-        }
-
-        return new IPAddress(networkBytes);
-    }
-
     // Converts an IPv4 address to a single number (and FromUInt32 converts back) so addresses can be counted by adding to them.
-    private static uint ToUInt32(IPAddress address)
-    {
-        var bytes = address.GetAddressBytes();
-        return ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
-    }
+    private static uint ToUInt32(IPAddress address) => BinaryPrimitives.ReadUInt32BigEndian(address.GetAddressBytes());
 
     private static IPAddress FromUInt32(uint value)
     {
-        return new IPAddress(
-        [
-            (byte)((value >> 24) & 0xFF),
-            (byte)((value >> 16) & 0xFF),
-            (byte)((value >> 8) & 0xFF),
-            (byte)(value & 0xFF)
-        ]);
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+        return new IPAddress(bytes);
     }
 
     // Link speed as text, in steps of 1000: "867 Mbps", "1 Gbps". Zero or negative gives "unknown".
@@ -795,7 +751,7 @@ internal static class LocalNetworkMonitoring
     private sealed record NetworkRequest(NetworkRequestMode Mode, string Target);
 
     // What kind of report was asked for: Overview (default), Scan (device list), Health (adds service checks) or Inspect (one device).
-    private enum NetworkRequestMode
+    internal enum NetworkRequestMode
     {
         Overview,
         Scan,

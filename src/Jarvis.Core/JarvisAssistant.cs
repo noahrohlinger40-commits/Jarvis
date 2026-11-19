@@ -116,8 +116,6 @@ public sealed class JarvisAssistant
         tools.Add(new ReminderTool());
         tools.Add(new ForgetMemoryTool());
         tools.Add(new MemoryProfileTool());
-        tools.Add(new MemoryTool());
-        tools.Add(new PrivacyTool());
         tools.Add(new WeatherTool());
         tools.Add(new WriteDownTool(modelGateway));
         tools.Add(new CalendarTool());
@@ -746,7 +744,7 @@ public sealed class JarvisAssistant
                 Environment.NewLine,
                 "Agent runtime is active, but I could not confidently complete that request.",
                 "Try rephrasing it naturally or use `help` to inspect the current command surface.",
-                "I currently handle memory, live computer context, app discovery and launch, app adapters for Spotify, VS Code, Chrome, Explorer, Discord, and Slack, window management, clipboard history and media controls, Win32 UI automation, file create/edit/move/copy/delete actions, browser, form, and selector-aware Chrome DOM workflows, notifications, web research, user-state context, visual analysis for screens and documents, system state, and optional shell execution.");
+                "I currently handle memory, live computer context, app discovery and launch, app adapters for Spotify, VS Code, Chrome, Explorer, Discord, and Slack, window management, clipboard and media controls, Win32 UI automation, file create/edit/move/copy/delete actions, browser and form workflows, notifications, web research, user-state context, visual analysis for screens and documents, system state, and optional shell execution.");
         }
 
         return string.Join(
@@ -1195,11 +1193,6 @@ public sealed class JarvisAssistant
                 tool.Name,
                 "Search the user's Desktop, OneDrive Desktop, Documents and Downloads by file or folder name, newest first.",
                 "Words from the file or folder name only, for example `report 4`."),
-            "memory" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Review a stored memory or change its retention or importance.",
-                "Memory subcommand only."),
             "write file" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
@@ -1253,7 +1246,7 @@ public sealed class JarvisAssistant
             "chrome" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Chrome adapter for navigation, tabs, history/downloads/bookmarks, find-on-page, form/login workflows, and selector-aware DevTools-backed DOM automation specifically in Chrome.",
+                "Chrome adapter for navigation, tabs, history/downloads/bookmarks, find-on-page, and form/login workflows specifically in Chrome.",
                 "Chrome action only."),
             "explorer" => new PlannerToolDefinition(
                 tool.Name,
@@ -1368,13 +1361,13 @@ public sealed class JarvisAssistant
             "clipboard" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Inspect or manipulate the clipboard, including history, restore, and paste into a target window.",
+                "Read, set or clear the clipboard, or paste it into a target window.",
                 "Clipboard subcommand payload only."),
             "notify" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Send or inspect Jarvis-managed notifications and toast attempts.",
-                "Format: `<title> :: <message>`, `list`, or `clear`."),
+                "Send a Windows toast notification.",
+                "Format: `<title> :: <message>`."),
             "wait" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,

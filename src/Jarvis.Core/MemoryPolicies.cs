@@ -250,14 +250,6 @@ internal static class MemoryPolicies
             && !IsReminderInactive(note.ReminderStatus);
     }
 
-    // A pending reminder due within the lookahead window from now (overdue ones count as due).
-    public static bool IsDueReminder(MemoryNote note, DateTimeOffset nowUtc, TimeSpan lookahead)
-    {
-        return IsPendingReminder(note)
-            && note.ReminderAtUtc is DateTimeOffset reminderAtUtc
-            && reminderAtUtc <= nowUtc.Add(lookahead);
-    }
-
     // Standardizes reminder status words ('done' becomes 'completed', 'snooze' becomes 'snoozed'); blank means 'pending'.
     public static string NormalizeReminderStatus(string? value)
     {

@@ -51,21 +51,18 @@ public sealed record ChatToolDefinition(
 // A tool call the model asked for: an id, the tool name, and the arguments as a raw JSON string.
 public sealed record ChatToolCall(string Id, string Name, string ArgumentsJson);
 
-// Everything needed for one model call. ModelOverride forces a specific model name instead of the route's default;
-// User is an optional label sent along as the OpenAI "user" field.
+// Everything needed for one model call. User is an optional label sent along as the OpenAI "user" field.
 public sealed record ChatCompletionRequest(
     ChatMessage[] Messages,
     ChatToolDefinition[]? Tools = null,
     double Temperature = 0.2,
-    string ModelOverride = "",
     string User = "");
 
-// The model's answer: reply text, any tool calls, which model name answered, and a "profile/provider" label.
+// The model's answer: reply text, any tool calls, and which model name answered.
 public sealed record ChatCompletionResponse(
     string Content,
     ChatToolCall[] ToolCalls,
-    string Model,
-    string ProviderLabel);
+    string Model);
 
 // The one door to the language model. Implementations: OpenAiCompatibleModelGateway (real HTTP calls),
 // DisabledModelGateway (always unavailable) and ScheduledModelGateway (adds the queue around another gateway).
@@ -91,17 +88,19 @@ public static class ModelGatewayFactory
             return new DisabledModelGateway("disabled in settings");
         }
 
-        var profiles = BuildProfiles(options);
+        var profile = BuildProfile(options);
 
-        // Local-only AI mode: drop any provider that is not a loopback (same-computer) server.
-        profiles.RemoveAll(profile => !LocalAiPolicy.AllowsModelProvider(options, profile.Provider, profile.BaseUrl));
-
-        if (options.LocalAiOnly && profiles.Count == 0)
-            return new DisabledModelGateway("local-only AI mode requires a local provider on this computer; hosted routes are blocked");
-
-        if (profiles.Count == 0)
+        // Local-only AI mode: drop a provider that is not a loopback (same-computer) server.
+        if (profile is not null && !LocalAiPolicy.AllowsModelProvider(options, profile.Provider, profile.BaseUrl))
         {
-            return new DisabledModelGateway("no usable model provider is configured");
+            profile = null;
+        }
+
+        if (profile is null)
+        {
+            return new DisabledModelGateway(options.LocalAiOnly
+                ? "local-only AI mode requires a local provider on this computer; hosted routes are blocked"
+                : "no usable model provider is configured");
         }
 
         // One inference budget per process: the app rebuilds the gateway on settings changes while earlier requests
@@ -109,65 +108,38 @@ public static class ModelGatewayFactory
         // Capacity is how many model calls may run at the same moment (1 to 4). The scheduler is shared across rebuilds.
         var capacity = Math.Clamp(options.ModelMaxConcurrentRequests, 1, 4);
         var scheduler = LazyInitializer.EnsureInitialized(ref _sharedScheduler, () => new ModelWorkScheduler(capacity));
-        return new ScheduledModelGateway(new OpenAiCompatibleModelGateway(workspaceRoot, options, profiles), capacity, scheduler);
+        return new ScheduledModelGateway(new OpenAiCompatibleModelGateway(workspaceRoot, options, profile), capacity, scheduler);
     }
 
     // The single queue shared by every gateway built in this process.
     private static ModelWorkScheduler? _sharedScheduler;
 
-    // Collects the usable providers. Today there is only one, the "primary" profile built from the Planner* settings.
-    private static List<ResolvedProviderProfile> BuildProfiles(JarvisOptions options)
+    // Turns the Planner* settings into the one provider profile; returns null when no base URL is set.
+    private static ResolvedProviderProfile? BuildProfile(JarvisOptions options)
     {
-        var profiles = new List<ResolvedProviderProfile>();
-
-        var primary = BuildPrimaryProfile(options);
-
-        if (primary is not null)
-        {
-            profiles.Add(primary);
-        }
-
-        return profiles;
-    }
-
-    // Turns the Planner* settings into one provider profile; returns null when no base URL is set.
-    private static ResolvedProviderProfile? BuildPrimaryProfile(JarvisOptions options)
-    {
-        var provider = NormalizeProvider(options.PlannerProvider);
-
         if (string.IsNullOrWhiteSpace(options.PlannerBaseUrl))
         {
             return null;
         }
 
-        var requestModel = ResolveRequestModel(
-            provider,
-            options.PlannerModel,
-            options.PlannerReasoningModel);
-
         // If no separate reasoning model is configured, the general model is used for reasoning too.
         var reasoningModel = string.IsNullOrWhiteSpace(options.PlannerReasoningModel)
-            ? requestModel
+            ? options.PlannerModel?.Trim() ?? string.Empty
             : options.PlannerReasoningModel.Trim();
 
         return new ResolvedProviderProfile(
-            "primary",
-            provider,
+            NormalizeProvider(options.PlannerProvider),
             options.PlannerBaseUrl.Trim(),
-            requestModel,
             options.PlannerFastModel.Trim(),
             reasoningModel,
             options.PlannerVisionModel.Trim(),
             options.PlannerDeepModel.Trim(),
-            ResolveApiKey(
+            // The API key comes from the settings value, Windows Credential Manager, or an environment variable (see ApiKeyResolver).
+            ApiKeyResolver.Resolve(
                 options.PlannerApiKey,
                 options.PlannerApiKeyCredentialTarget,
                 options.PlannerApiKeyEnvironmentVariable));
     }
-
-    // Finds the API key from the settings value, Windows Credential Manager, or an environment variable (see ApiKeyResolver).
-    private static string ResolveApiKey(string directValue, string credentialTarget, string envVar) =>
-        ApiKeyResolver.Resolve(directValue, credentialTarget, envVar);
 
     // Maps the free-text provider setting to "openai", "local" or the default "openai-compatible".
     private static string NormalizeProvider(string? provider)
@@ -184,23 +156,6 @@ public static class ModelGatewayFactory
             "local" => "local",
             _ => "openai-compatible"
         };
-    }
-
-    // Picks the general model name: PlannerModel if set, otherwise the reasoning model, otherwise empty.
-    private static string ResolveRequestModel(
-        string provider,
-        string configuredModel,
-        string reasoningModel)
-    {
-
-        if (!string.IsNullOrWhiteSpace(configuredModel))
-        {
-            return configuredModel.Trim();
-        }
-
-        return string.IsNullOrWhiteSpace(reasoningModel)
-            ? string.Empty
-            : reasoningModel.Trim();
     }
 }
 
@@ -236,14 +191,14 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
     private readonly string _workspaceRoot;
     private readonly JarvisOptions _options;
-    private readonly IReadOnlyList<ResolvedProviderProfile> _profiles;
+    private readonly ResolvedProviderProfile _profile;
     private readonly HttpClient _httpClient;
 
-    public OpenAiCompatibleModelGateway(string workspaceRoot, JarvisOptions options, IReadOnlyList<ResolvedProviderProfile> profiles)
+    public OpenAiCompatibleModelGateway(string workspaceRoot, JarvisOptions options, ResolvedProviderProfile profile)
     {
         _workspaceRoot = workspaceRoot;
         _options = options;
-        _profiles = profiles;
+        _profile = profile;
         // Timeouts are per request (see SendHttpAsync): a deep pass may legitimately run for minutes.
         _httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, Timeout.InfiniteTimeSpan);
     }
@@ -256,18 +211,11 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
     // Deep gets the long timeout; every other route gets the normal one.
     private static TimeSpan ModelTimeout(ModelRoute route) => route == ModelRoute.Deep ? DeepModelTimeout : DefaultModelTimeout;
 
-    public bool IsAvailable => _profiles.Count > 0;
+    public bool IsAvailable => true;
 
-    // A one-line description of the configured providers and their fast/reasoning models, shown in the UI.
+    // A one-line description of the configured provider and its fast/reasoning models, shown in the UI.
     public string Status =>
-        string.Join(
-            " | ",
-            _profiles.Select(profile =>
-            {
-                var fastModel = string.IsNullOrWhiteSpace(profile.FastModel) ? "n/a" : profile.FastModel;
-                var reasoningModel = string.IsNullOrWhiteSpace(profile.ReasoningModel) ? "n/a" : profile.ReasoningModel;
-                return $"{profile.Name}:{profile.Provider} fast={fastModel} reasoning={reasoningModel}";
-            }));
+        $"{_profile.Provider} fast={(string.IsNullOrWhiteSpace(_profile.FastModel) ? "n/a" : _profile.FastModel)} reasoning={(string.IsNullOrWhiteSpace(_profile.ReasoningModel) ? "n/a" : _profile.ReasoningModel)}";
 
     // The timeout cancels through a linked token; report it as a failure so callers do not mistake it for the user cancelling.
     private async Task<HttpResponseMessage> SendHttpAsync(HttpRequestMessage message, CancellationToken cancellationToken, TimeSpan timeout)
@@ -284,30 +232,25 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         }
     }
 
-    // Tries each candidate model for this route in order and returns the first success. Ordinary errors (HTTP
-    // failures, bad JSON) move on to the next candidate; cancellation and timeouts stop immediately.
+    // Tries each model for this route in order and returns the first success. Ordinary errors (HTTP failures, bad JSON)
+    // move on to the next model; cancellation and timeouts stop immediately.
     public async Task<ChatCompletionResponse> CompleteAsync(
         ChatCompletionRequest request,
         ModelRoute route,
         CancellationToken cancellationToken)
     {
-        if (!IsAvailable)
-        {
-            throw new InvalidOperationException("No model providers are available.");
-        }
-
         var failures = new List<string>();
 
-        foreach (var candidate in ResolveCandidates(route, request.ModelOverride))
+        foreach (var model in GetRouteModels(route))
         {
             try
             {
-                return await SendAsync(candidate, request, route, cancellationToken);
+                return await SendAsync(model, request, route, cancellationToken);
             }
             // A timeout already cost the full HTTP timeout while holding the model slot; fail now instead of waiting again.
             catch (Exception exception) when (exception is not OperationCanceledException and not TimeoutException)
             {
-                failures.Add($"{candidate.Profile.Name}/{candidate.Model}: {TrimError(exception.Message)}");
+                failures.Add($"{model}: {TrimError(exception.Message)}");
             }
         }
 
@@ -315,116 +258,46 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             "All planner model candidates failed. " + string.Join(" | ", failures));
     }
 
-    // Lists the (provider, model) pairs to try, without duplicates. A ModelOverride replaces the route's own list.
-    private IEnumerable<ModelCandidate> ResolveCandidates(ModelRoute route, string modelOverride)
+    // The model fallback chain for each route, first choice first, blanks and repeats (ignoring case) dropped.
+    // Fast: fast, reasoning. Vision: vision, reasoning. Deep: deep, reasoning, fast. Reasoning: reasoning, fast.
+    private IEnumerable<string> GetRouteModels(ModelRoute route)
     {
-        foreach (var profile in _profiles)
+        string[] chain = route switch
         {
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            ModelRoute.Fast => [_profile.FastModel, _profile.ReasoningModel],
+            ModelRoute.Vision => [_profile.VisionModel, _profile.ReasoningModel],
+            ModelRoute.Deep => [_profile.DeepModel, _profile.ReasoningModel, _profile.FastModel],
+            _ => [_profile.ReasoningModel, _profile.FastModel]
+        };
 
-            if (!string.IsNullOrWhiteSpace(modelOverride))
-            {
-                if (seen.Add(modelOverride.Trim()))
-                {
-                    yield return new ModelCandidate(profile, modelOverride.Trim());
-                }
-
-                continue;
-            }
-
-            foreach (var model in GetRouteModels(profile, route))
-            {
-                if (seen.Add(model))
-                {
-                    yield return new ModelCandidate(profile, model);
-                }
-            }
-        }
-    }
-
-    // The model fallback chain for each route, first choice first. Fast: fast, then reasoning. Vision: vision, then reasoning.
-    // Reasoning: reasoning, then fast. Deep: deep, then reasoning, then fast (Deep and Reasoning share the default branch below).
-    private IEnumerable<string> GetRouteModels(ResolvedProviderProfile profile, ModelRoute route)
-    {
-        switch (route)
-        {
-            case ModelRoute.Fast:
-                if (!string.IsNullOrWhiteSpace(profile.FastModel))
-                {
-                    yield return profile.FastModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel)
-                    && !string.Equals(profile.ReasoningModel, profile.FastModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yield return profile.ReasoningModel;
-                }
-
-                break;
-
-            case ModelRoute.Vision:
-                if (!string.IsNullOrWhiteSpace(profile.VisionModel))
-                {
-                    yield return profile.VisionModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel)
-                    && !string.Equals(profile.ReasoningModel, profile.VisionModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yield return profile.ReasoningModel;
-                }
-
-                break;
-
-            default:
-                if (route == ModelRoute.Deep && !string.IsNullOrWhiteSpace(profile.DeepModel))
-                {
-                    yield return profile.DeepModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel))
-                {
-                    yield return profile.ReasoningModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.FastModel)
-                    && !string.Equals(profile.FastModel, profile.ReasoningModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yield return profile.FastModel;
-                }
-
-                break;
-        }
+        return chain.Where(model => !string.IsNullOrWhiteSpace(model)).Distinct(StringComparer.OrdinalIgnoreCase);
     }
 
     // Makes one HTTP call to one model: builds the JSON body, sends it, checks the status and parses the reply.
     private async Task<ChatCompletionResponse> SendAsync(
-        ModelCandidate candidate,
+        string model,
         ChatCompletionRequest request,
         ModelRoute route,
         CancellationToken cancellationToken)
     {
-        if (!LocalAiPolicy.AllowsModelProvider(_options, candidate.Profile.Provider, candidate.Profile.BaseUrl))
-            throw new InvalidOperationException("Local-only AI mode blocked this model provider.");
-
         // Privacy guard: if the prompt contains Brain workspace references, only a local loopback "local" provider may see it.
         if (request.Messages.Any(message => message.Content.Any(part => part.Text.Contains(BrainWorkspace.ReferenceMarker, StringComparison.Ordinal))))
         {
-            if (!Uri.TryCreate(candidate.Profile.BaseUrl, UriKind.Absolute, out var brainUri) || !brainUri.IsLoopback
-                || !string.Equals(candidate.Profile.Provider, "local", StringComparison.OrdinalIgnoreCase))
+            if (!Uri.TryCreate(_profile.BaseUrl, UriKind.Absolute, out var brainUri) || !brainUri.IsLoopback
+                || !string.Equals(_profile.Provider, "local", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Brain work references are restricted to local loopback models; remote fallback was skipped.");
         }
 
         // Request body in the OpenAI chat format: model, messages, temperature (plus optional fields added below).
         var payload = new Dictionary<string, object?>
         {
-            ["model"] = candidate.Model,
+            ["model"] = model,
             ["messages"] = request.Messages.Select(SerializeMessage).ToArray(),
             ["temperature"] = request.Temperature
         };
 
         // Local servers get a reply-length cap per route; hosted servers get none (0 means "do not send a limit").
-        var localMaxTokens = ResolveLocalMaxTokens(candidate.Profile, route);
+        var localMaxTokens = ResolveLocalMaxTokens(_profile, route);
 
         if (localMaxTokens > 0)
         {
@@ -447,14 +320,14 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
         using var message = new HttpRequestMessage(
             HttpMethod.Post,
-            BuildEndpoint(candidate.Profile.BaseUrl))
+            BuildEndpoint(_profile.BaseUrl))
         {
             Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
         };
 
-        if (!string.IsNullOrWhiteSpace(candidate.Profile.ApiKey))
+        if (!string.IsNullOrWhiteSpace(_profile.ApiKey))
         {
-            message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", candidate.Profile.ApiKey);
+            message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _profile.ApiKey);
         }
 
         // Send with the per-route timeout, then read the whole body as text.
@@ -467,10 +340,10 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         }
 
         using var document = JsonDocument.Parse(body);
-        var completion = ExtractCompletion(document.RootElement, candidate);
+        var completion = ExtractCompletion(document.RootElement, model);
 
         // Local call recording is configurable; it never changes inference success.
-        LogPlannerCall(candidate, route, requestJson, document.RootElement);
+        LogPlannerCall(model, route, requestJson, document.RootElement);
 
         return completion;
     }
@@ -480,11 +353,11 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
     // Optionally appends one JSON line (time, route, model, first answer, full request) to data/planner-log.jsonl.
     // Only for local servers and only when PlannerRecordLocalCalls is on. This is training/debugging data.
-    private void LogPlannerCall(ModelCandidate candidate, ModelRoute route, string requestJson, JsonElement root)
+    private void LogPlannerCall(string model, ModelRoute route, string requestJson, JsonElement root)
     {
         try
         {
-            if (!_options.PlannerRecordLocalCalls || !IsLocalLoopbackProfile(candidate.Profile)
+            if (!_options.PlannerRecordLocalCalls || !IsLocalLoopbackProfile(_profile)
                 || !root.TryGetProperty("choices", out var choices)
                 || choices.ValueKind != JsonValueKind.Array
                 || choices.GetArrayLength() == 0)
@@ -492,7 +365,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
                 return;
             }
 
-            var line = $"{{\"timestampUtc\":\"{DateTime.UtcNow:O}\",\"route\":\"{route}\",\"model\":{JsonSerializer.Serialize(candidate.Model)},"
+            var line = $"{{\"timestampUtc\":\"{DateTime.UtcNow:O}\",\"route\":\"{route}\",\"model\":{JsonSerializer.Serialize(model)},"
                 + $"\"response\":{JsonSerializer.Serialize(choices[0])},\"request\":{requestJson}}}{Environment.NewLine}";
             var path = JarvisDataPaths.Resolve("data/planner-log.jsonl");
 
@@ -591,7 +464,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
     }
 
     // Reads choices[0].message from the response JSON (text plus tool calls); throws if there are no choices.
-    private static ChatCompletionResponse ExtractCompletion(JsonElement root, ModelCandidate candidate)
+    private static ChatCompletionResponse ExtractCompletion(JsonElement root, string model)
     {
         if (!root.TryGetProperty("choices", out var choices)
             || choices.ValueKind != JsonValueKind.Array
@@ -607,8 +480,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return new ChatCompletionResponse(
             content,
             toolCalls,
-            candidate.Model,
-            $"{candidate.Profile.Name}/{candidate.Profile.Provider}");
+            model);
     }
 
     // The reply text can be a plain string or an array of parts with "text" fields; both are handled.
@@ -757,17 +629,12 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
             || string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase);
     }
-
-    // One attempt to make: which provider and which model name.
-    private sealed record ModelCandidate(ResolvedProviderProfile Profile, string Model);
 }
 
-// A fully worked-out provider: name, kind, server URL, the model name for each route and the API key.
+// A fully worked-out provider: kind, server URL, the model name for each route and the API key.
 internal sealed record ResolvedProviderProfile(
-    string Name,
     string Provider,
     string BaseUrl,
-    string RequestModel,
     string FastModel,
     string ReasoningModel,
     string VisionModel,

@@ -3,7 +3,6 @@
 // (an Action name plus a text Payload), the tool's switch picks a helper for that action, and AppIntegrationHelpers does the work by
 // calling context.DesktopAutomation (focus a window, send a keyboard shortcut, send text, launch a program).
 // Most actions are therefore simulated keystrokes into the real app, with short fixed pauses between steps; there is no app-specific API.
-// The exception is the "chrome dom ..." family, which talks to Chrome through DevTools (ChromeDevToolsAutomation).
 // ActionSafety.cs checks the same parsed commands to decide when to ask first (logins, form fills, sensitive text).
 namespace Jarvis.Core;
 
@@ -111,15 +110,15 @@ public sealed class CodeTool : IAssistantTool
     }
 }
 
-// Chrome: normal browser control by keyboard shortcut and launch flags, plus "chrome dom ..." commands that use DevTools to read and click page elements.
+// Chrome: normal browser control by keyboard shortcut and launch flags.
 public sealed class ChromeTool : IAssistantTool
 {
     // Help text shown for a bad Chrome command.
-    private const string Usage = "Usage: chrome [status|open <url-or-query>|search <query>|go <url>|new window [target]|new tab [target]|incognito [target]|back|forward|reload|close tab|reopen tab|duplicate tab|next tab|previous tab|history|downloads|bookmarks|devtools|find <query>|fill <text>|form <value1> ;; <value2>|login <username> :: <password> [:: submit]|submit|dom status|dom tabs|dom select <tab-index|tab-id|match>|dom open <url-or-query>|dom new tab [url-or-query]|dom page|dom read <css-selector>|dom click <css-selector>|dom type <css-selector> :: <text>|dom wait <css-selector> [:: <timeout-seconds>]|dom verify <css-selector> [:: <expected-text>]]";
+    private const string Usage = "Usage: chrome [status|open <url-or-query>|search <query>|go <url>|new window [target]|new tab [target]|incognito [target]|back|forward|reload|close tab|reopen tab|duplicate tab|next tab|previous tab|history|downloads|bookmarks|devtools|find <query>|fill <text>|form <value1> ;; <value2>|login <username> :: <password> [:: submit]|submit]";
 
     public string Name => "chrome";
 
-    public string Description => "Chrome adapter. Use standard navigation commands or DevTools-backed DOM commands such as `chrome dom open <url>`, `chrome dom tabs`, `chrome dom click <css-selector>`, or `chrome dom verify <css-selector> [:: text]`.";
+    public string Description => "Chrome adapter for navigation, tabs, history, downloads, bookmarks, find-on-page, and form or login filling, using keyboard shortcuts.";
 
     public bool CanHandle(string input) => AppIntegrationParsing.TryParseChrome(input, out _);
 
@@ -219,29 +218,6 @@ public sealed class ChromeTool : IAssistantTool
             case "submit":
                 result = await AppIntegrationHelpers.RunBrowserHotkeyAsync("chrome", "enter", context, cancellationToken, "Submitted the active Chrome form.");
                 break;
-            // The dom-* actions return their own result directly; the rest set result and share the success check after the switch.
-            case "dom-status":
-                return await ChromeDevToolsAutomation.GetStatusAsync(context, cancellationToken);
-            case "dom-tabs":
-                return await ChromeDevToolsAutomation.ListTabsAsync(context, cancellationToken);
-            case "dom-select":
-                return await ChromeDevToolsAutomation.SelectTabAsync(command.Payload, context, cancellationToken);
-            case "dom-open":
-                return await ChromeDevToolsAutomation.OpenAsync(command.Payload, newTab: false, context, cancellationToken);
-            case "dom-new-tab":
-                return await ChromeDevToolsAutomation.OpenAsync(command.Payload, newTab: true, context, cancellationToken);
-            case "dom-page":
-                return await ChromeDevToolsAutomation.GetPageAsync(context, cancellationToken);
-            case "dom-read":
-                return await ChromeDevToolsAutomation.ReadAsync(command.Payload, context, cancellationToken);
-            case "dom-click":
-                return await ChromeDevToolsAutomation.ClickAsync(command.Payload, context, cancellationToken);
-            case "dom-type":
-                return await ChromeDevToolsAutomation.TypeAsync(command.Payload, context, cancellationToken);
-            case "dom-wait":
-                return await ChromeDevToolsAutomation.WaitForAsync(command.Payload, context, cancellationToken);
-            case "dom-verify":
-                return await ChromeDevToolsAutomation.VerifyAsync(command.Payload, context, cancellationToken);
             default:
                 result = Usage;
                 break;
@@ -453,7 +429,7 @@ public sealed class SlackTool : IAssistantTool
     }
 }
 
-// A parsed app command: Action is a short name such as "open", "search" or "dom-click"; Payload is the remaining text.
+// A parsed app command: Action is a short name such as "open", "search" or "jump"; Payload is the remaining text.
 internal sealed record AppIntegrationCommand(string Action, string Payload = "");
 
 // Shared building blocks for the app tools above. Every step reports back as text, and UiCommandParsing.LooksLikeFailure decides whether that text means failure.
@@ -1308,7 +1284,7 @@ internal static class AppIntegrationParsing
         return true;
     }
 
-    // Chrome commands are checked in order: simple open/status, "dom ..." commands, prefix commands that carry text, then fixed phrases.
+    // Chrome commands are checked in order: simple open/status, prefix commands that carry text, then fixed phrases.
     public static bool TryParseChrome(string input, out AppIntegrationCommand command)
     {
         if (!TryGetTail(input, out var tail, "chrome"))
@@ -1326,11 +1302,6 @@ internal static class AppIntegrationParsing
         if (IsSimpleAction(tail, out var simpleAction))
         {
             command = new AppIntegrationCommand(simpleAction);
-            return true;
-        }
-
-        if (TryParseChromeDomCommand(tail, out command))
-        {
             return true;
         }
 
@@ -1604,10 +1575,6 @@ internal static class AppIntegrationParsing
                     targetApp = "chrome";
                     text = command.Payload;
                     return !string.IsNullOrWhiteSpace(text);
-                case "dom-type" when ChromeDevToolsAutomation.TryParseSelectorAndText(command.Payload, out _, out var typedText):
-                    targetApp = "chrome";
-                    text = typedText;
-                    return !string.IsNullOrWhiteSpace(text);
             }
         }
 
@@ -1674,59 +1641,6 @@ internal static class AppIntegrationParsing
             }
 
             command = new AppIntegrationCommand(action, ToolInputHelper.GetCommandTail(tail, prefix));
-            return true;
-        }
-
-        command = new AppIntegrationCommand(string.Empty);
-        return false;
-    }
-
-    // Parses "chrome dom <action> <text>". Bare "dom" means status.
-    private static bool TryParseChromeDomCommand(string tail, out AppIntegrationCommand command)
-    {
-        if (!ToolInputHelper.StartsWithCommand(tail, "dom"))
-        {
-            command = new AppIntegrationCommand(string.Empty);
-            return false;
-        }
-
-        var domTail = ToolInputHelper.GetCommandTail(tail, "dom");
-
-        if (string.IsNullOrWhiteSpace(domTail)
-            || domTail.Equals("status", StringComparison.OrdinalIgnoreCase))
-        {
-            command = new AppIntegrationCommand("dom-status");
-            return true;
-        }
-
-        if (domTail.Equals("tabs", StringComparison.OrdinalIgnoreCase)
-            || domTail.Equals("list tabs", StringComparison.OrdinalIgnoreCase))
-        {
-            command = new AppIntegrationCommand("dom-tabs");
-            return true;
-        }
-
-        if (domTail.Equals("page", StringComparison.OrdinalIgnoreCase)
-            || domTail.Equals("current page", StringComparison.OrdinalIgnoreCase)
-            || domTail.Equals("current", StringComparison.OrdinalIgnoreCase))
-        {
-            command = new AppIntegrationCommand("dom-page");
-            return true;
-        }
-
-        if (TryParsePrefixedPayload(domTail, out command,
-                ("select", "dom-select"),
-                ("open", "dom-open"),
-                ("go", "dom-open"),
-                ("navigate", "dom-open"),
-                ("new tab", "dom-new-tab"),
-                ("read", "dom-read"),
-                ("click", "dom-click"),
-                ("type", "dom-type"),
-                ("fill", "dom-type"),
-                ("wait", "dom-wait"),
-                ("verify", "dom-verify")))
-        {
             return true;
         }
 

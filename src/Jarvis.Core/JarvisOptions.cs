@@ -45,19 +45,13 @@ public sealed record JarvisOptions
 
     public string VoiceName { get; init; } = "coral";
 
-    public string VoiceInstructions { get; init; } = string.Empty;
-
-    public string VoiceResponseFormat { get; init; } = "pcm";
-
     // Speech recognition (Jarvis listening). Settings starting with SpeechRecognition cover the engine, language, wake word,
-    // microphone tuning and push-to-talk below.
+    // microphone tuning and the hotkey below.
     public bool SpeechRecognitionEnabled { get; init; } = true;
 
     public string SpeechRecognitionProvider { get; init; } = "auto";
 
     public bool WakeWordEnabled { get; init; } = true;
-
-    public string RecognizerCulture { get; init; } = "en-US";
 
     public string SpeechRecognitionBaseUrl { get; init; } = "https://api.openai.com/v1";
 
@@ -116,16 +110,12 @@ public sealed record JarvisOptions
 
     public string SpeechRecognitionDeviceName { get; init; } = string.Empty;
 
-    // Push-to-talk and the global hotkey (default Control+Space) as alternatives to the wake word.
-    public bool SpeechRecognitionPushToTalkEnabled { get; init; } = false;
-
+    // The global hotkey (default Control+Space) as an alternative to the wake word.
     public bool SpeechRecognitionHotkeyEnabled { get; init; } = true;
 
     public string SpeechRecognitionHotkey { get; init; } = "Control+Space";
 
-    // Optional audio cleanup: noise suppression, echo cancellation, beamforming and hardware DSP profiles.
-    public bool SpeechRecognitionNoiseSuppressionEnabled { get; init; } = false;
-
+    // Optional audio cleanup: echo cancellation, beamforming and hardware DSP profiles.
     public bool SpeechRecognitionEchoCancellationEnabled { get; init; } = false;
 
     /// <summary>

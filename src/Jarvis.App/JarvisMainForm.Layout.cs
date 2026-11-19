@@ -316,7 +316,7 @@ internal sealed partial class JarvisMainForm
         return card;
     }
 
-    // Builds the "Microphone" card: waveform, level readouts, input device picker, mute and push-to-talk buttons,
+    // Builds the "Microphone" card: waveform, level readouts, input device picker, mute button
     // and a collapsible tuning area (calibrate, validate, wake word and engine pickers, volume, whisper mode).
     private GlassPanel BuildSignalCard()
     {
@@ -354,14 +354,11 @@ internal sealed partial class JarvisMainForm
         deviceFlow.Controls.Add(_deviceComboBox);
         deviceFlow.Controls.Add(_deviceRefreshButton);
 
-        // Mute and push-to-talk buttons; Push-to-Talk is only shown when enabled in settings.
+        // Mute button and Tuning toggle.
         var actionFlow = CreateRowFlow();
         _micToggleButton = CreateActionButton("Mute Mic");
-        _pushToTalkButton = CreateActionButton("Push-to-Talk");
-        _pushToTalkButton.Visible = _currentOptions.SpeechRecognitionPushToTalkEnabled;
         var tuningToggle = CreateActionButton("Tuning");
         actionFlow.Controls.Add(_micToggleButton);
-        actionFlow.Controls.Add(_pushToTalkButton);
         actionFlow.Controls.Add(tuningToggle);
 
         // Tuning area, hidden until the Tuning button is pressed.

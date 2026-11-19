@@ -1,13 +1,13 @@
 // WakeWordEngines.cs: "wake engines" are JSON files (default folder data\wake-engines) that describe an external program able to
 // spot the wake word in audio, such as the openWakeWord "hey jarvis" detector: its executable, command-line template, model file,
 // timeout and confidence tweaks. This file finds, loads (with a cache) and ranks them, in the same way WakeWordAssets.cs does for assets.
-// WakeWordDetector uses the chosen engine to build its external-process back end; if none fits, the built-in recogniser is used.
+// WakeWordDetector uses the chosen engine to build its external-process back end; if none fits, there is no wake detector.
 using System.Text.Json;
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
-// One loaded wake engine: all fields from its JSON file, plus where the file is. Empty path = built-in recogniser; path "auto" = choose automatically.
+// One loaded wake engine: all fields from its JSON file, plus where the file is. Empty path = no engine; path "auto" = choose automatically.
 internal sealed record WakeWordEngineDescriptor(
     string Path,
     string DefinitionDirectory,
@@ -122,7 +122,7 @@ internal static class WakeWordEngineCatalog
             DefinitionDirectory: string.Empty,
             Name: "auto",
             DisplayName: "Auto (Wake Engine)",
-            Description: "Automatically choose the best external wake engine for the active microphone when one matches, otherwise fall back to the recognizer wake detector.",
+            Description: "Automatically choose the best external wake engine for the active microphone when one matches, otherwise run no engine.",
             EngineKind: "auto",
             ExecutablePath: string.Empty,
             Arguments: string.Empty,
@@ -139,14 +139,14 @@ internal static class WakeWordEngineCatalog
             ExcludedDeviceKeywords: Array.Empty<string>(),
             EnvironmentVariables: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
 
-    // The "use the built-in recogniser" entry.
+    // The "no engine" entry.
     public static WakeWordEngineDescriptor RecognizerDefault { get; } =
         new(
             Path: string.Empty,
             DefinitionDirectory: string.Empty,
             Name: "recognizer-default",
             DisplayName: "Recognizer Wake",
-            Description: "Use the built-in recognizer-backed wake detector.",
+            Description: "Run no wake engine; whisper's transcript decides.",
             EngineKind: "recognizer",
             ExecutablePath: string.Empty,
             Arguments: string.Empty,
@@ -204,7 +204,7 @@ internal static class WakeWordEngineCatalog
             .OrderBy(engine => engine.BuildShortLabel(), StringComparer.OrdinalIgnoreCase)];
     }
 
-    // Returns the engine the settings ask for: "auto" chooses by microphone and wake asset, empty means the built-in recogniser, otherwise the named file.
+    // Returns the engine the settings ask for: "auto" chooses by microphone and wake asset, empty means no engine, otherwise the named file.
     public static WakeWordEngineDescriptor ResolveConfiguredEngine(
         JarvisOptions options,
         WakeWordAssetDescriptor? wakeWordAsset,
@@ -245,7 +245,7 @@ internal static class WakeWordEngineCatalog
     }
 
     // Loads the engine file at a path, or if that fails looks for one with a matching file name among the discovered engines;
-    // the built-in recogniser is the last fallback.
+    // no engine is the last fallback.
     public static WakeWordEngineDescriptor ResolveDescriptorByPath(string workspaceRoot, JarvisOptions options, string? storedPath)
     {
         var normalizedStoredPath = NormalizeStoredPath(storedPath);
@@ -306,7 +306,7 @@ internal static class WakeWordEngineCatalog
         return string.Equals(leftFileName, rightFileName, StringComparison.OrdinalIgnoreCase);
     }
 
-    // Auto mode: use the engine named by the wake asset if it exists; otherwise the best-scoring engine for the microphone; score 0 or below means the built-in recogniser.
+    // Auto mode: use the engine named by the wake asset if it exists; otherwise the best-scoring engine for the microphone; score 0 or below means no engine.
     private static WakeWordEngineDescriptor ResolveAutoEngine(
         JarvisOptions options,
         WakeWordAssetDescriptor? wakeWordAsset,

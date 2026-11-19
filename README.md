@@ -8,8 +8,8 @@ This repository does not pretend to be the full Iron Man system. It gives you a 
 - A Windows operations surface with live response streaming, waveform telemetry, tray mode, approvals, and voice controls
 - Persistent memory, learned preferences, contextual summaries, structured entity memory, reminder recall, retention controls, and transcript logging
 - Command routing for local directives
-- Streaming speech recognition through a rolling OpenAI-compatible path, with Windows fallback
-- Manifest-backed, recognizer-backed wake-word detection on streaming voice paths, with text-prefix and Windows grammar fallbacks
+- Streaming speech recognition through a rolling OpenAI-compatible path
+- Manifest-backed wake-word detection on streaming voice paths, with a text-prefix fallback
 - Per-device microphone calibration, validation, beamforming, wake-asset, and hardware-DSP tuning for half-duplex and full-duplex voice
 - Streaming OpenAI-compatible text-to-speech with Windows fallback
 - A safe-by-default shell execution toggle
@@ -26,7 +26,6 @@ This repository does not pretend to be the full Iron Man system. It gives you a 
 - `reminders` lists pending reminders, and `remind me to <task> at|on|in ...` stores time-based reminder memory
 - `forget <id-or-phrase>` removes a stored memory from active recall
 - `preferences` or `profile` shows learned phrasing, tone, app, location, habit, routine, structured relationship, device, project, place, and reminder preferences
-- `privacy` explains off-the-record turns and persistence boundaries
 - The live operations surface now has a memory workbench for reviewing, editing, and forgetting stored memory items without raw commands
 - Older transcript history is automatically compacted into summary memories so recall can stay useful without replaying every turn
 - `weather <location>` checks the current weather
@@ -34,8 +33,8 @@ This repository does not pretend to be the full Iron Man system. It gives you a 
 - `computer` shows the active window, visible desktop apps, workspace entries, and live machine context
 - `network`, `network scan`, `network health`, and `network <ip-or-host>` inspect local adapters, discover nearby devices, and run lightweight health checks
 - `apps` or `apps <name>` lists discovered running and installed applications
-- `open app <name>` now focuses a running app when possible and can discover apps from Start Menu shortcuts, Desktop shortcuts and executables, Windows App Paths, installed-program registry entries, per-user LocalAppData installs, Steam library manifests, Epic launcher manifests, Riot install metadata, Xbox game configs, and best-effort Battle.net installs
-- `spotify`, `code`, `chrome`, `explorer`, `office`, `discord`, and `slack` expose app-specific shortcuts for media/search/navigation flows, selector-aware Chrome DOM automation, and direct Office file opens
+- `open app <name>` now focuses a running app when possible and can discover apps from Start Menu shortcuts, Desktop shortcuts and executables, Windows App Paths, installed-program registry entries, and per-user LocalAppData installs
+- `spotify`, `code`, `chrome`, `explorer`, `office`, `discord`, and `slack` expose app-specific shortcuts for media/search/navigation flows and direct Office file opens
 - `open path <target>`, `list files <path>`, `read file <path>`, and `find files <term>` handle file navigation
 - `browse <url>` and `search web <query>` drive browser actions
 - `research <query>` runs open-domain web research with citations
@@ -46,13 +45,13 @@ This repository does not pretend to be the full Iron Man system. It gives you a 
 - You can say `Jarvis` and then speak the next command
 - You can also say `Jarvis status` in one utterance
 - When the planner is enabled, free-form typed or spoken requests can classify intent, route to cheap or strong models, ask clarifying questions, chain tool calls, reflect on tool results, and persist interrupted workflows
-- Planner activity now surfaces in the desktop UI with classification, planning, tool, reflection, clarification, and verification signals instead of only a final reply
+- Planner activity now surfaces in the desktop UI with classification, planning, tool, clarification, and verification signals instead of only a final reply
 - Recent follow-ups such as `open it`, `the second one`, `click that button`, `read text from the earlier label`, and `type hello into that field` can resolve from recent app, file, site, window, and `screen ui` context when the target is clear
 - A configurable `assistantPersona` can pin Jarvis's baseline tone and behavior so it stays stable across sessions instead of drifting with recent turns
 - The live operations surface now streams assistant replies into both the response console and conversation feed instead of only appending finished assistant blocks
 - The surface header now transitions explicitly through listening, thinking, acting, and speaking states so the current phase stays visible during a turn
 - The right-side voice panel now resolves microphone-specific wake assets and processing profiles, and can save separate calibration/validation baselines for different wake-asset, beamforming, and DSP combinations on the same device
-- In `auto` mode, Jarvis uses rolling `/audio/transcriptions` on compatible endpoints, and only then falls back to Windows recognition
+- In `auto` mode, Jarvis uses rolling `/audio/transcriptions` on compatible endpoints
 - Major shell-driven machine changes now stop for approval first, and protected system locations are blocked outright
 
 ## Run It
@@ -112,7 +111,7 @@ Notes:
 
 ## Local Speech Recognition (No API Key)
 
-Jarvis can transcribe your voice entirely on this PC with a private Whisper server, so speech recognition needs no account, no key, and no internet after setup. It is far more accurate than the built-in Windows recognizer.
+Jarvis can transcribe your voice entirely on this PC with a private Whisper server, so speech recognition needs no account, no key, and no internet after setup.
 
 One-time setup (needs Python 3.10+ and about 1 GB of disk; the model is downloaded once):
 
@@ -140,8 +139,7 @@ How it behaves:
 - The server ignores the long instruction-style prompt Jarvis sends, because Whisper treats prompts as earlier speech and can repeat them back. Set `JARVIS_WHISPER_CLIENT_PROMPT=1` to change that.
 - Server output goes to `%LOCALAPPDATA%\Jarvis\data\whisper-server.log`. Set `JARVIS_WHISPER_SAVE_DIR` to a folder to keep every audio clip it receives, which helps when diagnosing a recognition problem.
 - To use a cloud service instead, set `speechRecognitionBaseUrl` back to `https://api.openai.com/v1` with a key as described below.
-- If the server has not been set up or is not running, the voice status says "The local speech server is not running" and Jarvis cannot turn your voice into text. Check `%LOCALAPPDATA%\Jarvis\data\whisper-server.log`, run the setup script, or set `speechRecognitionProvider` to `windows` to use the built-in recognizer instead.
-- The built-in Windows recognizer now listens to the microphone named in `speechRecognitionDeviceName` with automatic gain, and its status line says why the cloud path was unavailable.
+- If the server has not been set up or is not running, the voice status says "The local speech server is not running" and Jarvis cannot turn your voice into text. Check `%LOCALAPPDATA%\Jarvis\data\whisper-server.log` or run the setup script.
 
 ## Local Model Without LM Studio
 
@@ -159,11 +157,10 @@ Everything Jarvis writes while it runs lives in `%LOCALAPPDATA%\Jarvis\data`, ou
 
 ## Streaming Voice Setup
 
-Jarvis now supports three speech-recognition modes through `speechRecognitionProvider`:
+Jarvis now supports two speech-recognition modes through `speechRecognitionProvider`:
 
-- `auto`: use the rolling OpenAI-compatible transcription path, then Windows as a last resort
+- `auto`: use the rolling OpenAI-compatible transcription path
 - `openai-compatible`: require the OpenAI-compatible rolling transcription path
-- `windows`: force the legacy Windows recognizer
 
 Recommended streaming configuration:
 
@@ -182,7 +179,6 @@ Recommended streaming configuration:
   "speechRecognitionPreRollMilliseconds": 250,
   "speechRecognitionMinimumUtteranceMilliseconds": 350,
   "speechRecognitionWakeWordAssetPath": "auto",
-  "speechRecognitionNoiseSuppressionEnabled": true,
   "speechRecognitionEchoCancellationEnabled": true,
   "speechRecognitionBargeInEnabled": true,
   "speechRecognitionBeamformingEnabled": false,
@@ -196,16 +192,15 @@ Recommended streaming configuration:
   "voiceModel": "gpt-4o-mini-tts",
   "voiceApiKeyCredentialTarget": "Jarvis/Voice/OpenAI",
   "voiceApiKeyEnvironmentVariable": "OPENAI_API_KEY",
-  "voiceName": "coral",
-  "voiceResponseFormat": "pcm"
+  "voiceName": "coral"
 }
 ```
 
 How it works:
 
-- The app continuously captures microphone audio instead of relying only on `System.Speech`
-- Jarvis sends rolling WAV-to-`/audio/transcriptions` requests instead of dropping all the way to Windows speech
-- Streaming recognition paths now run a recognizer-backed wake-word detector against captured PCM before transcript routing, and the detector can auto-select dedicated wake-asset manifests for different microphone patterns
+- The app continuously captures microphone audio
+- Jarvis sends rolling WAV-to-`/audio/transcriptions` requests
+- Streaming recognition paths now run a wake-word detector (openWakeWord through the local speech server) against captured audio before transcript routing, and the detector can auto-select dedicated wake-asset manifests for different microphone patterns
 - Voice output streams PCM audio from `/audio/speech` and begins playback before the full response has finished downloading
 - In `half-duplex` mode, Jarvis pauses the microphone while speaking to reduce self-transcription and wake-word feedback loops
 - In `full-duplex` mode, Jarvis keeps listening during speech output, suppresses likely playback echo before STT, and supports barge-in so user speech can interrupt active TTS
@@ -218,16 +213,16 @@ Important notes:
 - on Windows, `speechRecognitionApiKeyCredentialTarget` can point to a Generic Credential in Credential Manager so the key does not need to live in `jarvis.settings.json`
 - `openai-compatible` still works with endpoints that only implement `/audio/transcriptions`
 - `voiceProvider: "auto"` prefers streaming `/audio/speech` and falls back to Windows speech if the remote voice path is not configured
-- The recognizer-backed wake-word detector still runs on the rolling-transcription path by feeding captured utterances into the installed Windows speech model with wake grammars, but Jarvis can now swap that detector for manifest-backed external wake wrappers when a local Porcupine/OpenWakeWord/ONNX or other helper process is available
+- The wake-word detector runs openWakeWord through the local speech server on the rolling-transcription path, but Jarvis can swap that detector for manifest-backed external wake wrappers when a local Porcupine/OpenWakeWord/ONNX or other helper process is available
 - The built-in wake-asset manifests currently cover desktop USB mics, monitor webcams, wired headsets, wireless/Bluetooth headsets, conference speakerphones, and far-field arrays; `auto` picks the closest match from the active device name plus the resolved beamforming/DSP posture
 - Use the microphone controls in the right-side voice panel to pick a device, choose a wake asset, choose a wake engine, tune beamforming/hardware DSP posture, and run calibration or validation for the current room
 - `speechRecognitionCalibrationProfiles` stores per-device calibration captures keyed by the effective beamforming and DSP posture, so multiple tuned baselines can coexist for one microphone
 - `speechRecognitionValidationProfiles` stores per-device wake-word and full-duplex checks keyed by wake asset, wake engine, beamforming, and hardware DSP posture, including recommended conversation mode, wake readiness, and playback-leakage headroom
-- `speechRecognitionWakeWordAssetPath` accepts `auto`, an empty recognizer-default selection, or a JSON wake-asset manifest in `data\wake-word-assets`; manifests can now include per-device keyword matching in addition to alias and sensitivity tuning
-- `speechRecognitionWakeEnginePath` accepts `auto`, an empty recognizer-backed detector, or a JSON wake-engine manifest in `data\wake-engines`; those manifests can launch a local helper process and pass the captured WAV path, wake aliases, selected wake asset, and resolved mic-tuning context through placeholders and environment variables
+- `speechRecognitionWakeWordAssetPath` accepts `auto`, an empty value (no wake asset), or a JSON wake-asset manifest in `data\wake-word-assets`; manifests can now include per-device keyword matching in addition to alias and sensitivity tuning
+- `speechRecognitionWakeEnginePath` accepts `auto`, an empty value (transcript-only wake), or a JSON wake-engine manifest in `data\wake-engines`; those manifests can launch a local helper process and pass the captured WAV path, wake aliases, selected wake asset, and resolved mic-tuning context through placeholders and environment variables
 - `speechRecognitionBeamformingProfile` selects the software tuning profile (`auto`, `off`, `desktop`, `headset`, `conference`, or `far-field-array`)
 - `speechRecognitionHardwareDspProfile` selects the expected device-stack DSP posture (`auto`, `off`, `system-aec`, `voice-processing`, `conference-array`, or `vendor-beamforming`) so Jarvis can tune capture buffering and noise-reduction hints more realistically
-- `auto` is still the safest default because it preserves the compatibility and Windows fallbacks when the preferred remote path is unavailable
+- `auto` is still the safest default because it preserves the compatibility fallbacks when the preferred remote path is unavailable
 
 For a clickable start on Windows:
 
@@ -251,7 +246,7 @@ By default the desktop app now tries to start the configured speech-recognition 
 - Wake-word detection is more forgiving now and can handle common variants such as `hey Jarvis`, `okay Jarvis`, `please Jarvis`, hesitant starts like `uh Jarvis`, and frequent transcription slips like `Jervis`
 - When Jarvis asks for a low-confidence voice confirmation, you can correct it with phrases like `I said open Discord, not open this cord`, and Jarvis will store that correction to bias future transcripts
 - `voice corrections` shows the learned correction pairs plus recent rejected transcripts
-- On the rolling-transcription provider, wake activation now also has a recognizer-backed local detection path, so `Jarvis status` can still route even when the transcript drops or mangles the wake prefix
+- On the rolling-transcription provider, wake activation also runs openWakeWord through the local speech server, so `Jarvis status` can still route even when the transcript drops or mangles the wake prefix
 - In full-duplex mode, speaking over Jarvis interrupts active voice output and queues the new voice command once the interrupted turn finishes cleanup
 - After changing microphones or moving to a noisier room, run `Calibrate Mic` to capture room noise and speech so Jarvis can retune its gate, gain cap, and beamforming assumptions for that device
 - Run `Validate Mic` after calibration to capture wake-word strength, command headroom, and playback leakage so Jarvis can flag weak full-duplex setups before you rely on them
@@ -271,8 +266,6 @@ The desktop layer now supports richer app control beyond launch/read:
 
 **Browser**
 - `browse openai.com`, `go to discord`, `browse linkedin messages` (site names: teams, discord, linkedin, linkedin messages, notion, canvas, github, figma; add your own under `siteAliases` in `jarvis.settings.json`), `search web iron man interface design`
-- `chrome dom open openai.com`, `chrome dom tabs`, `chrome dom page`
-- `chrome dom click button[data-testid='send-button']`, `chrome dom type textarea :: hello`, `chrome dom verify h1 :: OpenAI`
 
 **App Adapters**
 - `spotify play`, `spotify playlist coding`, `code goto src/Jarvis.Core/JarvisDataPaths.cs:1`
@@ -313,7 +306,7 @@ Safety: Sensitive `type into` and `set clipboard` content requires approval. `cl
 
 Jarvis scans every app on the PC and keeps an index of them, so "open Spotify" or "open Clock" works without a hand-written alias.
 
-- **What is scanned:** Start Menu and desktop shortcuts, the registry (installed apps and App Paths), Steam, Epic, Xbox, Riot and Battle.net libraries, and everything Windows itself lists as an app. That last source includes Microsoft Store apps such as Claude, ChatGPT, Clock, Photos and Snipping Tool, which have no shortcut file to find.
+- **What is scanned:** Start Menu and desktop shortcuts, the registry (installed apps and App Paths), and everything Windows itself lists as an app. That last source includes Microsoft Store apps such as Claude, ChatGPT, Clock, Photos and Snipping Tool, which have no shortcut file to find.
 - **When:** in the background at every launch, cached for ten minutes in memory, with Windows' own app list refreshed every six hours. If a spoken name matches nothing, Jarvis rescans once, at most every two minutes, in case the app was just installed.
 - **The saved copy:** `%LOCALAPPDATA%\Jarvis\data\app-index.json` lists every indexed app with its launch target and the spoken names it answers to. Open it to see exactly what Jarvis knows. It is rebuilt automatically and is safe to delete.
 - **Spoken shortcuts:** each app answers to its full name and to shorter forms, so "Microsoft Edge" also answers to "edge" and "Microsoft Photos" and "Photos" both work. Filler such as "the", "my" and "app" is ignored.
@@ -362,13 +355,10 @@ Relevant settings:
 - `voiceApiKeyCredentialTarget`
 - `voiceApiKeyEnvironmentVariable`
 - `voiceName`
-- `voiceInstructions`
-- `voiceResponseFormat`
 - `speechRecognitionEnabled`
 - `speechRecognitionProvider`
 - `wakeWordEnabled`
 - `wakePhrase`
-- `recognizerCulture`
 - `speechRecognitionBaseUrl`
 - `speechRecognitionModel`
 - `speechRecognitionLanguage`
@@ -378,7 +368,6 @@ Relevant settings:
 - `speechRecognitionSilenceDurationMilliseconds`
 - `speechRecognitionPreRollMilliseconds`
 - `speechRecognitionMinimumUtteranceMilliseconds`
-- `speechRecognitionNoiseSuppressionEnabled`
 - `speechRecognitionEchoCancellationEnabled`
 - `speechRecognitionBargeInEnabled`
 - `speechRecognitionBeamformingEnabled`
@@ -411,13 +400,13 @@ This is no longer just a thin bootstrap shell, but it is still not full movie be
 1. Native in-process Porcupine/OpenWakeWord/ONNX bindings and direct vendor SDK interop; the current build supports manifest-backed external wake engines, but it does not bundle those SDKs itself
 2. Real external sync and write actions for email, tasks, messaging, and other productivity systems instead of only local snapshot reasoning
 3. Broader desktop-state understanding beyond the current screenshot-, window-, and file-based analysis
-4. Event-driven monitoring, richer sensor backends, broader desktop-state understanding, and wider browser coverage beyond the current Chrome-first DOM path
+4. Event-driven monitoring, richer sensor backends, broader desktop-state understanding, and wider browser coverage beyond the current Chrome-first path
 5. Broader multi-device continuity, richer multilingual voice tuning, and more polished operator HUD layers
 
 ## Recommended Next Steps
 
 1. Ship tested Porcupine/OpenWakeWord/ONNX wrapper manifests for real hardware instead of only the generic manifest schema and command runner.
-2. Expand the current automation layer from Chrome-first DOM workflows and UI primitives into broader cross-browser coverage, event-driven monitoring, and deeper app-state control.
+2. Expand the current automation layer from Chrome-first workflows and UI primitives into broader cross-browser coverage, event-driven monitoring, and deeper app-state control.
 3. Add real external integrations for email, tasks, messaging, calendar, and other systems that currently exist only as local planning context.
 4. Harden OCR workflows and desktop-surface capture beyond the current file- and screenshot-based routes.
 
@@ -432,7 +421,7 @@ The list below is intentionally broad. It is the practical roadmap for pushing t
 Much of this section is now in the current build.
 
 Currently implemented:
-- OpenAI-compatible and Windows speech-recognition paths with fallback behavior.
+- OpenAI-compatible speech recognition, including the local Whisper server.
 - Streaming TTS with fallback, tray-aware voice responses, and wake-driven voice entry points.
 - Manifest-backed wake assets and wake engines, per-device calibration and validation, and beamforming/hardware-DSP profile hooks.
 - Half-duplex and full-duplex conversation modes with noise suppression, echo cancellation, and barge-in support.
@@ -453,7 +442,7 @@ Currently implemented:
 - The runtime now uses recent turns, recent tool evidence, user state, memory profile, and live computer context when planning.
 - Tool-result verification, proactive summaries, and persisted workflow resume are implemented.
 - Ambiguous requests can trigger clarification flows, and those clarification sessions now persist across turns.
-- Reasoning and execution activity now stream into the desktop UI as classification, planning, tool, reflection, clarification, and verification events.
+- Reasoning and execution activity now stream into the desktop UI as classification, planning, tool, clarification, and verification events.
 - Image, screen, and document understanding are implemented through the visual tool surface.
 - Short-term reference resolution is now part of the planner, including safe follow-ups such as `open it`, `the second one`, `the other one`, `click that button`, and `type hello into that field`.
 
@@ -471,7 +460,6 @@ Currently implemented:
 - Long-term memory for notes, preferences, habits, routines, app/location cues, and episodic turn outcomes.
 - Retention policies, off-the-record/private handling, forgetting controls, and a desktop memory workbench for reviewing and editing stored items.
 - Structured memories for people, projects, devices, places, relationships, favorites, and reminder memory with time-based recall.
-- User-facing memory review, importance tuning, and retention tuning.
 - Improved importance scoring, richer routine modeling with cadence/time/anchor cues, stronger entity merge behavior, and broader cross-session personalization signals for planner presence guidance.
 
 ### 4. Desktop And App Automation
@@ -483,8 +471,7 @@ Currently implemented:
 - Win32 UI actions for click, type, hotkey, scroll, wait, clipboard workflows, and media controls with approval guardrails.
 - Screenshot capture, OCR-style extraction, structured UI detection, and planner grounding from live screen context.
 - Browser open/search actions plus deeper Chrome navigation, tab, history/downloads/bookmarks, find-on-page, form-fill, and login workflows.
-- DevTools-backed Chrome DOM automation for tab inspection and selection, selector-aware reads, clicks, typing, waits, and explicit verification on real web pages.
-- File navigation plus file create/edit/append/move/copy/delete workflows, clipboard history and restore, Jarvis notification history with best-effort toast delivery, and shell execution with approvals.
+- File navigation plus file create/edit/append/move/copy/delete workflows and shell execution with approvals.
 - Richer app-state introspection, and app adapters for Spotify, Discord, Slack, VS Code, Office, Chrome, and Explorer.
 
 ### 5. External Integrations
@@ -533,7 +520,7 @@ Currently implemented:
 - First-class presence controls now exist for response style, nickname/address, small-talk posture, and pronunciation hints in both settings and the desktop app's Presence workbench.
 - Social turns such as greetings, check-ins, thanks, apologies, compliments, readiness checks, and identity questions now have direct presence-aware replies.
 - Short task replies and acknowledgements now apply stronger urgency/frustration modulation without corrupting tool-heavy outputs.
-- Streamed spoken acknowledgements and configurable voice provider/model/name/instructions are live, and presence settings now feed both planner prompts and voice instructions.
+- Streamed spoken acknowledgements and configurable voice provider/model/name are live, and presence settings now feed planner prompts.
 - Tone continuity is preserved through persisted settings plus learned preference memory.
 
 Still open:

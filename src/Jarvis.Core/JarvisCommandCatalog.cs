@@ -2,7 +2,6 @@
 // People say "could you please pull up my notepad" or "turn off the vpn"; tools only understand canonical commands such as
 // "open app notepad" or "vpn off". NormalizeToCommand and NormalizeVoiceDirective do that translation with fixed phrase lists and regexes,
 // without calling the language model. Anything they do not recognise is returned unchanged, so the planner (the LLM) can handle it.
-// The lists below (phrases and prefixes) are also given to the speech recognizer as grammars, see LoadPhraseGrammar in VoiceRuntime.cs.
 // Nothing here runs a tool or touches the system; it only rewrites text.
 using System.Text.RegularExpressions;
 
@@ -59,14 +58,6 @@ public static partial class JarvisCommandCatalog
         "user profile",
         "show preferences",
         "show my preferences"
-    ];
-
-    public static IReadOnlyList<string> PrivacyPhrases { get; } =
-    [
-        "privacy",
-        "privacy help",
-        "privacy boundaries",
-        "memory privacy"
     ];
 
     public static IReadOnlyList<string> ReminderPhrases { get; } =
@@ -369,34 +360,12 @@ public static partial class JarvisCommandCatalog
         "tap "
     ];
 
-    public static IReadOnlyList<string> TypePrefixes { get; } =
-    [
-        "type into ",
-        "type ",
-        "types into ",
-        "types ",
-        "enter into ",
-        "enter ",
-        "input into ",
-        "input ",
-        "write into ",
-        "write "
-    ];
-
     public static IReadOnlyList<string> GetTextPrefixes { get; } =
     [
         "get element text ",
         "read element ",
         "what text ",
         "element text "
-    ];
-
-    public static IReadOnlyList<string> ScrollPrefixes { get; } =
-    [
-        "scroll window ",
-        "scroll ",
-        "move down ",
-        "move up "
     ];
 
     public static IReadOnlyList<string> WaitPrefixes { get; } =
@@ -444,11 +413,6 @@ public static partial class JarvisCommandCatalog
         if (ContainsExact(PreferencePhrases, normalized))
         {
             return "preferences";
-        }
-
-        if (ContainsExact(PrivacyPhrases, normalized))
-        {
-            return "privacy";
         }
 
         if (ContainsExact(ReminderPhrases, normalized))

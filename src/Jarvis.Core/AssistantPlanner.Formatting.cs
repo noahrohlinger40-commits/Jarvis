@@ -2092,12 +2092,6 @@ internal sealed partial class StructuredAssistantPlanner
             return true;
         }
 
-        if (value.Contains("privacy", StringComparison.OrdinalIgnoreCase))
-        {
-            toolName = "privacy";
-            return true;
-        }
-
         if (value.Contains("reminder", StringComparison.OrdinalIgnoreCase)
             || value.Contains("remind me", StringComparison.OrdinalIgnoreCase))
         {

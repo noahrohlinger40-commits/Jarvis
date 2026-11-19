@@ -310,12 +310,6 @@ internal static partial class Win32UiAutomation
                 : error);
     }
 
-    // Reads clipboard text for other code in the project (clipboard history), without the wording of the tool reply.
-    public static bool TryGetClipboardText(out string text, out string error)
-    {
-        return TryReadClipboardText(out text, out error);
-    }
-
     // Tool: paste into a window by focusing it and sending Ctrl+V. The 120 ms wait lets focus settle first.
     public static async Task<string> PasteClipboardAsync(string targetApp)
     {

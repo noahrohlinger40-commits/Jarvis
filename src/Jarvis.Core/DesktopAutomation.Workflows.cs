@@ -1,22 +1,14 @@
 // DesktopAutomation.Workflows.cs: the "do things to files and notifications" slice of DesktopAutomationService.
 // Holds write/replace/move/copy/delete file tools with their safety checks (no editing Windows or Program Files),
-// app state reporting, clipboard history and the Jarvis notification history/toast. Called by the tool layer through IDesktopAutomationService.
-// History is stored as small JSON files under data\automation.
+// app state reporting and the Jarvis toast notification. Called by the tool layer through IDesktopAutomationService.
 using System.Diagnostics;
 using System.Security;
 using System.Text;
-using System.Text.Json;
 
 namespace Jarvis.Core;
 
 public sealed partial class DesktopAutomationService
 {
-    // JSON settings for the history files: web-style camelCase names, human-readable indentation.
-    private static readonly JsonSerializerOptions AutomationJsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        WriteIndented = true
-    };
-
     // Tool: write (or append to) a text file, creating folders as needed. Refuses system folders and binary files.
     public async Task<string> WriteFileAsync(string target, string content, bool append, CancellationToken cancellationToken)
     {
@@ -86,7 +78,7 @@ public sealed partial class DesktopAutomationService
         }
 
         var original = await File.ReadAllTextAsync(resolvedPath, cancellationToken);
-        var replacementCount = CountOccurrences(original, findText);
+        var replacementCount = original.Split(findText).Length - 1;
 
         if (replacementCount == 0)
         {
@@ -263,63 +255,7 @@ public sealed partial class DesktopAutomationService
         return Task.FromResult(string.Join(Environment.NewLine, lines));
     }
 
-    // Tool: show the last 10 clipboard entries. It first records whatever is on the clipboard now so the list is current.
-    public async Task<string> GetClipboardHistoryAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (Win32UiAutomation.TryGetClipboardText(out var text, out _) && !string.IsNullOrWhiteSpace(text))
-        {
-            await CaptureClipboardHistoryEntryAsync(text, cancellationToken);
-        }
-
-        var history = await LoadClipboardHistoryAsync(cancellationToken);
-
-        if (history.Count == 0)
-        {
-            return "Clipboard history is empty.";
-        }
-
-        var lines = history
-            .Take(10)
-            .Select((entry, index) =>
-                $"- {index + 1}. {entry.CapturedAtUtc.ToLocalTime():yyyy-MM-dd h:mm tt} | {TrimForAutomationDisplay(entry.Text, 100)}")
-            .ToArray();
-
-        return "Clipboard history:" + Environment.NewLine + string.Join(Environment.NewLine, lines);
-    }
-
-    // Tool: put an older clipboard entry (counted from 1, newest first) back on the clipboard.
-    public async Task<string> RestoreClipboardHistoryAsync(int index, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var history = await LoadClipboardHistoryAsync(cancellationToken);
-
-        if (history.Count == 0)
-        {
-            return "Clipboard history is empty.";
-        }
-
-        if (index < 1 || index > history.Count)
-        {
-            return $"Clipboard history index must be between 1 and {history.Count}.";
-        }
-
-        var entry = history[index - 1];
-        var setResult = await Win32UiAutomation.SetClipboardTextAsync(entry.Text);
-
-        if (!UiCommandParsing.LooksLikeFailure(setResult))
-        {
-            await CaptureClipboardHistoryEntryAsync(entry.Text, cancellationToken);
-        }
-
-        return UiCommandParsing.LooksLikeFailure(setResult)
-            ? setResult
-            : $"Restored clipboard history item {index}: {TrimForAutomationDisplay(entry.Text, 100)}";
-    }
-
-    // Tool: show a Windows toast notification and also store it in Jarvis's own history (kept to the newest 30), so there is a record even if the toast could not be shown.
+    // Tool: show a Windows toast notification.
     public async Task<string> SendNotificationAsync(string title, string message, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -332,143 +268,16 @@ public sealed partial class DesktopAutomationService
             return "Usage: notify <title> :: <message>";
         }
 
-        var notifications = await LoadNotificationsAsync(cancellationToken);
         var toastAttempt = await TryShowToastNotificationAsync(normalizedTitle, normalizedMessage, cancellationToken);
-        notifications.Insert(0, new AutomationNotificationRecord(
-            Guid.NewGuid().ToString("N"),
-            normalizedTitle,
-            normalizedMessage,
-            DateTimeOffset.UtcNow,
-            toastAttempt.Succeeded,
-            toastAttempt.Error));
-        notifications = notifications.Take(30).ToList();
-        await SaveNotificationsAsync(notifications, cancellationToken);
 
         if (toastAttempt.Succeeded)
         {
             return $"Sent notification: {normalizedTitle}";
         }
 
-        return string.Join(
-            Environment.NewLine,
-            $"Recorded notification: {normalizedTitle}",
-            string.IsNullOrWhiteSpace(toastAttempt.Error)
-                ? "Toast display was unavailable on this machine, so the notification was only stored in Jarvis history."
-                : $"Toast display was unavailable, so the notification was only stored in Jarvis history. Detail: {toastAttempt.Error}");
-    }
-
-    // Tool: list the 12 most recent stored notifications.
-    public async Task<string> ListNotificationsAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var notifications = await LoadNotificationsAsync(cancellationToken);
-
-        if (notifications.Count == 0)
-        {
-            return "No Jarvis notifications are recorded.";
-        }
-
-        var lines = notifications
-            .Take(12)
-            .Select(entry =>
-            {
-                var preview = string.IsNullOrWhiteSpace(entry.Message)
-                    ? "[no message]"
-                    : TrimForAutomationDisplay(entry.Message, 100);
-                var delivery = entry.ToastDisplayed ? "toast shown" : "history only";
-                return $"- {entry.CreatedAtUtc.ToLocalTime():yyyy-MM-dd h:mm tt} | {entry.Title} | {delivery} | {preview}";
-            })
-            .ToArray();
-
-        return "Jarvis notifications:" + Environment.NewLine + string.Join(Environment.NewLine, lines);
-    }
-
-    // Tool: delete the notification history.
-    public async Task<string> ClearNotificationsAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        await SaveNotificationsAsync([], cancellationToken);
-        return "Cleared the Jarvis notification history.";
-    }
-
-    // Saves clipboard text to history: skips blanks and repeats of the newest entry, keeps the newest 20.
-    private async Task CaptureClipboardHistoryEntryAsync(string text, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var normalized = NormalizeClipboardText(text);
-
-        if (string.IsNullOrWhiteSpace(normalized))
-        {
-            return;
-        }
-
-        var history = await LoadClipboardHistoryAsync(cancellationToken);
-
-        if (history.Count > 0 && string.Equals(history[0].Text, normalized, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        history.Insert(0, new ClipboardHistoryRecord(
-            Guid.NewGuid().ToString("N"),
-            normalized,
-            DateTimeOffset.UtcNow));
-        history = history
-            .Take(20)
-            .ToList();
-        await SaveJsonAsync(GetClipboardHistoryPath(), history, cancellationToken);
-    }
-
-    // Small loaders/savers for the two history files.
-    private async Task<List<ClipboardHistoryRecord>> LoadClipboardHistoryAsync(CancellationToken cancellationToken)
-    {
-        return await LoadJsonAsync(GetClipboardHistoryPath(), cancellationToken, static () => new List<ClipboardHistoryRecord>());
-    }
-
-    private async Task<List<AutomationNotificationRecord>> LoadNotificationsAsync(CancellationToken cancellationToken)
-    {
-        return await LoadJsonAsync(GetNotificationHistoryPath(), cancellationToken, static () => new List<AutomationNotificationRecord>());
-    }
-
-    private async Task SaveNotificationsAsync(IReadOnlyList<AutomationNotificationRecord> notifications, CancellationToken cancellationToken)
-    {
-        await SaveJsonAsync(GetNotificationHistoryPath(), notifications, cancellationToken);
-    }
-
-    // Reads a JSON file; a missing or damaged file quietly gives a fresh default value instead of an error.
-    private async Task<T> LoadJsonAsync<T>(string path, CancellationToken cancellationToken, Func<T> createDefault)
-    {
-        try
-        {
-            if (!File.Exists(path))
-            {
-                return createDefault();
-            }
-
-            await using var stream = File.OpenRead(path);
-            var document = await JsonSerializer.DeserializeAsync<T>(stream, AutomationJsonOptions, cancellationToken);
-            return document ?? createDefault();
-        }
-        catch
-        {
-            return createDefault();
-        }
-    }
-
-    // Writes a JSON file, creating its folder first.
-    private async Task SaveJsonAsync<T>(string path, T value, CancellationToken cancellationToken)
-    {
-        var directory = Path.GetDirectoryName(path);
-
-        if (!string.IsNullOrWhiteSpace(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-
-        await using var stream = File.Create(path);
-        await JsonSerializer.SerializeAsync(stream, value, AutomationJsonOptions, cancellationToken);
+        return string.IsNullOrWhiteSpace(toastAttempt.Error)
+            ? "Could not show the notification: toast display was unavailable on this machine."
+            : $"Could not show the notification: toast display was unavailable. Detail: {toastAttempt.Error}";
     }
 
     // Shows a Windows toast by running a tiny PowerShell script (the toast API is a Windows Runtime API that is simple to reach from PowerShell). The title and message are XML-escaped first so characters like < or & cannot break the toast XML.
@@ -528,7 +337,7 @@ public sealed partial class DesktopAutomationService
                 return (true, string.Empty);
             }
 
-            // A non-zero exit code means PowerShell could not show the toast; its error text (shortened) is returned so it can be stored.
+            // A non-zero exit code means PowerShell could not show the toast; its error text (shortened) is returned.
             var error = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
             return (false, TrimForAutomationDisplay(error, 180));
         }
@@ -638,42 +447,6 @@ public sealed partial class DesktopAutomationService
         }
     }
 
-    // Counts non-overlapping occurrences of the text (exact, case-sensitive), used to report how many replacements were made.
-    private static int CountOccurrences(string content, string findText)
-    {
-        var count = 0;
-        var index = 0;
-
-        while (index < content.Length)
-        {
-            var matchIndex = content.IndexOf(findText, index, StringComparison.Ordinal);
-
-            if (matchIndex < 0)
-            {
-                break;
-            }
-
-            count++;
-            index = matchIndex + Math.Max(1, findText.Length);
-        }
-
-        return count;
-    }
-
-    // Cleans clipboard text for the history: Windows line endings, trimmed, at most 12,000 characters.
-    private static string NormalizeClipboardText(string text)
-    {
-        const int maxChars = 12000;
-        var normalized = (text ?? string.Empty).ReplaceLineEndings(Environment.NewLine).Trim();
-
-        if (normalized.Length <= maxChars)
-        {
-            return normalized;
-        }
-
-        return normalized[..maxChars];
-    }
-
     // Working-set memory (the RAM a process is using right now) in readable form, or empty if the process is gone.
     private static string TryDescribeProcessMemory(int processId)
     {
@@ -690,23 +463,4 @@ public sealed partial class DesktopAutomationService
 
     // Shortens text to maxLength using the shared Clip extension.
     private static string TrimForAutomationDisplay(string value, int maxLength) => value.Clip(maxLength);
-
-    private string GetClipboardHistoryPath() => JarvisDataPaths.Resolve("data/automation/clipboard-history.json");
-
-    private string GetNotificationHistoryPath() => JarvisDataPaths.Resolve("data/automation/notifications.json");
 }
-
-// One saved clipboard-history entry.
-internal sealed record ClipboardHistoryRecord(
-    string Id,
-    string Text,
-    DateTimeOffset CapturedAtUtc);
-
-// One saved notification: whether a toast was shown, and the error if not.
-internal sealed record AutomationNotificationRecord(
-    string Id,
-    string Title,
-    string Message,
-    DateTimeOffset CreatedAtUtc,
-    bool ToastDisplayed,
-    string ToastError);

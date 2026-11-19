@@ -143,12 +143,12 @@ public sealed class MediaTool : IAssistantTool
     }
 }
 
-// Tool that reads or changes the clipboard: show, history, restore an older entry, set text, clear, or paste into a window.
+// Tool that reads or changes the clipboard: show, set text, clear, or paste into a window.
 public sealed class ClipboardTool : IAssistantTool
 {
     public string Name => "clipboard";
 
-    public string Description => "Inspect or change the clipboard. Use `clipboard`, `clipboard history`, `clipboard restore 2`, `set clipboard hello`, or `paste clipboard into notepad`.";
+    public string Description => "Inspect or change the clipboard. Use `clipboard`, `set clipboard hello`, or `paste clipboard into notepad`.";
 
     public bool CanHandle(string input) => UiCommandParsing.TryParseClipboardCommand(input, out _, out _);
 
@@ -159,18 +159,15 @@ public sealed class ClipboardTool : IAssistantTool
             return new ToolResult("Usage: clipboard | set clipboard <text> | clear clipboard | paste clipboard into <window>");
         }
 
-        // The first word chosen by TryParseClipboardCommand decides which service call runs. "restore" and "paste" fall through to a usage message if their argument is missing or not a number.
+        // The first word chosen by TryParseClipboardCommand decides which service call runs. "paste" falls through to a usage message if its argument is missing.
         var result = action switch
         {
             "show" => await context.DesktopAutomation.GetClipboardAsync(cancellationToken),
-            "history" => await context.DesktopAutomation.GetClipboardHistoryAsync(cancellationToken),
-            "restore" when int.TryParse(payload, out var index) => await context.DesktopAutomation.RestoreClipboardHistoryAsync(index, cancellationToken),
-            "restore" => "Usage: clipboard restore <history-index>",
             "set" => await context.DesktopAutomation.SetClipboardAsync(payload, cancellationToken),
             "clear" => await context.DesktopAutomation.ClearClipboardAsync(cancellationToken),
             "paste" when !string.IsNullOrWhiteSpace(payload) => await context.DesktopAutomation.PasteClipboardAsync(payload, cancellationToken),
             "paste" => "Usage: paste clipboard into <window>",
-            _ => "Usage: clipboard | clipboard history | clipboard restore <index> | set clipboard <text> | clear clipboard | paste clipboard into <window>"
+            _ => "Usage: clipboard | set clipboard <text> | clear clipboard | paste clipboard into <window>"
         };
 
         var success = !UiCommandParsing.LooksLikeFailure(result);
@@ -309,25 +306,11 @@ internal static partial class UiCommandParsing
         return false;
     }
 
-    // Picks which clipboard action was asked for and extracts its text. More specific phrases (history, restore) are tested before the plain "clipboard" so they are not swallowed by it.
+    // Picks which clipboard action was asked for and extracts its text.
     public static bool TryParseClipboardCommand(string input, out string action, out string payload)
     {
         action = string.Empty;
         payload = string.Empty;
-
-        if (ToolInputHelper.MatchesExact(input, "clipboard history", "show clipboard history", "list clipboard history"))
-        {
-            action = "history";
-            return true;
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "clipboard restore")
-            || ToolInputHelper.StartsWithCommand(input, "restore clipboard"))
-        {
-            action = "restore";
-            payload = ToolInputHelper.GetCommandTail(input, "clipboard restore", "restore clipboard");
-            return true;
-        }
 
         if (ToolInputHelper.MatchesExact(input, "clipboard", "show clipboard", "get clipboard", "read clipboard", "clipboard show"))
         {

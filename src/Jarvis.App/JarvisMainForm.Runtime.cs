@@ -986,13 +986,12 @@ internal sealed partial class JarvisMainForm
             AppendSystemMessage($"Calibration failed: {exception.Message}");
             AppendTimelineEntry("AUDIO", "Microphone calibration failed.", exception.Message, Color.FromArgb(255, 138, 101));
         }
-        // Always re-enable the button and restart listening if it was on before (and push-to-talk is not in use).
+        // Always re-enable the button and restart listening if it was on before.
         finally
         {
             _calibrateMicButton.Enabled = true;
 
             if (wasListening
-                && !_currentOptions.SpeechRecognitionPushToTalkEnabled
                 && !_cancellationTokenSource.IsCancellationRequested
                 && !_currentVoiceRuntime.CurrentStatus.IsListening)
             {
@@ -1128,7 +1127,6 @@ internal sealed partial class JarvisMainForm
             _validateMicButton.Enabled = true;
 
             if (wasListening
-                && !_currentOptions.SpeechRecognitionPushToTalkEnabled
                 && !_cancellationTokenSource.IsCancellationRequested
                 && !_currentVoiceRuntime.CurrentStatus.IsListening)
             {
@@ -1345,28 +1343,6 @@ internal sealed partial class JarvisMainForm
         }
 
         await _currentVoiceRuntime.StartAsync(_cancellationTokenSource.Token);
-    }
-
-    // Push-to-Talk button: with push-to-talk enabled in settings it starts/stops live capture and logs it; otherwise it acts like the mic toggle.
-    private async Task TogglePushToTalkAsync()
-    {
-        if (!_currentOptions.SpeechRecognitionPushToTalkEnabled)
-        {
-            await ToggleMicrophoneAsync();
-            return;
-        }
-
-        if (_currentVoiceRuntime.CurrentStatus.IsListening)
-        {
-            await _currentVoiceRuntime.StopAsync(_cancellationTokenSource.Token);
-            AppendSystemMessage("Push-to-talk microphone paused.");
-            AppendTimelineEntry("VOICE", "Push-to-talk paused.", "Operator halted live capture.", Color.FromArgb(255, 138, 101));
-            return;
-        }
-
-        await _currentVoiceRuntime.StartAsync(_cancellationTokenSource.Token);
-        AppendRuntimeMessage("Push-to-talk microphone active. Press the hotkey again to stop.");
-        AppendTimelineEntry("VOICE", "Push-to-talk active.", "Operator armed the microphone.", Color.FromArgb(106, 220, 197));
     }
 
     // Volume slider changed: clamps to 10%-200%, rebuilds the speaker with the new volume and saves it. Ignores changes under 0.1%.
@@ -1641,7 +1617,7 @@ internal sealed partial class JarvisMainForm
     }
 
     // ----- Showing status on screen -----
-    // Updates the voice labels (LISTEN HOT/READY, WAKE...), the push-to-talk and mic buttons and the tray tooltip. Adds a feed line only when the text actually changed.
+    // Updates the voice labels (LISTEN HOT/READY, WAKE...), the mic button and the tray tooltip. Adds a feed line only when the text actually changed.
     private void UpdateVoiceUi(VoiceStatusSnapshot status, bool appendToFeed)
     {
         _trayIcon.Text = BuildTrayText(status.StatusText);
@@ -1659,16 +1635,6 @@ internal sealed partial class JarvisMainForm
         _wakeIndicatorLabel.ForeColor = status.IsArmed
             ? Color.FromArgb(255, 138, 101)
             : Color.FromArgb(132, 196, 255);
-
-        if (_currentOptions.SpeechRecognitionPushToTalkEnabled)
-        {
-            _pushToTalkButton.Visible = true;
-            _pushToTalkButton.Text = status.IsListening ? "Stop PTT" : "Start PTT";
-        }
-        else
-        {
-            _pushToTalkButton.Visible = false;
-        }
 
         _micToggleButton.Text = status.IsListening ? "Mute Mic" : "Start Mic";
         _micToggleButton.Enabled = status.IsAvailable || status.IsListening;
@@ -1815,7 +1781,6 @@ internal sealed partial class JarvisMainForm
             case AssistantActivityKind.Status:
             case AssistantActivityKind.Classification:
             case AssistantActivityKind.Planning:
-            case AssistantActivityKind.Reflection:
             case AssistantActivityKind.Background:
             case AssistantActivityKind.Summary:
             case AssistantActivityKind.Warning:
@@ -1833,7 +1798,6 @@ internal sealed partial class JarvisMainForm
     {
         if (activity.Kind is AssistantActivityKind.ToolStart
             or AssistantActivityKind.ToolComplete
-            or AssistantActivityKind.Reflection
             or AssistantActivityKind.Summary
             or AssistantActivityKind.Warning
             or AssistantActivityKind.Error
@@ -2346,7 +2310,6 @@ internal sealed partial class JarvisMainForm
         finally
         {
             if (shouldPauseMicrophone
-                && !_currentOptions.SpeechRecognitionPushToTalkEnabled
                 && !_cancellationTokenSource.IsCancellationRequested)
             {
                 try
@@ -3032,7 +2995,6 @@ internal sealed partial class JarvisMainForm
             AssistantActivityKind.ToolStart => Color.FromArgb(132, 196, 255),
             AssistantActivityKind.ToolComplete => Color.FromArgb(106, 220, 197),
             AssistantActivityKind.Summary => Color.FromArgb(106, 220, 197),
-            AssistantActivityKind.Reflection => Color.FromArgb(145, 186, 255),
             AssistantActivityKind.Background => Color.FromArgb(186, 150, 255),
             AssistantActivityKind.Clarification => Color.FromArgb(255, 210, 132),
             _ => Color.FromArgb(173, 216, 230)

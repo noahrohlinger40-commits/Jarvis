@@ -170,7 +170,7 @@ public sealed class JsonAgentStateStore : IAgentStateStore
     // Reads every saved session (an empty list if the file does not exist). Callers must already hold _gate.
     private async Task<List<PersistedAgentSession>> LoadAsync(CancellationToken cancellationToken)
     {
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         if (!File.Exists(_filePath))
         {
@@ -185,7 +185,7 @@ public sealed class JsonAgentStateStore : IAgentStateStore
     // Overwrites the file with the full list. Callers must already hold _gate.
     private async Task SaveAsync(List<PersistedAgentSession> sessions, CancellationToken cancellationToken)
     {
-        EnsureParentDirectoryExists();
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
 
         // Write to a temporary file first and then swap it in, so a crash mid-write cannot wipe the saved sessions.
         var temp = _filePath + ".tmp";
@@ -196,16 +196,6 @@ public sealed class JsonAgentStateStore : IAgentStateStore
         }
 
         File.Move(temp, _filePath, overwrite: true);
-    }
-
-    private void EnsureParentDirectoryExists()
-    {
-        var directory = Path.GetDirectoryName(_filePath);
-
-        if (!string.IsNullOrWhiteSpace(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
     }
 
     // A background session that has not finished (neither 'background-complete' nor 'completed').

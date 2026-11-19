@@ -1,7 +1,7 @@
 // AudioDeviceResolver.cs: finds which microphone to record from. Settings store a device name, but NAudio's WaveIn API
 // (the older Windows multimedia interface used for recording) wants a numeric index and reports names slightly differently
 // from what the user sees, so the name is matched loosely with a score. Falls back to the Windows default microphones.
-// Called by the voice runtimes (OpenAiCompatibleVoiceRuntime, VoiceRuntime.cs) and the calibration service.
+// Called by OpenAiCompatibleVoiceRuntime, LectureRecorder and the calibration service.
 using System.Text;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
