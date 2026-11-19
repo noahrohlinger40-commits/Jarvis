@@ -1,8 +1,13 @@
+// WakeWordEngines.cs: "wake engines" are JSON files (default folder data\wake-engines) that describe an external program able to
+// spot the wake word in audio, such as the openWakeWord "hey jarvis" detector: its executable, command-line template, model file,
+// timeout and confidence tweaks. This file finds, loads (with a cache) and ranks them, in the same way WakeWordAssets.cs does for assets.
+// WakeWordDetector uses the chosen engine to build its external-process back end; if none fits, the built-in recogniser is used.
 using System.Text.Json;
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// One loaded wake engine: all fields from its JSON file, plus where the file is. Empty path = built-in recogniser; path "auto" = choose automatically.
 internal sealed record WakeWordEngineDescriptor(
     string Path,
     string DefinitionDirectory,
@@ -25,19 +30,23 @@ internal sealed record WakeWordEngineDescriptor(
     string[] ExcludedDeviceKeywords,
     IReadOnlyDictionary<string, string> EnvironmentVariables)
 {
+    // True for the built-in "no external engine" entry.
     public bool IsRecognizerDefault => string.IsNullOrWhiteSpace(Path);
 
+    // True for the "auto" entry that picks an engine for the microphone.
     public bool IsAutomaticSelection =>
         string.Equals(
             WakeWordEngineCatalog.NormalizeStoredPath(Path),
             WakeWordEngineCatalog.AutoSelectionPath,
             StringComparison.OrdinalIgnoreCase);
 
+    // True when a real external program should be run (not the default, not "auto", and the kind is not "recognizer").
     public bool UsesExternalProcess =>
         !IsRecognizerDefault
         && !IsAutomaticSelection
         && !string.Equals(NormalizeEngineKind(EngineKind), "recognizer", StringComparison.Ordinal);
 
+    // Name to show in menus.
     public string BuildShortLabel()
     {
         if (!string.IsNullOrWhiteSpace(DisplayName))
@@ -53,6 +62,7 @@ internal sealed record WakeWordEngineDescriptor(
         return "Recognizer Wake";
     }
 
+    // How well this engine suits a microphone, by device-name keywords (+18 plus keyword length up to 18 each); excluded keywords disqualify it.
     public int ScoreDeviceMatch(string? deviceName)
     {
         if (IsRecognizerDefault || IsAutomaticSelection)
@@ -86,20 +96,26 @@ internal sealed record WakeWordEngineDescriptor(
         return score;
     }
 
+    // No kind in the file means an external program.
     private static string NormalizeEngineKind(string? engineKind) =>
         string.IsNullOrWhiteSpace(engineKind)
             ? "external-process"
             : engineKind.Trim().ToLowerInvariant();
 }
 
+// Finds, loads and caches wake engine descriptions.
 internal static class WakeWordEngineCatalog
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    // Lock for the cache below.
     private static readonly object Sync = new();
+    // Parsed engines keyed by file path, reloaded when the file changes on disk.
     private static readonly Dictionary<string, CachedWakeWordEngine> Cache = new(StringComparer.OrdinalIgnoreCase);
+    // Where engine files live by default, relative to the app folder.
     private const string DefaultRelativeDirectory = "data\\wake-engines";
     public const string AutoSelectionPath = "auto";
 
+    // The "choose automatically" menu entry. Command timeout default 1800 ms (1.8 s).
     public static WakeWordEngineDescriptor AutoSelection { get; } =
         new(
             Path: AutoSelectionPath,
@@ -123,6 +139,7 @@ internal static class WakeWordEngineCatalog
             ExcludedDeviceKeywords: Array.Empty<string>(),
             EnvironmentVariables: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
 
+    // The "use the built-in recogniser" entry.
     public static WakeWordEngineDescriptor RecognizerDefault { get; } =
         new(
             Path: string.Empty,
@@ -146,6 +163,7 @@ internal static class WakeWordEngineCatalog
             ExcludedDeviceKeywords: Array.Empty<string>(),
             EnvironmentVariables: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
 
+    // Lists everything available: Auto, Default, then each valid .json engine from the configured file's folder and the default folder.
     public static IReadOnlyList<WakeWordEngineDescriptor> Discover(string workspaceRoot, JarvisOptions options)
     {
         var discovered = new List<WakeWordEngineDescriptor>();
@@ -159,7 +177,7 @@ internal static class WakeWordEngineCatalog
 
         if (!string.IsNullOrWhiteSpace(configuredPath) && !IsAutoSelectionPath(configuredPath))
         {
-            var configuredAbsolutePath = ResolveAbsolutePath(configuredPath, workspaceRoot);
+            var configuredAbsolutePath = WakeWordPaths.ResolveAbsolutePath(configuredPath, workspaceRoot);
             TryAdd(configuredPath, configuredAbsolutePath, workspaceRoot, discovered, seen);
 
             var configuredDirectory = System.IO.Path.GetDirectoryName(configuredAbsolutePath);
@@ -170,13 +188,13 @@ internal static class WakeWordEngineCatalog
             }
         }
 
-        directories.Add(ResolveAbsolutePath(DefaultRelativeDirectory, workspaceRoot));
+        directories.Add(WakeWordPaths.ResolveAbsolutePath(DefaultRelativeDirectory, workspaceRoot));
 
         foreach (var directory in directories.Where(Directory.Exists))
         {
             foreach (var filePath in Directory.EnumerateFiles(directory, "*.json", SearchOption.TopDirectoryOnly))
             {
-                var storedPath = ToStoredPath(workspaceRoot, filePath);
+                var storedPath = WakeWordPaths.ToStoredPath(workspaceRoot, filePath);
                 TryAdd(storedPath, filePath, workspaceRoot, discovered, seen);
             }
         }
@@ -186,6 +204,7 @@ internal static class WakeWordEngineCatalog
             .OrderBy(engine => engine.BuildShortLabel(), StringComparer.OrdinalIgnoreCase)];
     }
 
+    // Returns the engine the settings ask for: "auto" chooses by microphone and wake asset, empty means the built-in recogniser, otherwise the named file.
     public static WakeWordEngineDescriptor ResolveConfiguredEngine(
         JarvisOptions options,
         WakeWordAssetDescriptor? wakeWordAsset,
@@ -207,6 +226,7 @@ internal static class WakeWordEngineCatalog
         return ResolveDescriptorByPath(Directory.GetCurrentDirectory(), options, storedPath);
     }
 
+    // Like ResolveConfiguredEngine but returns the "auto" entry itself instead of resolving it, for showing the setting in the UI.
     public static WakeWordEngineDescriptor ResolveSelectionDescriptor(JarvisOptions options)
     {
         var storedPath = NormalizeStoredPath(options.SpeechRecognitionWakeEnginePath);
@@ -224,6 +244,8 @@ internal static class WakeWordEngineCatalog
         return ResolveDescriptorByPath(Directory.GetCurrentDirectory(), options, storedPath);
     }
 
+    // Loads the engine file at a path, or if that fails looks for one with a matching file name among the discovered engines;
+    // the built-in recogniser is the last fallback.
     public static WakeWordEngineDescriptor ResolveDescriptorByPath(string workspaceRoot, JarvisOptions options, string? storedPath)
     {
         var normalizedStoredPath = NormalizeStoredPath(storedPath);
@@ -238,7 +260,7 @@ internal static class WakeWordEngineCatalog
             return RecognizerDefault;
         }
 
-        var absolutePath = ResolveAbsolutePath(normalizedStoredPath, workspaceRoot);
+        var absolutePath = WakeWordPaths.ResolveAbsolutePath(normalizedStoredPath, workspaceRoot);
         var direct = TryLoadDescriptor(normalizedStoredPath, absolutePath, workspaceRoot);
 
         if (direct is not null)
@@ -251,9 +273,11 @@ internal static class WakeWordEngineCatalog
             ?? RecognizerDefault;
     }
 
+    // True if the setting is the word "auto".
     public static bool IsAutoSelectionPath(string? path) =>
         string.Equals(NormalizeStoredPath(path), AutoSelectionPath, StringComparison.OrdinalIgnoreCase);
 
+    // Trims and uses backslashes so one path always has one spelling.
     public static string NormalizeStoredPath(string? path)
     {
         return string.IsNullOrWhiteSpace(path)
@@ -261,6 +285,7 @@ internal static class WakeWordEngineCatalog
             : path.Trim().Replace('/', '\\');
     }
 
+    // Two stored paths are the same if they are equal, or end in the same file name (the folder may have moved).
     public static bool StoredPathsMatch(string? left, string? right)
     {
         var normalizedLeft = NormalizeStoredPath(left);
@@ -281,6 +306,7 @@ internal static class WakeWordEngineCatalog
         return string.Equals(leftFileName, rightFileName, StringComparison.OrdinalIgnoreCase);
     }
 
+    // Auto mode: use the engine named by the wake asset if it exists; otherwise the best-scoring engine for the microphone; score 0 or below means the built-in recogniser.
     private static WakeWordEngineDescriptor ResolveAutoEngine(
         JarvisOptions options,
         WakeWordAssetDescriptor? wakeWordAsset,
@@ -330,6 +356,7 @@ internal static class WakeWordEngineCatalog
         return bestMatch.Engine;
     }
 
+    // Adds an engine to the list unless the path was already seen or the file cannot be read.
     private static void TryAdd(
         string storedPath,
         string absolutePath,
@@ -354,6 +381,7 @@ internal static class WakeWordEngineCatalog
         discovered.Add(descriptor);
     }
 
+    // Reads one JSON manifest into a descriptor, reusing the cache while the file is unchanged. Errors give null (engine ignored).
     private static WakeWordEngineDescriptor? TryLoadDescriptor(string storedPath, string absolutePath, string workspaceRoot)
     {
         if (!File.Exists(absolutePath))
@@ -398,6 +426,7 @@ internal static class WakeWordEngineCatalog
                 WorkingDirectory: manifest.WorkingDirectory?.Trim() ?? string.Empty,
                 ModelPath: manifest.ModelPath?.Trim() ?? string.Empty,
                 AccessKey: manifest.AccessKey?.Trim() ?? string.Empty,
+                // Timeout clamped to 250 ms - 15 s; sensitivity bias to -0.20..+0.20.
                 CommandTimeoutMilliseconds: Math.Clamp(manifest.CommandTimeoutMilliseconds ?? 1800, 250, 15000),
                 MinimumConfidence: manifest.MinimumConfidence,
                 SensitivityBias: Math.Clamp(manifest.SensitivityBias ?? 0, -0.20, 0.20),
@@ -407,8 +436,8 @@ internal static class WakeWordEngineCatalog
                     manifest.PreferredWakeAssetPaths,
                     absolutePath,
                     workspaceRoot),
-                DeviceKeywords: NormalizeValues(manifest.DeviceKeywords),
-                ExcludedDeviceKeywords: NormalizeValues(manifest.ExcludedDeviceKeywords),
+                DeviceKeywords: WakeWordPaths.NormalizeValues(manifest.DeviceKeywords),
+                ExcludedDeviceKeywords: WakeWordPaths.NormalizeValues(manifest.ExcludedDeviceKeywords),
                 EnvironmentVariables: NormalizeEnvironmentVariables(manifest.EnvironmentVariables));
 
             lock (Sync)
@@ -424,44 +453,7 @@ internal static class WakeWordEngineCatalog
         }
     }
 
-    private static string ResolveAbsolutePath(string path, string baseDirectory)
-    {
-        return System.IO.Path.IsPathRooted(path)
-            ? System.IO.Path.GetFullPath(path)
-            : System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDirectory, path));
-    }
-
-    private static string ToStoredPath(string workspaceRoot, string absolutePath)
-    {
-        if (string.IsNullOrWhiteSpace(workspaceRoot))
-        {
-            return absolutePath;
-        }
-
-        try
-        {
-            return NormalizeStoredPath(System.IO.Path.GetRelativePath(workspaceRoot, absolutePath));
-        }
-        catch
-        {
-            return absolutePath;
-        }
-    }
-
-    private static string[] NormalizeValues(IEnumerable<string>? values)
-    {
-        if (values is null)
-        {
-            return Array.Empty<string>();
-        }
-
-        return values
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
+    // Trims names and values of the environment variables passed to the external program.
     private static IReadOnlyDictionary<string, string> NormalizeEnvironmentVariables(
         IReadOnlyDictionary<string, string>? values)
     {
@@ -485,6 +477,7 @@ internal static class WakeWordEngineCatalog
         return normalized;
     }
 
+    // Turns asset paths listed in the engine file into the same stored form used elsewhere (relative to the workspace when the file exists).
     private static string[] NormalizeStoredPaths(
         IEnumerable<string>? values,
         string manifestAbsolutePath,
@@ -509,7 +502,7 @@ internal static class WakeWordEngineCatalog
 
             if (System.IO.Path.IsPathRooted(trimmed))
             {
-                normalized.Add(ToStoredPath(workspaceRoot, System.IO.Path.GetFullPath(trimmed)));
+                normalized.Add(WakeWordPaths.ToStoredPath(workspaceRoot, System.IO.Path.GetFullPath(trimmed)));
                 continue;
             }
 
@@ -517,7 +510,7 @@ internal static class WakeWordEngineCatalog
 
             if (File.Exists(manifestRelativePath))
             {
-                normalized.Add(ToStoredPath(workspaceRoot, manifestRelativePath));
+                normalized.Add(WakeWordPaths.ToStoredPath(workspaceRoot, manifestRelativePath));
                 continue;
             }
 
@@ -527,6 +520,8 @@ internal static class WakeWordEngineCatalog
         return normalized.ToArray();
     }
 
+    // Auto-selection score: microphone keyword score, +28 if the engine prefers the chosen wake asset, +20 for a matching
+    // beamforming profile, +18 for a matching hardware DSP profile.
     private static int ScoreAutoSelection(
         WakeWordEngineDescriptor descriptor,
         string? deviceName,
@@ -562,8 +557,10 @@ internal static class WakeWordEngineCatalog
         return score;
     }
 
+    // Cache entry: the descriptor and the file's modification time when it was read.
     private sealed record CachedWakeWordEngine(DateTime LastWriteUtc, WakeWordEngineDescriptor? Descriptor);
 
+    // The JSON shape of an engine file; missing fields get these safe defaults.
     private sealed record WakeWordEngineManifest
     {
         public string Name { get; init; } = string.Empty;

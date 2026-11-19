@@ -1,3 +1,7 @@
+// DesktopAutomation.Workflows.cs: the "do things to files and notifications" slice of DesktopAutomationService.
+// Holds write/replace/move/copy/delete file tools with their safety checks (no editing Windows or Program Files),
+// app state reporting, clipboard history and the Jarvis notification history/toast. Called by the tool layer through IDesktopAutomationService.
+// History is stored as small JSON files under data\automation.
 using System.Diagnostics;
 using System.Security;
 using System.Text;
@@ -7,11 +11,13 @@ namespace Jarvis.Core;
 
 public sealed partial class DesktopAutomationService
 {
+    // JSON settings for the history files: web-style camelCase names, human-readable indentation.
     private static readonly JsonSerializerOptions AutomationJsonOptions = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
     };
 
+    // Tool: write (or append to) a text file, creating folders as needed. Refuses system folders and binary files.
     public async Task<string> WriteFileAsync(string target, string content, bool append, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -52,6 +58,7 @@ public sealed partial class DesktopAutomationService
         return $"{action} {normalizedContent.Length} characters to {resolvedPath} ({FormatBytes(fileInfo.Length)}).";
     }
 
+    // Tool: replace every occurrence of one piece of text in a text file. Matching is exact (case-sensitive); reports how many were changed.
     public async Task<string> ReplaceInFileAsync(string target, string findText, string replaceText, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -66,7 +73,7 @@ public sealed partial class DesktopAutomationService
             return "A find value is required for replace in file.";
         }
 
-        var resolvedPath = ResolveSafeExistingPath(target);
+        var resolvedPath = ResolveSafePath(target);
 
         if (!File.Exists(resolvedPath))
         {
@@ -92,6 +99,7 @@ public sealed partial class DesktopAutomationService
         return $"Replaced {replacementCount} occurrence(s) in {resolvedPath}.";
     }
 
+    // Tool: move a file or folder. A file move overwrites an existing destination file; a folder move refuses if the destination folder exists.
     public Task<string> MovePathAsync(string source, string destination, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -101,7 +109,7 @@ public sealed partial class DesktopAutomationService
             return Task.FromResult("Usage: move path <source> :: <destination>");
         }
 
-        var resolvedSource = ResolveSafeExistingPath(source);
+        var resolvedSource = ResolveSafePath(source);
 
         if (!File.Exists(resolvedSource) && !Directory.Exists(resolvedSource))
         {
@@ -132,6 +140,7 @@ public sealed partial class DesktopAutomationService
         return Task.FromResult($"Moved folder to {resolvedDestination}.");
     }
 
+    // Tool: copy a file or folder (folders are copied with everything inside).
     public Task<string> CopyPathAsync(string source, string destination, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -141,7 +150,7 @@ public sealed partial class DesktopAutomationService
             return Task.FromResult("Usage: copy path <source> :: <destination>");
         }
 
-        var resolvedSource = ResolveSafeExistingPath(source);
+        var resolvedSource = ResolveSafePath(source);
 
         if (!File.Exists(resolvedSource) && !Directory.Exists(resolvedSource))
         {
@@ -166,6 +175,7 @@ public sealed partial class DesktopAutomationService
         return Task.FromResult($"Copied folder to {resolvedDestination}.");
     }
 
+    // Tool: delete a file or folder (folders recursively). Protected system paths are rejected by ResolveSafePath, and the workspace root or a drive root is refused here.
     public Task<string> DeletePathAsync(string target, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -175,7 +185,7 @@ public sealed partial class DesktopAutomationService
             return Task.FromResult("Usage: delete path <target>");
         }
 
-        var resolvedPath = ResolveSafeExistingPath(target);
+        var resolvedPath = ResolveSafePath(target);
 
         if (IsDangerousDeleteTarget(resolvedPath))
         {
@@ -197,6 +207,7 @@ public sealed partial class DesktopAutomationService
         return Task.FromResult($"Path not found: {resolvedPath}");
     }
 
+    // Tool: report whether an app is visible, running or just installed, with process id and memory use, for up to 5 matches.
     public Task<string> GetApplicationStateAsync(string target, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -252,6 +263,7 @@ public sealed partial class DesktopAutomationService
         return Task.FromResult(string.Join(Environment.NewLine, lines));
     }
 
+    // Tool: show the last 10 clipboard entries. It first records whatever is on the clipboard now so the list is current.
     public async Task<string> GetClipboardHistoryAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -277,6 +289,7 @@ public sealed partial class DesktopAutomationService
         return "Clipboard history:" + Environment.NewLine + string.Join(Environment.NewLine, lines);
     }
 
+    // Tool: put an older clipboard entry (counted from 1, newest first) back on the clipboard.
     public async Task<string> RestoreClipboardHistoryAsync(int index, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -306,6 +319,7 @@ public sealed partial class DesktopAutomationService
             : $"Restored clipboard history item {index}: {TrimForAutomationDisplay(entry.Text, 100)}";
     }
 
+    // Tool: show a Windows toast notification and also store it in Jarvis's own history (kept to the newest 30), so there is a record even if the toast could not be shown.
     public async Task<string> SendNotificationAsync(string title, string message, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -343,6 +357,7 @@ public sealed partial class DesktopAutomationService
                 : $"Toast display was unavailable, so the notification was only stored in Jarvis history. Detail: {toastAttempt.Error}");
     }
 
+    // Tool: list the 12 most recent stored notifications.
     public async Task<string> ListNotificationsAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -369,6 +384,7 @@ public sealed partial class DesktopAutomationService
         return "Jarvis notifications:" + Environment.NewLine + string.Join(Environment.NewLine, lines);
     }
 
+    // Tool: delete the notification history.
     public async Task<string> ClearNotificationsAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -376,6 +392,7 @@ public sealed partial class DesktopAutomationService
         return "Cleared the Jarvis notification history.";
     }
 
+    // Saves clipboard text to history: skips blanks and repeats of the newest entry, keeps the newest 20.
     private async Task CaptureClipboardHistoryEntryAsync(string text, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -404,6 +421,7 @@ public sealed partial class DesktopAutomationService
         await SaveJsonAsync(GetClipboardHistoryPath(), history, cancellationToken);
     }
 
+    // Small loaders/savers for the two history files.
     private async Task<List<ClipboardHistoryRecord>> LoadClipboardHistoryAsync(CancellationToken cancellationToken)
     {
         return await LoadJsonAsync(GetClipboardHistoryPath(), cancellationToken, static () => new List<ClipboardHistoryRecord>());
@@ -419,6 +437,7 @@ public sealed partial class DesktopAutomationService
         await SaveJsonAsync(GetNotificationHistoryPath(), notifications, cancellationToken);
     }
 
+    // Reads a JSON file; a missing or damaged file quietly gives a fresh default value instead of an error.
     private async Task<T> LoadJsonAsync<T>(string path, CancellationToken cancellationToken, Func<T> createDefault)
     {
         try
@@ -438,6 +457,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Writes a JSON file, creating its folder first.
     private async Task SaveJsonAsync<T>(string path, T value, CancellationToken cancellationToken)
     {
         var directory = Path.GetDirectoryName(path);
@@ -451,6 +471,7 @@ public sealed partial class DesktopAutomationService
         await JsonSerializer.SerializeAsync(stream, value, AutomationJsonOptions, cancellationToken);
     }
 
+    // Shows a Windows toast by running a tiny PowerShell script (the toast API is a Windows Runtime API that is simple to reach from PowerShell). The title and message are XML-escaped first so characters like < or & cannot break the toast XML.
     private async Task<(bool Succeeded, string Error)> TryShowToastNotificationAsync(
         string title,
         string message,
@@ -461,6 +482,8 @@ public sealed partial class DesktopAutomationService
         var xml = "<toast><visual><binding template='ToastGeneric'>" +
                   $"<text>{escapedTitle}</text><text>{escapedMessage}</text>" +
                   "</binding></visual></toast>";
+        // The script is passed as -EncodedCommand (base64 of UTF-16 text), which avoids any quoting problems with the XML inside it. The XML itself goes in a PowerShell here-string.
+        // The notifier name 'Jarvis' is the app name that Windows shows on the toast.
         var script = string.Join(
             Environment.NewLine,
             "Add-Type -AssemblyName System.Runtime.WindowsRuntime",
@@ -493,6 +516,7 @@ public sealed partial class DesktopAutomationService
                 return (false, "PowerShell could not be started for toast delivery.");
             }
 
+            // Both output streams are read while waiting so a full pipe cannot freeze the process.
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
             var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
             await process.WaitForExitAsync(cancellationToken);
@@ -504,6 +528,7 @@ public sealed partial class DesktopAutomationService
                 return (true, string.Empty);
             }
 
+            // A non-zero exit code means PowerShell could not show the toast; its error text (shortened) is returned so it can be stored.
             var error = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
             return (false, TrimForAutomationDisplay(error, 180));
         }
@@ -513,14 +538,8 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // The two ResolveSafe... methods turn the text from the model into a full path and reject protected system locations before any file is touched.
     private string ResolveSafePath(string target)
-    {
-        var resolvedPath = ResolvePath(target);
-        EnsurePathIsAllowed(resolvedPath);
-        return resolvedPath;
-    }
-
-    private string ResolveSafeExistingPath(string target)
     {
         var resolvedPath = ResolvePath(target);
         EnsurePathIsAllowed(resolvedPath);
@@ -543,6 +562,7 @@ public sealed partial class DesktopAutomationService
         return resolvedDestination;
     }
 
+    // Throws if the path is empty or inside a protected system folder.
     private void EnsurePathIsAllowed(string resolvedPath)
     {
         if (string.IsNullOrWhiteSpace(resolvedPath))
@@ -556,6 +576,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Extra delete-only guard: never delete the workspace root itself or a whole drive.
     private bool IsDangerousDeleteTarget(string resolvedPath)
     {
         if (string.IsNullOrWhiteSpace(resolvedPath))
@@ -577,6 +598,7 @@ public sealed partial class DesktopAutomationService
             && string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase);
     }
 
+    // True for the Windows folder, System32, SysWOW64, Program Files (both), and ProgramData, and anything inside them. The path comparison adds a trailing separator so "C:\Windowsfoo" is not mistaken for "C:\Windows".
     private static bool IsProtectedSystemPath(string path)
     {
         var fullPath = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -598,6 +620,7 @@ public sealed partial class DesktopAutomationService
             || fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
     }
 
+    // Copies a folder tree by recursion, overwriting files that already exist.
     private static void CopyDirectory(string sourceDirectory, string destinationDirectory)
     {
         Directory.CreateDirectory(destinationDirectory);
@@ -615,6 +638,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Counts non-overlapping occurrences of the text (exact, case-sensitive), used to report how many replacements were made.
     private static int CountOccurrences(string content, string findText)
     {
         var count = 0;
@@ -636,6 +660,7 @@ public sealed partial class DesktopAutomationService
         return count;
     }
 
+    // Cleans clipboard text for the history: Windows line endings, trimmed, at most 12,000 characters.
     private static string NormalizeClipboardText(string text)
     {
         const int maxChars = 12000;
@@ -649,6 +674,7 @@ public sealed partial class DesktopAutomationService
         return normalized[..maxChars];
     }
 
+    // Working-set memory (the RAM a process is using right now) in readable form, or empty if the process is gone.
     private static string TryDescribeProcessMemory(int processId)
     {
         try
@@ -662,27 +688,21 @@ public sealed partial class DesktopAutomationService
         }
     }
 
-    private static string TrimForAutomationDisplay(string value, int maxLength)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var flattened = value.ReplaceLineEndings(" ").Trim();
-        return flattened.Length <= maxLength ? flattened : flattened[..maxLength] + "...";
-    }
+    // Shortens text to maxLength using the shared Clip extension.
+    private static string TrimForAutomationDisplay(string value, int maxLength) => value.Clip(maxLength);
 
     private string GetClipboardHistoryPath() => JarvisDataPaths.Resolve("data/automation/clipboard-history.json");
 
     private string GetNotificationHistoryPath() => JarvisDataPaths.Resolve("data/automation/notifications.json");
 }
 
+// One saved clipboard-history entry.
 internal sealed record ClipboardHistoryRecord(
     string Id,
     string Text,
     DateTimeOffset CapturedAtUtc);
 
+// One saved notification: whether a toast was shown, and the error if not.
 internal sealed record AutomationNotificationRecord(
     string Id,
     string Title,

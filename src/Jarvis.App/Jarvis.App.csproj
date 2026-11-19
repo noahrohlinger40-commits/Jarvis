@@ -12,6 +12,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
+    <!-- Per-monitor DPI so screen capture, OCR and click coordinates stay physical pixels on mixed-DPI setups. -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <!-- Only for System.Windows.Automation (UIAutomationClient), used to read browser pages. -->
     <UseWPF>true</UseWPF>
   </PropertyGroup>

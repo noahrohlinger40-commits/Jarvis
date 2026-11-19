@@ -1,3 +1,11 @@
+// Tools.cs: the built-in tools Jarvis can run, plus the small types every tool shares.
+// A tool is a class implementing IAssistantTool: a Name (e.g. "weather"), a Description, CanHandle(input) (is this text meant for it?)
+// and ExecuteAsync (does the work, returns a ToolResult). Tools are put in one list in the JarvisAssistant constructor; ORDER MATTERS:
+// the first tool whose CanHandle returns true wins.
+// The planner (AssistantPlanner) turns each Name and Description into a tool definition for the local model with one text argument,
+// input, so the Description is the model's instruction manual. A call is the text "<name> <input>"; ToolSafetyService (ActionSafety.cs)
+// decides allow / ask / block before ExecuteAsync runs. Tools reach the desktop, memory, web and screen through ToolContext.
+// This file holds the core tools and ToolInputHelper; the rest live in siblings such as AppIntegrationTools.cs and AutomationWorkflowTools.cs.
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -8,47 +16,43 @@ using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
+// Everything a tool may need while it runs: settings, memory and transcript stores, desktop automation, weather, web research and screen
+// understanding services, the workspace folder, and whether the planner (the LLM) is available. One is built per assistant and passed to every tool.
 public sealed class ToolContext
 {
     public ToolContext(
         JarvisOptions options,
-        IMemoryStore memoryStore,
-        ITranscriptStore transcriptStore,
+        JsonMemoryStore memoryStore,
+        JsonLineTranscriptStore transcriptStore,
         IDesktopAutomationService desktopAutomation,
         IWeatherService weatherService,
-        IUserStateProvider userStateProvider,
         IWebResearchService webResearchService,
         IVisualContextService visualContextService,
         string workspaceRoot,
         bool plannerAvailable,
-        string plannerStatus,
-        Func<string, bool, CancellationToken, Task<ToolResult>> automationCommandExecutor)
+        string plannerStatus)
     {
         Options = options;
         MemoryStore = memoryStore;
         TranscriptStore = transcriptStore;
         DesktopAutomation = desktopAutomation;
         WeatherService = weatherService;
-        UserStateProvider = userStateProvider;
         WebResearchService = webResearchService;
         VisualContextService = visualContextService;
         WorkspaceRoot = workspaceRoot;
         PlannerAvailable = plannerAvailable;
         PlannerStatus = plannerStatus;
-        AutomationCommandExecutor = automationCommandExecutor;
     }
 
     public JarvisOptions Options { get; }
 
-    public IMemoryStore MemoryStore { get; }
+    public JsonMemoryStore MemoryStore { get; }
 
-    public ITranscriptStore TranscriptStore { get; }
+    public JsonLineTranscriptStore TranscriptStore { get; }
 
     public IDesktopAutomationService DesktopAutomation { get; }
 
     public IWeatherService WeatherService { get; }
-
-    public IUserStateProvider UserStateProvider { get; }
 
     public IWebResearchService WebResearchService { get; }
 
@@ -60,15 +64,11 @@ public sealed class ToolContext
 
     public string PlannerStatus { get; }
 
-    public Func<string, bool, CancellationToken, Task<ToolResult>> AutomationCommandExecutor { get; }
-
-    public Task<ToolResult> ExecuteAutomationCommandAsync(
-        string command,
-        bool bypassApproval,
-        CancellationToken cancellationToken) =>
-        AutomationCommandExecutor(command, bypassApproval, cancellationToken);
+    // The last N finished turns of this session, oldest first; the request being handled is not in it yet.
+    public Func<int, IReadOnlyList<ConversationStateEntry>> RecentTurns { get; init; } = _ => [];
 }
 
+// The outcome of running a tool. ResponseText is what the user sees and hears; the other fields help the planner and the safety layer.
 /// <param name="FollowUpCommand">
 /// Set when the reply asks for the rest of a command ("What should I write down?"). The user's next
 /// input is appended to this command instead of being handled on its own.
@@ -84,8 +84,11 @@ public sealed record ToolResult(
     string VerificationText = "",
     string SummaryText = "",
     string FollowUpCommand = "",
-    bool SpeakInFull = false);
+    bool SpeakInFull = false,
+    // A failure the planner cannot fix (the tool was the right one and got as far as acting). Skips the cheap-route fallback.
+    bool SkipReplan = false);
 
+// The contract every tool follows. See the header of this file for how tools are registered, offered to the model and run.
 public interface IAssistantTool
 {
     string Name { get; }
@@ -97,6 +100,7 @@ public interface IAssistantTool
     Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken);
 }
 
+// Lists every registered tool with its Description. Gets the tool list through a function because the list is still being built when this tool is created.
 public sealed class HelpTool : IAssistantTool
 {
     private readonly Func<IReadOnlyList<IAssistantTool>> _getTools;
@@ -128,6 +132,7 @@ public sealed class HelpTool : IAssistantTool
     }
 }
 
+// Prints a summary of the current settings and capabilities (voice, speech, safety, planner, memory counts).
 public sealed class StatusTool : IAssistantTool
 {
     public string Name => "status";
@@ -163,9 +168,8 @@ public sealed class StatusTool : IAssistantTool
             $"Speech provider: {context.Options.SpeechRecognitionProvider}",
             $"Wake word gate: {(context.Options.WakeWordEnabled ? "enabled" : "disabled")}",
             $"Recognizer culture: {context.Options.RecognizerCulture}",
-            "Desktop automation: enabled for app discovery, visible-window discovery, window management, browser, form, and Chrome DOM workflows, file create/edit/move/copy/delete actions, clipboard history and restore, notifications, macros with rollback support, media controls, Win32 UI control, local network discovery, live computer context, system state, and app adapters for Spotify, VS Code, Office, Chrome, Explorer, Discord, and Slack",
-            $"Visual grounding: screen and window capture, monitor inventory, OCR-style text extraction, structured UI analysis, and document parsing for text/PDF/image inputs ({(string.IsNullOrWhiteSpace(context.Options.PlannerVisionModel) ? "planner vision route inherits the default model" : context.Options.PlannerVisionModel)})",
-            $"Ambient sensing: {(context.Options.AmbientContextEnabled ? "enabled" : "disabled")} | webcam {(string.IsNullOrWhiteSpace(context.Options.AmbientWebcamFramePath) ? "not configured" : "configured")} | room sensors {(string.IsNullOrWhiteSpace(context.Options.AmbientRoomSensorSnapshotPath) ? "not configured" : "configured")} | face recognition {(context.Options.AmbientFaceRecognitionEnabled ? (context.Options.AmbientFaceRecognitionConsentGranted ? "enabled with consent" : "blocked until consent is granted") : "disabled")} | spatial cues {(context.Options.SpatialAudioCuesEnabled ? "enabled" : "disabled")} | far-field {(context.Options.FarFieldListeningEnabled ? "enabled" : "disabled")}",
+            "Desktop automation: enabled for app discovery, visible-window discovery, window management, browser, form, and Chrome DOM workflows, file create/edit/move/copy/delete actions, clipboard history and restore, notifications, media controls, Win32 UI control, local network discovery, live computer context, system state, and app adapters for Spotify, VS Code, Office, Chrome, Explorer, Discord, and Slack",
+            $"Visual grounding: screen and window capture, monitor inventory, OCR-style text extraction, structured UI analysis, and document parsing for text/image inputs ({(string.IsNullOrWhiteSpace(context.Options.PlannerVisionModel) ? "planner vision route inherits the default model" : context.Options.PlannerVisionModel)})",
             $"Shell execution: {(context.Options.ShellExecutionEnabled ? "enabled" : "disabled")}",
             $"Action safety: {(context.Options.SafetyRequireApprovalForMajorActions ? "approval required for shell changes" : "approval disabled")} | {(context.Options.SafetyBlockProtectedSystemPaths ? "protected system paths blocked" : "protected system path blocking disabled")}",
             $"Local AI mode: {(context.Options.LocalAiOnly ? "this computer only; hosted model, voice, and transcription routes blocked" : "remote AI providers permitted")}",
@@ -185,6 +189,7 @@ public sealed class StatusTool : IAssistantTool
     }
 }
 
+// Says the current local date and time.
 public sealed class TimeTool : IAssistantTool
 {
     public string Name => "time";
@@ -204,6 +209,7 @@ public sealed class TimeTool : IAssistantTool
     }
 }
 
+// Saves a note to memory. A "private" note is acknowledged but never written to disk. Text that looks like a password or key is refused.
 public sealed class RememberTool : IAssistantTool
 {
     public string Name => "remember";
@@ -225,6 +231,7 @@ public sealed class RememberTool : IAssistantTool
             return new ToolResult("Usage: remember <note>");
         }
 
+        // Notes starting with private, privately or ephemeral are acknowledged but not stored.
         var isPrivate = content.StartsWith("private ", StringComparison.OrdinalIgnoreCase)
             || content.StartsWith("privately ", StringComparison.OrdinalIgnoreCase)
             || content.StartsWith("ephemeral ", StringComparison.OrdinalIgnoreCase);
@@ -245,6 +252,7 @@ public sealed class RememberTool : IAssistantTool
                     SummaryText: "Private memory was not persisted.");
         }
 
+        // An optional prefix (forever, long term, short term) sets how long the note is kept; saying it counts as the user approving that retention.
         var retentionPolicy = string.Empty;
         var userApprovedRetention = false;
 
@@ -265,6 +273,7 @@ public sealed class RememberTool : IAssistantTool
             break;
         }
 
+        // Refuse to store anything that looks like a password, key or card number.
         if (MemoryAutomation.LooksSensitive(content))
         {
             return new ToolResult(
@@ -297,6 +306,7 @@ public sealed class RememberTool : IAssistantTool
     }
 }
 
+// Searches saved memory for a phrase and shows the top five matches.
 public sealed class RecallTool : IAssistantTool
 {
     public string Name => "recall";
@@ -331,6 +341,7 @@ public sealed class RecallTool : IAssistantTool
     }
 }
 
+// Shows the most recent memories and upcoming reminders.
 public sealed class ListMemoryTool : IAssistantTool
 {
     public string Name => "notes";
@@ -374,6 +385,7 @@ public sealed class ListMemoryTool : IAssistantTool
     }
 }
 
+// Creates a reminder or lists pending ones. If the request lacks a time or a task, it asks for only the missing part.
 public sealed class ReminderTool : IAssistantTool
 {
     public string Name => "reminders";
@@ -436,6 +448,7 @@ public sealed class ReminderTool : IAssistantTool
     }
 }
 
+// Forgets a memory chosen by id prefix or by search. If several memories match, it lists them instead of guessing.
 public sealed class ForgetMemoryTool : IAssistantTool
 {
     public string Name => "forget";
@@ -455,6 +468,7 @@ public sealed class ForgetMemoryTool : IAssistantTool
             return new ToolResult("Usage: forget <id-or-phrase>");
         }
 
+        // First try an id match (full id or a prefix of it); only if that fails, search by phrase.
         var notes = await context.MemoryStore.GetAllAsync(cancellationToken);
         var directMatch = notes.FirstOrDefault(note =>
             string.Equals(note.Id, target, StringComparison.OrdinalIgnoreCase)
@@ -501,6 +515,7 @@ public sealed class ForgetMemoryTool : IAssistantTool
     }
 }
 
+// Shows what Jarvis has learned about the user: preferences, routines, structured memories and pending reminders.
 public sealed class MemoryProfileTool : IAssistantTool
 {
     public string Name => "preferences";
@@ -520,6 +535,7 @@ public sealed class MemoryProfileTool : IAssistantTool
     }
 }
 
+// Explains what Jarvis does and does not keep.
 public sealed class PrivacyTool : IAssistantTool
 {
     public string Name => "privacy";
@@ -546,118 +562,7 @@ public sealed class PrivacyTool : IAssistantTool
     }
 }
 
-public sealed class ExportMemoriesTool : IAssistantTool
-{
-    public string Name => "export memories";
-
-    public string Description => "Export memories to JSON with `export memories <path>`.";
-
-    public bool CanHandle(string input) =>
-        input.Equals("export memories", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("export memories ", StringComparison.OrdinalIgnoreCase)
-        || input.Equals("export memory", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("export memory ", StringComparison.OrdinalIgnoreCase);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var requestedPath = ToolInputHelper.GetCommandTail(input, "export memories", "export memory");
-        var targetPath = ToolInputHelper.ResolveTransferPath(
-            context,
-            requestedPath,
-            "memories",
-            "json");
-        var exportPath = await context.MemoryStore.ExportAsync(targetPath, cancellationToken);
-
-        return new ToolResult(
-            $"Exported memories to {exportPath}",
-            VerificationText: "The memory store wrote a JSON export bundle.",
-            SummaryText: "Exported memories.");
-    }
-}
-
-public sealed class ImportMemoriesTool : IAssistantTool
-{
-    public string Name => "import memories";
-
-    public string Description => "Import memories from JSON or JSONL with `import memories <path>`.";
-
-    public bool CanHandle(string input) =>
-        input.StartsWith("import memories ", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("import memory ", StringComparison.OrdinalIgnoreCase);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var requestedPath = ToolInputHelper.GetCommandTail(input, "import memories", "import memory");
-
-        if (string.IsNullOrWhiteSpace(requestedPath))
-        {
-            return new ToolResult("Usage: import memories <path>");
-        }
-
-        var result = await context.MemoryStore.ImportAsync(ToolInputHelper.ResolveTransferPath(context, requestedPath, "memories", "json"), cancellationToken);
-        return new ToolResult(
-            result.SummaryText,
-            VerificationText: "The memory store processed the import file.",
-            SummaryText: result.SummaryText);
-    }
-}
-
-public sealed class ExportTranscriptsTool : IAssistantTool
-{
-    public string Name => "export transcripts";
-
-    public string Description => "Export transcript history with `export transcripts <path>`.";
-
-    public bool CanHandle(string input) =>
-        input.Equals("export transcripts", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("export transcripts ", StringComparison.OrdinalIgnoreCase)
-        || input.Equals("export transcript", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("export transcript ", StringComparison.OrdinalIgnoreCase);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var requestedPath = ToolInputHelper.GetCommandTail(input, "export transcripts", "export transcript");
-        var targetPath = ToolInputHelper.ResolveTransferPath(
-            context,
-            requestedPath,
-            "transcripts",
-            "jsonl");
-        var exportPath = await context.TranscriptStore.ExportAsync(targetPath, cancellationToken);
-
-        return new ToolResult(
-            $"Exported transcripts to {exportPath}",
-            VerificationText: "The transcript store wrote the export file.",
-            SummaryText: "Exported transcripts.");
-    }
-}
-
-public sealed class ImportTranscriptsTool : IAssistantTool
-{
-    public string Name => "import transcripts";
-
-    public string Description => "Import transcript history from JSON or JSONL with `import transcripts <path>`.";
-
-    public bool CanHandle(string input) =>
-        input.StartsWith("import transcripts ", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("import transcript ", StringComparison.OrdinalIgnoreCase);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var requestedPath = ToolInputHelper.GetCommandTail(input, "import transcripts", "import transcript");
-
-        if (string.IsNullOrWhiteSpace(requestedPath))
-        {
-            return new ToolResult("Usage: import transcripts <path>");
-        }
-
-        var result = await context.TranscriptStore.ImportAsync(ToolInputHelper.ResolveTransferPath(context, requestedPath, "transcripts", "jsonl"), cancellationToken);
-        return new ToolResult(
-            result.SummaryText,
-            VerificationText: "The transcript store processed the import file.",
-            SummaryText: result.SummaryText);
-    }
-}
-
+// Reports current weather for a place, or for the default location from settings.
 public sealed class WeatherTool : IAssistantTool
 {
     public string Name => "weather";
@@ -681,6 +586,7 @@ public sealed class WeatherTool : IAssistantTool
     }
 }
 
+// Makes a Sticky Notes note from dictated words. It can also save "that" (the last reply) or "our conversation" as a note.
 /// <param name="modelGateway">Condenses rambling dictation into a short note; without it the words are only tidied.</param>
 public sealed class WriteDownTool(IModelGateway? modelGateway = null) : IAssistantTool
 {
@@ -729,7 +635,8 @@ public sealed class WriteDownTool(IModelGateway? modelGateway = null) : IAssista
         Press $button 'New note'
         for ($i = 0; $i -lt 20 -and $A::FocusedElement.Current.Name -notlike 'Note editor*'; $i++) { Start-Sleep -Milliseconds 150 }
         if ($A::FocusedElement.Current.Name -notlike 'Note editor*') { 'The new note did not open for typing.'; exit 1 }
-        $shell.SendKeys(($env:JARVIS_NOTE_TEXT -replace '([+^%~(){}\[\]])', '{$1}'))
+        # A .NET exception does not stop a script, so a failed typing step would still print ok. The loops above rely on that to retry; only this step must not.
+        try { $shell.SendKeys(($env:JARVIS_NOTE_TEXT -replace '([+^%~(){}\[\]])', '{$1}')) } catch { "Could not type the note: $($_.Exception.Message)"; exit 1 }
         'ok'
         """;
 
@@ -747,8 +654,16 @@ public sealed class WriteDownTool(IModelGateway? modelGateway = null) : IAssista
             return new ToolResult("What should I write down?", FollowUpCommand: "write down");
         }
 
-        text = await StickyNoteText.CondenseAsync(modelGateway, text, DateTime.Now, cancellationToken);
+        var (note, reply) = await ResolveNoteAsync(text, context, cancellationToken);
 
+        if (reply is not null)
+        {
+            return reply;
+        }
+
+        text = note;
+
+        // Launch a hidden Windows PowerShell with the script above. -EncodedCommand takes the script as Base64 text in UTF-16.
         var startInfo = new ProcessStartInfo("powershell.exe")
         {
             UseShellExecute = false,
@@ -762,19 +677,121 @@ public sealed class WriteDownTool(IModelGateway? modelGateway = null) : IAssista
         // Passed through the environment so no quoting or escaping of the dictated text is needed.
         startInfo.Environment["JARVIS_NOTE_TEXT"] = text;
 
-        using var process = Process.Start(startInfo)!;
-        var output = (await process.StandardOutput.ReadToEndAsync(cancellationToken)).Trim();
-        await process.WaitForExitAsync(cancellationToken);
+        // Exit code 0 means the script printed ok; otherwise its printed text is the reason shown to the user.
+        try
+        {
+            using var process = Process.Start(startInfo)!;
+            var output = (await process.StandardOutput.ReadToEndAsync(cancellationToken)).Trim();
+            await process.WaitForExitAsync(cancellationToken);
 
-        return process.ExitCode == 0
-            ? new ToolResult($"Added a sticky note: \"{text}\"")
-            : new ToolResult($"I couldn't add the sticky note. {output}", Succeeded: false);
+            if (process.ExitCode == 0)
+            {
+                return new ToolResult($"Added a sticky note: \"{text}\"");
+            }
+
+            return NoteFailure(output.Length > 0 ? output : $"PowerShell exited with code {process.ExitCode}.", text);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return NoteFailure(exception.Message, text);
+        }
+    }
+
+    /// <summary>The note's words, or a reply when there is nothing to save. Split from ExecuteAsync so tests never reach the desktop script.</summary>
+    public async Task<(string Note, ToolResult? Reply)> ResolveNoteAsync(string text, ToolContext context, CancellationToken cancellationToken)
+    {
+        var reference = ReferenceKind(text);
+
+        if (reference == NoteReference.None)
+        {
+            text = await StickyNoteText.CondenseAsync(modelGateway, text, DateTime.Now, cancellationToken);
+        }
+        else
+        {
+            var turns = context.RecentTurns(reference == NoteReference.Conversation ? ConversationTurns : 1);
+
+            if (turns.Count == 0)
+            {
+                return (string.Empty, new ToolResult("I don't have anything from this conversation to write down yet. What should I write down?", FollowUpCommand: "write down"));
+            }
+
+            // "Add that" after a failed note retries the same note, already condensed.
+            if (reference == NoteReference.LastExchange && FailedNoteText(turns[^1].ResponseText) is { } failedNote)
+            {
+                text = failedNote;
+            }
+            else
+            {
+                text = await StickyNoteText.CondenseAsync(modelGateway, text, DateTime.Now, cancellationToken, SourceText(turns));
+
+                if (text.Length == 0)
+                {
+                    return (string.Empty, new ToolResult("I couldn't work out a note from that, so I didn't save one. What should I write down?", FollowUpCommand: "write down"));
+                }
+            }
+        }
+
+        return (text, null);
+    }
+
+    /// <summary>
+    /// The note step failed after the text was condensed. The words go back to the user and the planner is skipped,
+    /// because the planner would turn the dictation into chat steps, write no note and show no failure.
+    /// </summary>
+    public static ToolResult NoteFailure(string reason, string text) =>
+        new($"I couldn't save the sticky note: {reason.Trim()} Here is the note so you can copy it: \"{text}\"",
+            Succeeded: false, SkipReplan: true);
+
+    // What a "write down" request points at: its own words (None), the previous exchange ("that", "what you just said"), or the recent conversation.
+    public enum NoteReference { None, LastExchange, Conversation }
+
+    // How many recent turns count as "the conversation", and the most characters of conversation text sent to the model (the newest are kept).
+    private const int ConversationTurns = 6;
+    private const int SourceCap = 4000;
+
+    // "add that to the sticky note" and "write down our last conversation" name something instead of saying it, so the tool
+    // would only see those words. A word like "that" is a reference only when nothing else follows; the conversation phrases
+    // need our/this/last/previous, so "the conversation with Sam" is text. Examples: "our last conversation", "everything we
+    // talked about so far", "this conversation we just had". They must be the whole request, so "our conversation tomorrow
+    // is cancelled" stays plain text; "we had" may run on.
+    private static readonly Regex ConversationRegex = new(
+        @"^(?:(?:all|everything|anything)\s+(?:of\s+|from\s+|in\s+)?)?(?:(?:our|this|(?:the\s+)?(?:last|previous|recent))\s+(?:(?:last|previous|recent|whole|entire)\s+)*conversation(?:\s+we\s+(?:just\s+)?had\b(?!\s+with\b).*)?|what\s+we\s+(?:just\s+)?(?:talked|spoke|chatted)\s+about|what\s+we\s+(?:just\s+)?(?:discussed|said))(?:\s+(?:so\s+far|today|tonight|earlier|just\s+now))?$",
+        RegexOptions.IgnoreCase);
+
+    // Matches phrases that name the previous exchange, e.g. "that", "it down", "what you just said", "your last answer". Whole request only.
+    private static readonly Regex LastExchangeRegex = new(
+        @"^(?:(?:that|this|it)(?:\s+down)?|(?:what|everything)\s+(?:you|i)\s+(?:just\s+)?(?:said|told\s+me|answered|replied)|the\s+(?:last|previous)\s+(?:thing|answer|reply|response)(?:\s+you\s+(?:said|told\s+me))?|your\s+(?:last\s+|previous\s+)?(?:answer|reply|response))$",
+        RegexOptions.IgnoreCase);
+
+    // Classifies the dictated text as a reference to earlier conversation or as plain text to save. Matched on the exact whole phrase.
+    public static NoteReference ReferenceKind(string text)
+    {
+        var trimmed = text.Trim(' ', '.', ',', ':', ';', '!', '?', '-');
+        return ConversationRegex.IsMatch(trimmed) ? NoteReference.Conversation
+            : LastExchangeRegex.IsMatch(trimmed) ? NoteReference.LastExchange
+            : NoteReference.None;
+    }
+
+    /// <summary>The words of a note that failed to save, from the reply <see cref="NoteFailure"/> gave.</summary>
+    public static string? FailedNoteText(string response)
+    {
+        var match = Regex.Match(response ?? string.Empty, "Here is the note so you can copy it: \"(?<note>.+)\"\\s*$", RegexOptions.Singleline);
+        return match.Success ? match.Groups["note"].Value : null;
+    }
+
+    /// <summary>The turns as labelled text for the model, newest kept when the cap trims.</summary>
+    public static string SourceText(IReadOnlyList<ConversationStateEntry> turns)
+    {
+        var text = string.Join("\n\n", turns.Select(turn => $"User: {turn.UserInput.Trim()}\nJarvis: {turn.ResponseText.Trim()}"));
+        return text.Length <= SourceCap ? text : text[^SourceCap..];
     }
 }
 
+// Cleans up dictated text for a sticky note, using the model when it is available and a simple filler-word clean-up when it is not.
 /// <summary>Turns natural dictation ("so um tomorrow I need to grab milk and eggs after class") into a sticky note.</summary>
 public static partial class StickyNoteText
 {
+    // Prompt text sent to the model to condense dictation. Wording matters: the rules and examples steer it away from inventing details.
     private const string Instructions =
         "You turn dictated speech into a short sticky note. Write the note itself, never a reply to the user.\n"
         + "- Keep every concrete detail: times, places, amounts, and names or titles exactly as said (\"IT Professions exam\", not \"IT exam\").\n"
@@ -787,9 +804,21 @@ public static partial class StickyNoteText
         + "Dictated: so um I need to grab paper towels and uh dish soap -> Grab paper towels, dish soap\n"
         + "Dictated: can you write down that the wifi password for the lab is blue falcon 42 -> Lab wifi password: blue falcon 42";
 
-    public static async Task<string> CondenseAsync(IModelGateway? gateway, string dictated, DateTime now, CancellationToken cancellationToken)
+    // Without this the model, given only the request sentence, invents a note about the conversation.
+    private const string SourceInstructions =
+        "\nThe input is not dictation but part of the conversation between User and Jarvis. Write the note from what is said there and nothing else; "
+        + "add no fact, name, time or day that does not appear in it.\n"
+        // At 15 words a sample with a due date and a meeting kept only the meeting. 30 words still fits Accept's 200 characters.
+        + "For this note the limit is 30 words: keep every separate fact, task, date and time, separated by commas, and leave out greetings and small talk. "
+        + "If there is nothing but greetings and small talk, reply with the single word none.";
+
+    // Asks the model to condense the dictation (12 second limit). With source text the model sees only the earlier conversation, never the request itself.
+    // If the model is missing, slow, errors, or gives an unrelated answer, the fallback is used instead. Day words are turned into dates at the end.
+    /// <param name="source">Earlier turns the note is about ("add that", "our conversation"). The model sees only these, never the request;
+    /// with no usable note the result is empty, since tidying the request sentence would save the request itself as the note.</param>
+    public static async Task<string> CondenseAsync(IModelGateway? gateway, string dictated, DateTime now, CancellationToken cancellationToken, string? source = null)
     {
-        var fallback = Tidy(dictated);
+        var fallback = source is null ? Tidy(dictated) : string.Empty;
 
         if (gateway is not { IsAvailable: true })
         {
@@ -803,14 +832,14 @@ public static partial class StickyNoteText
             var response = await gateway.CompleteAsync(
                 new ChatCompletionRequest(
                     [
-                        new ChatMessage("system", [ChatMessageContentPart.FromText(Instructions)]),
-                        new ChatMessage("user", [ChatMessageContentPart.FromText($"Dictated: {dictated}")])
+                        new ChatMessage("system", [ChatMessageContentPart.FromText(source is null ? Instructions : Instructions + SourceInstructions)]),
+                        new ChatMessage("user", [ChatMessageContentPart.FromText(source is null ? $"Dictated: {dictated}" : $"Conversation:\n{source}")])
                     ],
                     Temperature: 0.1),
                 ModelRoute.Fast,
                 timeout.Token);
 
-            return ResolveDays(Accept(response.Content, dictated) ?? fallback, now);
+            return ResolveDays(Accept(response.Content, source ?? dictated) ?? fallback, now);
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
@@ -864,6 +893,7 @@ public static partial class StickyNoteText
         return ContentWords(note).Any(said.Contains) ? char.ToUpperInvariant(note[0]) + note[1..] : null;
     }
 
+    // Fallback when the model is unavailable: just removes filler words (um, uh, erm, you know) and tidies spaces and capitals.
     public static string Tidy(string dictated)
     {
         var note = Regex.Replace(dictated, @"\b(?:um+|uh+|erm|you know)\b,?\s*", string.Empty, RegexOptions.IgnoreCase);
@@ -876,13 +906,16 @@ public static partial class StickyNoteText
     [GeneratedRegex(@"\b(?:(?<next>next)\s+|(?:this|coming)\s+)?(?<word>today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b(?!\s*\d{1,2}/\d{1,2})", RegexOptions.IgnoreCase)]
     private static partial Regex DayWordRegex();
 
+    // The lowercase words of 3+ letters or digits, used to check that a model-written note shares words with what was said.
     private static HashSet<string> ContentWords(string text) =>
         Regex.Matches(text.ToLowerInvariant(), @"[a-z0-9]{3,}").Select(match => match.Value).ToHashSet();
 
+    // Matches a reasoning block (think tags) that some models print before the answer, so it can be removed.
     [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
     private static partial Regex ThinkBlockRegex();
 }
 
+// Puts the computer to sleep a few seconds after replying, so the reply can be shown and spoken first.
 public sealed class SleepTool : IAssistantTool
 {
     public string Name => "sleep";
@@ -911,6 +944,7 @@ public sealed class SleepTool : IAssistantTool
         return Task.FromResult(new ToolResult("Going to sleep. Goodnight!"));
     }
 
+    // Windows power-management calls, loaded straight from the system DLLs (P/Invoke).
     [System.Runtime.InteropServices.DllImport("powrprof.dll")]
     private static extern bool IsPwrSuspendAllowed();
 
@@ -921,6 +955,7 @@ public sealed class SleepTool : IAssistantTool
     private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 }
 
+// Shows computer status: drives, process count and similar.
 public sealed class SystemStateTool : IAssistantTool
 {
     public string Name => "system";
@@ -939,6 +974,7 @@ public sealed class SystemStateTool : IAssistantTool
     }
 }
 
+// Shows live desktop context: active window, visible apps, workspace files and system state. Many phrasings are accepted.
 public sealed class ComputerContextTool : IAssistantTool
 {
     public string Name => "computer";
@@ -962,6 +998,7 @@ public sealed class ComputerContextTool : IAssistantTool
     }
 }
 
+// Network overview, device scan or health check, or details for one IP or host. The desktop service does the real work.
 public sealed class NetworkTool : IAssistantTool
 {
     public string Name => "network";
@@ -996,6 +1033,7 @@ public sealed class NetworkTool : IAssistantTool
             SummaryText: response.ReplaceLineEndings(" ").Trim());
     }
 
+    // Maps the many ways of asking onto "scan", "health", empty (overview) or a specific host.
     private static string ParseNetworkTarget(string input)
     {
         var normalized = input.Trim();
@@ -1026,6 +1064,7 @@ public sealed class NetworkTool : IAssistantTool
     }
 }
 
+// Turns NordVPN on or off, or reports its state, by running NordVPN's own command line and polling until it takes effect.
 public sealed class VpnTool : IAssistantTool
 {
     public string Name => "vpn";
@@ -1036,6 +1075,7 @@ public sealed class VpnTool : IAssistantTool
 
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
+        // Read the state first: status needs no change, an unknown word is refused, and asking for the state it already has does nothing.
         var action = ToolInputHelper.GetCommandTail(input, "vpn").Trim().ToLowerInvariant();
         var isOn = IsConnected();
 
@@ -1107,6 +1147,7 @@ public sealed class VpnTool : IAssistantTool
     }
 }
 
+// Lists installed or running apps, optionally filtered by name.
 public sealed class ApplicationsTool : IAssistantTool
 {
     public string Name => "apps";
@@ -1130,6 +1171,7 @@ public sealed class ApplicationsTool : IAssistantTool
     }
 }
 
+// Focuses an app that is already running, or launches it.
 public sealed class OpenApplicationTool : IAssistantTool
 {
     public string Name => "open app";
@@ -1148,6 +1190,7 @@ public sealed class OpenApplicationTool : IAssistantTool
     }
 }
 
+// Opens a file or folder with its default program. Opening a program or script asks for approval first (see ActionSafety.cs).
 public sealed class OpenPathTool : IAssistantTool
 {
     public string Name => "open path";
@@ -1166,6 +1209,7 @@ public sealed class OpenPathTool : IAssistantTool
     }
 }
 
+// Lists the files in a folder.
 public sealed class ListFilesTool : IAssistantTool
 {
     public string Name => "list files";
@@ -1184,6 +1228,7 @@ public sealed class ListFilesTool : IAssistantTool
     }
 }
 
+// Shows a preview of a text file.
 public sealed class ReadFileTool : IAssistantTool
 {
     public string Name => "read file";
@@ -1202,11 +1247,12 @@ public sealed class ReadFileTool : IAssistantTool
     }
 }
 
+// Searches common user folders (Desktop, OneDrive Desktop, Documents, Downloads) for files by name.
 public sealed class FindFilesTool : IAssistantTool
 {
     public string Name => "find files";
 
-    public string Description => "Search the workspace for matching files with `find files <term>`.";
+    public string Description => "Search your Desktop, OneDrive Desktop, Documents and Downloads by name with `find files <term>`.";
 
     public bool CanHandle(string input) =>
         input.StartsWith("find files", StringComparison.OrdinalIgnoreCase) ||
@@ -1220,11 +1266,12 @@ public sealed class FindFilesTool : IAssistantTool
     }
 }
 
+// Opens a website or a known site name in the browser.
 public sealed class BrowseTool : IAssistantTool
 {
     public string Name => "browse";
 
-    public string Description => "Open a website with `browse <url>` or `go to <site>`.";
+    public string Description => "Open a website in the browser with `browse <url>` or `go to <site>`; site names work too: teams, discord, linkedin, linkedin messages, notion, canvas, github, figma.";
 
     public bool CanHandle(string input) =>
         input.StartsWith("browse", StringComparison.OrdinalIgnoreCase) ||
@@ -1239,6 +1286,7 @@ public sealed class BrowseTool : IAssistantTool
     }
 }
 
+// Runs a web search in the browser.
 public sealed class SearchWebTool : IAssistantTool
 {
     public string Name => "search web";
@@ -1256,88 +1304,7 @@ public sealed class SearchWebTool : IAssistantTool
     }
 }
 
-public sealed class EmailTool : IAssistantTool
-{
-    public string Name => "email";
-
-    public string Description => "Show email-aware planning context from the local user-state snapshot.";
-
-    public bool CanHandle(string input) =>
-        input.Equals("email", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("emails", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("inbox", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("email context", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("show email", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("show emails", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("list emails", StringComparison.OrdinalIgnoreCase);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var snapshot = await context.UserStateProvider.GetSnapshotAsync(cancellationToken);
-
-        if (snapshot.EmailItems.Length == 0)
-        {
-            return new ToolResult(
-                "No email context is available in the local user-state snapshot.",
-                Succeeded: false,
-                VerificationText: "The user-state snapshot did not contain email items.",
-                SummaryText: "No email items are available.");
-        }
-
-        var lines = snapshot.EmailItems
-            .Take(8)
-            .Select(item =>
-            {
-                var unread = item.IsUnread ? " | unread" : string.Empty;
-                return $"- {item.Title} | {item.Detail}{unread}";
-            });
-
-        return new ToolResult(
-            "Email context:" + Environment.NewLine + string.Join(Environment.NewLine, lines),
-            VerificationText: $"Loaded {snapshot.EmailItems.Length} email item(s) from the local user-state snapshot.",
-            SummaryText: $"Loaded {snapshot.EmailItems.Length} email item(s).");
-    }
-}
-
-public sealed class TasksTool : IAssistantTool
-{
-    public string Name => "tasks";
-
-    public string Description => "Show task-aware planning context from the current user-state snapshot.";
-
-    public bool CanHandle(string input) =>
-        input.Equals("tasks", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("todo", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("task", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("task context", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("show tasks", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("list tasks", StringComparison.OrdinalIgnoreCase) ||
-        input.Equals("show todo", StringComparison.OrdinalIgnoreCase);
-
-    public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        var snapshot = await context.UserStateProvider.GetSnapshotAsync(cancellationToken);
-
-        if (snapshot.TaskItems.Length == 0)
-        {
-            return new ToolResult(
-                "No task context is available in the local user-state snapshot.",
-                Succeeded: false,
-                VerificationText: "The user-state snapshot did not contain task items.",
-                SummaryText: "No task items are available.");
-        }
-
-        var lines = snapshot.TaskItems
-            .Take(8)
-            .Select(item => $"- {item.Title} | {item.Detail}{(string.IsNullOrWhiteSpace(item.DueAt) ? string.Empty : $" | {item.DueAt}")}");
-
-        return new ToolResult(
-            "Task context:" + Environment.NewLine + string.Join(Environment.NewLine, lines),
-            VerificationText: $"Loaded {snapshot.TaskItems.Length} task item(s) from the local user-state snapshot.",
-            SummaryText: $"Loaded {snapshot.TaskItems.Length} task item(s).");
-    }
-}
-
+// Web research that returns cited sources, using the research service. Reports offline status separately from "no results".
 public sealed class ResearchTool : IAssistantTool
 {
     public string Name => "research";
@@ -1385,6 +1352,7 @@ public sealed class ResearchTool : IAssistantTool
     }
 }
 
+// Screen tools: list monitors, capture, read text (OCR), find UI elements, or answer a question about what is on screen.
 public sealed class ScreenTool : IAssistantTool
 {
     public string Name => "screen";
@@ -1408,6 +1376,7 @@ public sealed class ScreenTool : IAssistantTool
         ToolInputHelper.StartsWithCommand(input, "screen ui") ||
         ToolInputHelper.StartsWithCommand(input, "screen elements");
 
+    // The first matching branch wins; with no sub-command the text after "screen" is treated as a question about the current screen.
     public Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
         if (ToolInputHelper.MatchesExact(input, "monitors", "show monitors", "list monitors", "displays", "show displays", "list displays"))
@@ -1446,61 +1415,7 @@ public sealed class ScreenTool : IAssistantTool
     }
 }
 
-public sealed class AmbientTool : IAssistantTool
-{
-    public string Name => "ambient";
-
-    public string Description => "Inspect webcam-fed room context and sensor hooks. Use `ambient`, `ambient webcam`, `ambient presence`, `ambient face`, or `ambient room`.";
-
-    public bool CanHandle(string input) =>
-        ToolInputHelper.StartsWithCommand(input, "ambient") ||
-        ToolInputHelper.StartsWithCommand(input, "webcam") ||
-        ToolInputHelper.StartsWithCommand(input, "camera") ||
-        ToolInputHelper.StartsWithCommand(input, "presence") ||
-        ToolInputHelper.StartsWithCommand(input, "gesture") ||
-        ToolInputHelper.StartsWithCommand(input, "face recognition") ||
-        ToolInputHelper.StartsWithCommand(input, "face") ||
-        ToolInputHelper.StartsWithCommand(input, "room sensors") ||
-        ToolInputHelper.StartsWithCommand(input, "far field") ||
-        ToolInputHelper.StartsWithCommand(input, "spatial audio");
-
-    public Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
-    {
-        if (ToolInputHelper.MatchesExact(input, "ambient"))
-        {
-            return context.VisualContextService.AnalyzeAmbientContextAsync(string.Empty, cancellationToken);
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "ambient"))
-        {
-            var payload = ToolInputHelper.GetCommandTail(input, "ambient");
-            return context.VisualContextService.AnalyzeAmbientContextAsync(payload, cancellationToken);
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "webcam")
-            || ToolInputHelper.StartsWithCommand(input, "camera"))
-        {
-            var payload = ToolInputHelper.GetCommandTail(input, "webcam", "camera");
-            return context.VisualContextService.AnalyzeAmbientContextAsync(
-                string.IsNullOrWhiteSpace(payload) ? "webcam" : $"webcam {payload}",
-                cancellationToken);
-        }
-
-        if (ToolInputHelper.StartsWithCommand(input, "presence")
-            || ToolInputHelper.StartsWithCommand(input, "gesture")
-            || ToolInputHelper.StartsWithCommand(input, "face recognition")
-            || ToolInputHelper.StartsWithCommand(input, "face")
-            || ToolInputHelper.StartsWithCommand(input, "room sensors")
-            || ToolInputHelper.StartsWithCommand(input, "far field")
-            || ToolInputHelper.StartsWithCommand(input, "spatial audio"))
-        {
-            return context.VisualContextService.AnalyzeAmbientContextAsync(input.Trim(), cancellationToken);
-        }
-
-        return context.VisualContextService.AnalyzeAmbientContextAsync(string.Empty, cancellationToken);
-    }
-}
-
+// Describes an image file, optionally answering a question about it (path :: question).
 public sealed class AnalyzeImageTool : IAssistantTool
 {
     public string Name => "analyze image";
@@ -1518,11 +1433,12 @@ public sealed class AnalyzeImageTool : IAssistantTool
     }
 }
 
+// Reads a text or image-based document, optionally answering a question about it (path :: question).
 public sealed class AnalyzeDocumentTool : IAssistantTool
 {
     public string Name => "analyze document";
 
-    public string Description => "Analyze a text, PDF, or image-based document. Format: `analyze document <path>` or `analyze document <path> :: <question>`.";
+    public string Description => "Analyze a text or image-based document. Format: `analyze document <path>` or `analyze document <path> :: <question>`.";
 
     public bool CanHandle(string input) =>
         input.StartsWith("analyze document", StringComparison.OrdinalIgnoreCase) ||
@@ -1535,6 +1451,7 @@ public sealed class AnalyzeDocumentTool : IAssistantTool
     }
 }
 
+// Runs a PowerShell command. Off unless shellExecutionEnabled is set. Whether it runs freely, asks first or is blocked is decided in ActionSafety.cs.
 public sealed class ShellTool : IAssistantTool
 {
     public string Name => "run";
@@ -1569,6 +1486,7 @@ public sealed class ShellTool : IAssistantTool
                 SummaryText: "Missing PowerShell command.");
         }
 
+        // A result starting with "Command failed" or "Shell process failed" is how failure is recognised, because the helper below returns text, not an error.
         var output = await ExecutePowerShellAsync(command, context.WorkspaceRoot, cancellationToken);
         var failed = output.StartsWith("Command failed", StringComparison.OrdinalIgnoreCase)
             || output.StartsWith("Shell process failed", StringComparison.OrdinalIgnoreCase);
@@ -1582,7 +1500,12 @@ public sealed class ShellTool : IAssistantTool
             SummaryText: output.ReplaceLineEndings(" ").Trim());
     }
 
-    private static async Task<string> ExecutePowerShellAsync(string command, string workspaceRoot, CancellationToken cancellationToken)
+    // ponytail: one fixed deadline for every command; make it a setting if long installs ever need more.
+    private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(120);
+
+    // Runs a command in a hidden PowerShell and returns its output as text, with a 120 second time limit. The command is passed Base64-encoded
+    // (UTF-16, as PowerShell's -EncodedCommand expects) so quotes and special characters in it cannot break the command line.
+    private static async Task<string> ExecutePowerShellAsync(string command, string workspaceRoot, CancellationToken cancellationToken, TimeSpan? timeout = null)
     {
         var encodedCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
         var startInfo = new ProcessStartInfo
@@ -1603,10 +1526,25 @@ public sealed class ShellTool : IAssistantTool
             return "Shell process failed to start.";
         }
 
+        // Output is read while the process runs, so a full output buffer cannot make the process hang.
         var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        var deadline = timeout ?? CommandTimeout;
+        using var deadlineSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadlineSource.CancelAfter(deadline);
+        var timedOut = false;
 
-        await process.WaitForExitAsync(cancellationToken);
+        try
+        {
+            await process.WaitForExitAsync(deadlineSource.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelling the wait leaves the child running, so stop the whole tree ourselves.
+            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            cancellationToken.ThrowIfCancellationRequested();
+            timedOut = true;
+        }
 
         var stdout = await stdoutTask;
         var stderr = await stderrTask;
@@ -1615,6 +1553,12 @@ public sealed class ShellTool : IAssistantTool
             new[] { stdout.Trim(), stderr.Trim() }.Where(text => !string.IsNullOrWhiteSpace(text)));
 
         var trimmedOutput = TrimOutput(combined);
+
+        if (timedOut)
+        {
+            return $"Command was stopped after {deadline.TotalSeconds:0} seconds without finishing."
+                + (string.IsNullOrWhiteSpace(trimmedOutput) ? string.Empty : Environment.NewLine + trimmedOutput);
+        }
 
         if (process.ExitCode == 0)
         {
@@ -1628,6 +1572,7 @@ public sealed class ShellTool : IAssistantTool
             : $"Command failed with exit code {process.ExitCode}:{Environment.NewLine}{trimmedOutput}";
     }
 
+    // Cuts long output to 2000 characters so it does not flood the screen or the model.
     private static string TrimOutput(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -1647,6 +1592,7 @@ public sealed class ShellTool : IAssistantTool
     }
 }
 
+// Ends the assistant.
 public sealed class ExitTool : IAssistantTool
 {
     public string Name => "exit";
@@ -1664,8 +1610,23 @@ public sealed class ExitTool : IAssistantTool
     }
 }
 
+// Helper functions shared by many tools (also used by AppIntegrationTools.cs and other tool files).
 internal static class ToolInputHelper
 {
+    // Shortens text to one line of at most max characters, adding "..." when cut.
+    internal static string Clip(this string text, int max)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var flattened = text.ReplaceLineEndings(" ").Trim();
+        return flattened.Length <= max ? flattened : flattened[..max] + "...";
+    }
+
+    // Returns what follows the first matching command prefix, minus leading spaces and separators. For prefixes "open app" and "launch",
+    // "open app, chrome" gives "chrome". Put longer prefixes first, because the first match wins. Empty if none match.
     public static string GetCommandTail(string input, params string[] prefixes)
     {
         foreach (var prefix in prefixes)
@@ -1681,17 +1642,20 @@ internal static class ToolInputHelper
         return string.Empty;
     }
 
+    // True if the input equals any of the given phrases (ignoring case).
     public static bool MatchesExact(string input, params string[] values)
     {
         return values.Any(value => input.Equals(value, StringComparison.OrdinalIgnoreCase));
     }
 
+    // True if the input is exactly the command word or starts with it followed by a space, so "screen" matches but "screenshot" does not.
     public static bool StartsWithCommand(string input, string value)
     {
         return input.Equals(value, StringComparison.OrdinalIgnoreCase)
             || input.StartsWith(value + " ", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Formats one memory as a single line: date, text, then extras like id, app, location, reminder time and retention.
     public static string RenderMemoryLine(MemoryNote note)
     {
         var details = new List<string>();
@@ -1740,6 +1704,7 @@ internal static class ToolInputHelper
         return $"- {note.CreatedAtUtc:yyyy-MM-dd HH:mm}Z | {note.Content}{suffix}";
     }
 
+    // Formats one reminder as a single line with id, text, due time and status.
     public static string RenderReminderLine(MemoryNote note)
     {
         var due = note.ReminderAtUtc?.ToLocalTime().ToString("yyyy-MM-dd h:mm tt") ?? "unscheduled";
@@ -1747,6 +1712,8 @@ internal static class ToolInputHelper
         return $"- {ShortId(note.Id)} | {text} | due {due} | status {MemoryPolicies.NormalizeReminderStatus(note.ReminderStatus)}";
     }
 
+    // Collects the current context (active app and window, time of day, location) to store with a memory. If the desktop cannot be read,
+    // it still returns a basic snapshot so saving a note never fails because of it.
     public static async Task<InteractionContextSnapshot> BuildInteractionContextAsync(
         ToolContext context,
         string recentActivity,
@@ -1773,6 +1740,7 @@ internal static class ToolInputHelper
         }
     }
 
+    // Builds the context used to rank memory search results, from the query plus the current desktop context.
     public static async Task<MemoryQueryContext> BuildMemoryQueryContextAsync(
         ToolContext context,
         string query,
@@ -1788,33 +1756,7 @@ internal static class ToolInputHelper
             interactionContext.SafeRecentActivity);
     }
 
-    public static string ResolveTransferPath(
-        ToolContext context,
-        string requestedPath,
-        string prefix,
-        string defaultExtension)
-    {
-        if (string.IsNullOrWhiteSpace(requestedPath))
-        {
-            return JarvisDataPaths.Resolve(Path.Combine(
-                "data",
-                "exports",
-                $"{prefix}-{DateTimeOffset.Now:yyyyMMdd-HHmmss}.{defaultExtension.TrimStart('.')}"));
-        }
-
-        var trimmed = Environment.ExpandEnvironmentVariables(requestedPath.Trim().Trim('"'));
-
-        if (trimmed.StartsWith('~'))
-        {
-            var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            trimmed = Path.Combine(userProfile, trimmed[1..].TrimStart('\\', '/'));
-        }
-
-        return Path.IsPathRooted(trimmed)
-            ? Path.GetFullPath(trimmed)
-            : Path.GetFullPath(Path.Combine(context.WorkspaceRoot, trimmed));
-    }
-
+    // The default weather location from settings, used as the user's rough location.
     private static string ResolveLocation(ToolContext context)
     {
         return string.IsNullOrWhiteSpace(context.Options.DefaultWeatherLocation)
@@ -1822,6 +1764,7 @@ internal static class ToolInputHelper
             : context.Options.DefaultWeatherLocation.Trim();
     }
 
+    // The first 8 characters of an id, which is enough to refer to a memory.
     private static string ShortId(string id)
     {
         return string.IsNullOrWhiteSpace(id)

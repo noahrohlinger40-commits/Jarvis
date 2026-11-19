@@ -1,7 +1,12 @@
+// The rules for how long a memory lives, how important it is, and whether a reminder is still open.
+// Used by JsonMemoryStore.cs whenever it saves, updates, filters or ranks notes (and by MemorySemanticSearch.cs for the
+// importance and reminder bonuses). All numbers below are hand-picked tuning values, not derived from anything.
 namespace Jarvis.Core;
 
+// Stateless helper methods; nothing is stored here.
 internal static class MemoryPolicies
 {
+    // Maps synonyms onto the canonical names (e.g. 'permanent' becomes 'forever'); unknown words are kept as typed, an empty value stays empty.
     public static string NormalizeRetentionPolicy(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -22,6 +27,8 @@ internal static class MemoryPolicies
         };
     }
 
+    // Chooses a retention policy for a new note: the requested one if any, else by kind: reminders last until done, summaries
+    // are 'rolling', preferences/entities/relationships (and routines, habits, favorites) are 'long', everything else is 'standard'.
     public static string ResolveRetentionPolicy(MemoryWriteRequest request)
     {
         var normalized = NormalizeRetentionPolicy(request.RetentionPolicy);
@@ -60,6 +67,7 @@ internal static class MemoryPolicies
         return "standard";
     }
 
+    // Expiry for a new note: an explicit date if given, otherwise derived from its retention policy. Null means never expires.
     public static DateTimeOffset? ResolveExpiryUtc(MemoryWriteRequest request, DateTimeOffset createdAtUtc)
     {
         if (request.ExpiresAtUtc is not null)
@@ -70,6 +78,8 @@ internal static class MemoryPolicies
         return ResolveExpiryUtc(ResolveRetentionPolicy(request), createdAtUtc, request.ReminderAtUtc, request.ReminderStatus);
     }
 
+    // Turns a retention policy into an expiry date counted from creation: forever = never, long = 365 days, standard = 180, episodic = 90,
+    // rolling = 45, short = 30. An unfinished reminder never expires; a finished one lingers 14 days past its due time. Unknown policies use 180.
     public static DateTimeOffset? ResolveExpiryUtc(
         string retentionPolicy,
         DateTimeOffset createdAtUtc,
@@ -92,6 +102,9 @@ internal static class MemoryPolicies
         };
     }
 
+    // Importance from 0.05 to 1: starts from a base by kind (reminder 0.82 ... plain note 0.36), then adds small bonuses
+    // for manual entry, user-approved retention, longer text, wording like 'always' or 'never', attached entities, a reminder
+    // time and routine-style categories (preferences get a little extra by category, e.g. address +0.08). An explicit score wins.
     public static double ResolveImportanceScore(MemoryWriteRequest request)
     {
         if (request.ImportanceScore is double explicitScore)
@@ -170,6 +183,8 @@ internal static class MemoryPolicies
         return ClampImportance(score);
     }
 
+    // Recomputes importance for an existing note: the same base rules, plus up to +0.14 for being seen repeatedly (0.025 per extra sighting)
+    // and up to +0.06 for being seen recently, which fades to zero over a year.
     public static double ResolveImportanceScore(MemoryNote note)
     {
         var baseline = ResolveImportanceScore(new MemoryWriteRequest(
@@ -199,6 +214,8 @@ internal static class MemoryPolicies
         return ClampImportance(baseline + observationBonus + recencyBonus);
     }
 
+    // Importance after a repeat sighting: a 70/30 mix of the existing note's recomputed score and the new request's score, plus 0.03.
+    // It never goes below the importance the note already had, so repeats can only raise it.
     public static double BlendImportance(MemoryNote existing, MemoryWriteRequest incoming)
     {
         var incomingScore = incoming.ImportanceScore ?? ResolveImportanceScore(incoming);
@@ -207,6 +224,7 @@ internal static class MemoryPolicies
         return ClampImportance(blended);
     }
 
+    // A note is usable if it has not been forgotten and has not expired.
     public static bool IsActive(MemoryNote note, DateTimeOffset nowUtc)
     {
         if (note.IsForgotten)
@@ -217,12 +235,14 @@ internal static class MemoryPolicies
         return !IsExpired(note, nowUtc);
     }
 
+    // True once the expiry time is reached; notes without an expiry never expire.
     public static bool IsExpired(MemoryNote note, DateTimeOffset nowUtc)
     {
         return note.ExpiresAtUtc is DateTimeOffset expiresAtUtc
             && expiresAtUtc <= nowUtc;
     }
 
+    // A reminder with a time, not forgotten, whose status is not completed/dismissed/canceled.
     public static bool IsPendingReminder(MemoryNote note)
     {
         return note.ReminderAtUtc is not null
@@ -230,6 +250,7 @@ internal static class MemoryPolicies
             && !IsReminderInactive(note.ReminderStatus);
     }
 
+    // A pending reminder due within the lookahead window from now (overdue ones count as due).
     public static bool IsDueReminder(MemoryNote note, DateTimeOffset nowUtc, TimeSpan lookahead)
     {
         return IsPendingReminder(note)
@@ -237,6 +258,7 @@ internal static class MemoryPolicies
             && reminderAtUtc <= nowUtc.Add(lookahead);
     }
 
+    // Standardizes reminder status words ('done' becomes 'completed', 'snooze' becomes 'snoozed'); blank means 'pending'.
     public static string NormalizeReminderStatus(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -254,17 +276,20 @@ internal static class MemoryPolicies
         };
     }
 
+    // Keeps importance within 0.05 to 1 so no note can drop to zero or exceed full importance.
     public static double ClampImportance(double value)
     {
         return Math.Clamp(value, 0.05d, 1d);
     }
 
+    // True for finished reminders (completed, dismissed, canceled).
     private static bool IsReminderInactive(string? value)
     {
         var normalized = NormalizeReminderStatus(value);
         return normalized is "completed" or "dismissed" or "canceled" or "cancelled";
     }
 
+    // True if the text has a word that suggests it matters long-term, such as 'always', 'never', 'favorite' or 'prefer'.
     private static bool ContainsImportanceCue(string content)
     {
         return content.Contains("always ", StringComparison.OrdinalIgnoreCase)

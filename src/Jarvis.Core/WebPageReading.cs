@@ -1,3 +1,8 @@
+// WebPageReading.cs: lets Jarvis read aloud or summarize the web page open in Chrome/Edge. The browser reports the
+// page as an accessibility tree (the same structure screen readers use) and this file turns that tree into clean text.
+// Three parts: PageContentExtractor (strips menus, ads and footers, like a reader mode), PageSummarizer (asks the
+// local model for a short spoken summary, in chunks for long pages) and PageTool (the "page read" / "page summarize"
+// chat command). The code that actually reads the browser lives in the app project behind IBrowserPageReader.
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -11,20 +16,25 @@ namespace Jarvis.Core;
 /// </summary>
 public sealed record PageNode(string Type, string Name, string ClassName, int HeadingLevel, IReadOnlyList<PageNode> Children);
 
+// A whole page as read from the browser: title, address and the root of its element tree.
 public sealed record BrowserPage(string Title, string Url, PageNode Document);
 
+// Implemented in the app project; hands back the page currently open in the front browser window.
 public interface IBrowserPageReader
 {
     /// <summary>The page in the frontmost Chromium browser window (Chrome, Edge, Brave, ...), or null if none is open.</summary>
     Task<BrowserPage?> ReadActivePageAsync(CancellationToken cancellationToken);
 }
 
+// One piece of cleaned-up text. Kind is "paragraph", "heading", "item" (list item) or "row" (table row).
 public sealed record PageBlock(string Kind, string Text, int HeadingLevel = 0);
 
 /// <param name="Article">The main content only (an article's body), or empty when the page has no clear article.</param>
 /// <param name="Page">Everything meaningful on the page, links and lists included, for pages that are not articles.</param>
+// The extraction result, kept in two forms because it is not known up front which one the user wants.
 public sealed record ExtractedPage(string Title, string Url, IReadOnlyList<PageBlock> Article, IReadOnlyList<PageBlock> Page)
 {
+    // Total number of words across the blocks.
     public static int CountWords(IEnumerable<PageBlock> blocks) =>
         blocks.Sum(block => block.Text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
 }
@@ -33,6 +43,8 @@ public sealed record ExtractedPage(string Title, string Url, IReadOnlyList<PageB
 /// Separates what a page is about from what surrounds it, like a browser's reader mode, using the regions
 /// and structure the browser reports instead of the raw HTML.
 /// </summary>
+// Walks the page tree and keeps readable text. It works in two modes: "article mode" (only the main story, strict
+// filtering) and "page mode" (everything meaningful, lighter filtering). "Partial" because the regexes are generated at compile time.
 public static partial class PageContentExtractor
 {
     // Controls and decoration: never content in either mode. A "document" below the page itself is an
@@ -59,6 +71,7 @@ public static partial class PageContentExtractor
         "breadcrumb", "breadcrumbs", "navbox", "reflist", "references", "toc", "skip", "paywall"
     };
 
+    // Extra class-name words that only count as clutter inside an article (photo credits, sidebars, media players).
     private static readonly HashSet<string> ArticleClutterClassWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "caption", "credit", "hatnote", "infobox", "sidebar", "byline", "audio", "video", "gallery", "player"
@@ -73,11 +86,13 @@ public static partial class PageContentExtractor
         "reviews", "ratings and reviews", "ratings reviews", "user reviews", "customer reviews", "top reviews"
     };
 
+    // Element types that sit inside a sentence (links, bold text...). They are joined into one paragraph instead of starting a new one.
     private static readonly HashSet<string> InlineTypes = new(StringComparer.OrdinalIgnoreCase)
     {
         "text", "link", "time", "emphasis", "strong", "code", "mark", "abbreviation", "superscript", "subscript"
     };
 
+    // Produces both versions: the article body (empty if no clear article is found) and the full cleaned page.
     public static ExtractedPage Extract(BrowserPage page)
     {
         var root = FindArticleRoot(page.Document);
@@ -87,10 +102,13 @@ public static partial class PageContentExtractor
     }
 
     /// <summary>Title, then the blocks, with headings and list items ending in a stop so the voice pauses.</summary>
+    // One block per line; headings and list items get a full stop added so the text-to-speech voice pauses after them.
     public static string ToReadableText(IEnumerable<PageBlock> blocks) =>
         string.Join("\n", blocks.Select(block => block.Kind == "paragraph" || EndsSentence(block.Text) ? block.Text : block.Text + "."));
 
     // The smallest region holding most of the page's prose: the article body, not the page around it.
+    // Starts at the top and keeps stepping into the child that holds at least 80% of all the prose, stopping when no
+    // child does. The node it ends on is taken as the article. Pages with under 200 characters of prose have no article.
     private static PageNode? FindArticleRoot(PageNode document)
     {
         var total = document.Children.Sum(Prose);
@@ -129,12 +147,15 @@ public static partial class PageContentExtractor
             : node.Children.Sum(Prose);
     }
 
+    // Turns the element tree into a flat list of text blocks. Text pieces are collected into the current paragraph;
+    // headings, list items and table rows become their own block.
     private static List<PageBlock> BuildBlocks(PageNode root, bool articleMode)
     {
         var blocks = new List<PageBlock>();
         var paragraph = new StringBuilder();
         var linkCharacters = 0;
 
+        // Closes the current paragraph and adds it as a block (unless it is empty or, in article mode, mostly links).
         void Flush()
         {
             var text = Normalize(paragraph.ToString());
@@ -149,6 +170,8 @@ public static partial class PageContentExtractor
             linkCharacters = 0;
         }
 
+        // Visits one element: skips junk, makes a block for headings/items/rows, appends leaf text to the paragraph, and
+        // recurses into children. Non-inline containers end the current paragraph before and after.
         void Walk(PageNode node, bool insideLink)
         {
             if (IsSkipped(node, articleMode))
@@ -215,6 +238,7 @@ public static partial class PageContentExtractor
         return blocks;
     }
 
+    // Gathers all text under one element into a single string, also counting how many characters were link text.
     private static (string Text, int LinkCharacters) CollectText(PageNode node, bool articleMode)
     {
         var builder = new StringBuilder();
@@ -274,6 +298,8 @@ public static partial class PageContentExtractor
         return text;
     }
 
+    // Decides whether an element (and everything under it) is page furniture rather than content: by control type, by
+    // telltale names ("Skip to...", "advertisement"), or by words in its HTML class name such as "ad" or "newsletter".
     private static bool IsSkipped(PageNode node, bool articleMode)
     {
         if (AlwaysSkippedTypes.Contains(node.Type) || (articleMode && ArticleSkippedTypes.Contains(node.Type)))
@@ -304,6 +330,7 @@ public static partial class PageContentExtractor
             return true;
         }
 
+        // Split the class name on spaces, underscores and hyphens and test each word, so "sc-ad-container" yields "sc", "ad", "container".
         foreach (var word in ClassWordRegex().Split(node.ClassName))
         {
             if (ClutterClassWords.Contains(word) || (articleMode && ArticleClutterClassWords.Contains(word)))
@@ -315,6 +342,8 @@ public static partial class PageContentExtractor
         return false;
     }
 
+    // Final tidy-up of article text: drops everything from an "end section" heading (References, Related articles...)
+    // until a heading of the same or higher level, and removes non-prose such as ratings and counters.
     private static List<PageBlock> CleanArticle(List<PageBlock> blocks)
     {
         var kept = new List<PageBlock>();
@@ -334,6 +363,7 @@ public static partial class PageContentExtractor
                 skipUntilLevel = 0;
 
                 // "Reviews (14,910)" and "See also [edit]" are still end sections: compare letters only.
+                // Reduces a heading to plain letters and single spaces: "See also [edit]" becomes "See also" and "Reviews (14,910)" becomes "Reviews".
                 var name = Regex.Replace(Regex.Replace(block.Text, @"\[\s*edit\s*\]|[^\p{L}\s]", " "), @"\s+", " ").Trim();
 
                 if (EndSectionHeadings.Contains(name))
@@ -361,6 +391,7 @@ public static partial class PageContentExtractor
         return kept.Where((block, index) => block.Kind != "heading" || (index + 1 < kept.Count && kept[index + 1].Kind != "heading")).ToList();
     }
 
+    // Drops repeated text (pages often show the same snippet twice). Headings and very short blocks (under 12 characters) are always kept.
     private static List<PageBlock> RemoveDuplicates(List<PageBlock> blocks)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -388,13 +419,17 @@ public static partial class PageContentExtractor
         builder.Append(piece);
     }
 
+    // Collapses any run of whitespace (including line breaks) into one space.
     private static string Normalize(string text) => Regex.Replace(text, @"\s+", " ").Trim();
 
+    // True if the text already ends with sentence punctuation or a closing quote/bracket.
     private static bool EndsSentence(string text) => text.Length > 0 && ".!?:;\"'”’)".Contains(text[^1]);
 
+    // Matches a link that is only a citation marker or edit link: "[12]", "[a]", "[note 3]", "[citation needed]", "[edit]" or "edit".
     [GeneratedRegex(@"^(?:\[(?:\d+|[a-z]{1,2}|note \d+|citation needed|edit)\]|edit)$", RegexOptions.IgnoreCase)]
     private static partial Regex CitationRegex();
 
+    // Matches a run of spaces, underscores or hyphens (the separators inside CSS class names).
     [GeneratedRegex(@"[\s_\-]+")]
     private static partial Regex ClassWordRegex();
 }
@@ -402,10 +437,12 @@ public static partial class PageContentExtractor
 /// <summary>Summarizes page text with the local model, in chunks when the page is longer than its context.</summary>
 public static partial class PageSummarizer
 {
-    // About 3,000 tokens, comfortably inside the local model's 8K context with instructions and output.
+    // Characters per chunk when the page is too long for one model call: about 3,000 tokens, inside the local model's 8K context.
     private const int ChunkCharacters = 12_000;
+    // Pages longer than 5 chunks are cut off and the summary says it covers only the first part.
     private const int MaximumChunks = 5;
 
+    // Prompt for the final summary. It is read aloud, so no lists, markdown or emoji, and about 100 words.
     private const string SummaryInstructions =
         "You summarize the web page the user is looking at. Your summary is read aloud.\n"
         + "- Write 3 or 4 plain sentences, under 100 words in total: no lists, headings, markdown, or emoji.\n"
@@ -413,9 +450,12 @@ public static partial class PageSummarizer
         + "- Then give the most important information: key points, names, numbers, prices, dates, and conclusions.\n"
         + "- Use only what the page says. If a focus is given, answer about that focus from the page.";
 
+    // Prompt for the first pass on long pages: pull out the key facts of each chunk, which are then summarized together.
     private const string NotesInstructions =
         "Extract the key facts from this part of a web page as 3 to 6 short plain sentences. Use only facts from the text. No lists or markdown.";
 
+    // Summarizes the page. One chunk goes straight to the model. Several chunks are first turned into short notes
+    // (one model call each) and the notes are then summarized: a "map then reduce" approach.
     public static async Task<string> SummarizeAsync(
         IModelGateway gateway,
         ExtractedPage page,
@@ -453,6 +493,7 @@ public static partial class PageSummarizer
         return truncated ? summary + " (This covers the first part of a very long page.)" : summary;
     }
 
+    // One model call with a system prompt and a user message. Gives up after 90 seconds, then cleans the reply.
     private static async Task<string> CompleteAsync(IModelGateway gateway, string instructions, string input, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -464,17 +505,20 @@ public static partial class PageSummarizer
                     new ChatMessage("user", [ChatMessageContentPart.FromText(input)])
                 ],
                 Temperature: 0.2),
-            // Not Fast: its 128-token cap cut summaries off mid-sentence. Reasoning allows 384 on the local model.
+            // Reasoning, not Fast: Fast's 256-token cap can cut summaries off mid-sentence. Reasoning allows 384 on the local model.
             ModelRoute.Reasoning,
             timeout.Token);
 
+        // Remove any <think>...</think> reasoning that some models print before the answer.
         var text = ThinkBlockRegex().Replace(response.Content ?? string.Empty, string.Empty);
         // Read aloud, so markdown symbols would be spoken or mangled.
+        // Removes list markers at the start of a line ("- ", "* ", "1. ") and markdown characters (* # _ `).
         text = Regex.Replace(text, @"^\s*(?:[-*•]|\d+\.)\s+|[*#_`]+", string.Empty, RegexOptions.Multiline);
         return Regex.Replace(text, @"\s+", " ").Trim();
     }
 
     // Split at line breaks, which fall between paragraphs, so no sentence is cut in half.
+    // Packs whole lines into chunks of up to ChunkCharacters; a single over-long line is cut to fit.
     private static List<string> SplitIntoChunks(string text)
     {
         var chunks = new List<string>();
@@ -499,11 +543,13 @@ public static partial class PageSummarizer
         return chunks.Count == 0 ? [string.Empty] : chunks;
     }
 
+    // The website name (host) for the prompt, e.g. "www.example.com"; falls back to the raw text.
     private static string DescribeSite(string url) =>
         Uri.TryCreate(url.Contains("://", StringComparison.Ordinal) ? url : "https://" + url, UriKind.Absolute, out var uri)
             ? uri.Host
             : url;
 
+    // Matches a <think>...</think> block across line breaks (the lazy "*?" stops at the first closing tag).
     [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
     private static partial Regex ThinkBlockRegex();
 }
@@ -520,8 +566,10 @@ public sealed class PageTool(IBrowserPageReader? pageReader, IModelGateway? mode
         "The web page open in the user's browser. `page read` reads its main text aloud (just the article, without menus or ads). "
         + "`page summarize` or `page summarize <focus>` summarizes it, for example `page summarize the reviews`.";
 
+    // Handles any input that starts with the word "page".
     public bool CanHandle(string input) => ToolInputHelper.StartsWithCommand(input, "page");
 
+    // Reads the page from the browser, cleans it, then either reads it out ("page read") or summarizes it ("page summarize [focus]").
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
         var tail = ToolInputHelper.GetCommandTail(input, "page").Trim();
@@ -547,6 +595,8 @@ public sealed class PageTool(IBrowserPageReader? pageReader, IModelGateway? mode
             : Read(extracted);
     }
 
+    // Builds the text to speak: the article if it has at least 80 words, otherwise the whole page, with a spoken intro
+    // giving the title and estimated minutes (160 words per minute).
     private static ToolResult Read(ExtractedPage page)
     {
         var isArticle = ExtractedPage.CountWords(page.Article) >= 80;
@@ -585,6 +635,7 @@ public sealed class PageTool(IBrowserPageReader? pageReader, IModelGateway? mode
             SpeakInFull: true);
     }
 
+    // Checks that the model is running and the page has enough text, then summarizes it.
     private async Task<ToolResult> SummarizeAsync(ExtractedPage page, string focus, CancellationToken cancellationToken)
     {
         if (modelGateway is not { IsAvailable: true })

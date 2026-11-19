@@ -1,7 +1,15 @@
+// AssistantPresenceStyle.cs: Jarvis's "social" manner. It answers small talk (hello, thanks, goodbye) with a short
+// canned reply, without calling the language model, and can add a short lead-in such as "Prioritizing this now."
+// when the user sounds urgent or frustrated. The wording changes with the response style and presence settings
+// (AssistantPersonaConfiguration). Called by the assistant/planner before and after the model runs.
+using System.Text.RegularExpressions;
+
 namespace Jarvis.Core;
 
+// Pure text helpers with no state. The word lists below are matched against input that was lower-cased and stripped of punctuation.
 public static class AssistantPresenceStyle
 {
+    // Whole-message phrases for each kind of small talk. A message must equal one of these exactly (and be short) to count; see IsExactMatch.
     private static readonly string[] GreetingPhrases =
     [
         "hi",
@@ -70,6 +78,7 @@ public static class AssistantPresenceStyle
         "talk later"
     ];
 
+    // Words that mean the user is in a hurry. Unlike the lists above, these match anywhere inside a longer request.
     private static readonly string[] UrgentTerms =
     [
         "asap",
@@ -80,6 +89,7 @@ public static class AssistantPresenceStyle
         "quickly"
     ];
 
+    // Words that suggest something is going wrong for the user. Also matched anywhere inside the request.
     private static readonly string[] FrustratedTerms =
     [
         "not working",
@@ -94,6 +104,8 @@ public static class AssistantPresenceStyle
         "problem"
     ];
 
+    // If the whole message is pure small talk, produces the reply in "response" and returns true. Returns false for
+    // anything else, so the message goes on to the normal planner. The order of checks decides which kind wins.
     public static bool TryBuildSocialReply(
         string input,
         JarvisOptions options,
@@ -156,6 +168,8 @@ public static class AssistantPresenceStyle
         return false;
     }
 
+    // Produces a very short spoken acknowledgement ("Standing by.", "Prioritizing it now.") for the same kinds of
+    // input, or for urgent/frustrated requests. Returns false when no acknowledgement fits.
     public static bool TryBuildAcknowledgement(string input, JarvisOptions options, out string acknowledgement)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -211,6 +225,7 @@ public static class AssistantPresenceStyle
             return true;
         }
 
+        // Not small talk: fall back to the mood of the request (urgent, frustrated, both, or neither).
         var signal = AnalyzeSignal(normalized);
 
         acknowledgement = signal switch
@@ -224,6 +239,8 @@ public static class AssistantPresenceStyle
         return !string.IsNullOrWhiteSpace(acknowledgement);
     }
 
+    // Optionally puts a short mood-matching lead in front of a finished reply (for example "I see the issue.").
+    // Leaves the reply alone when it is a question, multi-line, long, a system message or list (ShouldLeaveUntouched).
     public static string ApplyResponsePresence(
         string userInput,
         string responseText,
@@ -253,6 +270,8 @@ public static class AssistantPresenceStyle
         return $"{lead} {trimmed}";
     }
 
+    // The Build*Reply methods below choose the exact wording for one kind of small talk, based on response style
+    // (concise, normal, detailed, cinematic). Where small talk is switched off in settings they give a minimal reply.
     private static string BuildGreetingReply(string normalizedInput, JarvisOptions options, string preferredUserAddress)
     {
         var salutation = ResolveGreeting(normalizedInput, DateTimeOffset.Now);
@@ -377,6 +396,7 @@ public static class AssistantPresenceStyle
         };
     }
 
+    // Picks the lead-in sentence for the mood of the user's message; returns empty when none is needed.
     private static string BuildResponseLead(string userInput, JarvisOptions options, string preferredUserAddress)
     {
         var normalized = NormalizeComparable(userInput);
@@ -417,6 +437,8 @@ public static class AssistantPresenceStyle
         };
     }
 
+    // True for replies that must not get a lead-in: follow-up questions, multi-line or long (over 260 characters) text,
+    // background tasks, and structured/system messages (see the prefixes below), lists and code (backticks).
     private static bool ShouldLeaveUntouched(string responseText, AgentIntentKind intent, bool isFollowUpQuestion)
     {
         if (isFollowUpQuestion
@@ -431,6 +453,7 @@ public static class AssistantPresenceStyle
             return true;
         }
 
+        // Starts of internal or structured messages that should be shown exactly as written.
         var blockedPrefixes = new[]
         {
             "approval required",
@@ -449,6 +472,7 @@ public static class AssistantPresenceStyle
             || responseText.Contains("`", StringComparison.Ordinal);
     }
 
+    // Classifies a message as urgent, frustrated, both, gratitude or neutral.
     private static PresenceSignal AnalyzeSignal(string normalizedInput)
     {
         var urgent = ContainsAny(normalizedInput, UrgentTerms);
@@ -477,6 +501,7 @@ public static class AssistantPresenceStyle
         return PresenceSignal.Neutral;
     }
 
+    // The LooksLike* checks: is the whole message one of that kind's phrases. The number is the longest message (in words) allowed.
     private static bool LooksLikeGreeting(string normalizedInput) =>
         IsExactMatch(normalizedInput, GreetingPhrases, 4);
 
@@ -501,6 +526,8 @@ public static class AssistantPresenceStyle
     private static bool LooksLikeClosing(string normalizedInput) =>
         IsExactMatch(normalizedInput, ClosingPhrases, 4);
 
+    // True when the message is short enough and equals one of the phrases. Exact matching stops "thanks, now delete
+    // my files" from being treated as small talk.
     private static bool IsExactMatch(string normalizedInput, IReadOnlyList<string> phrases, int maxWords)
     {
         if (string.IsNullOrWhiteSpace(normalizedInput))
@@ -516,9 +543,15 @@ public static class AssistantPresenceStyle
         return phrases.Any(phrase => string.Equals(normalizedInput, phrase, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static bool ContainsAny(string normalizedInput, IReadOnlyList<string> phrases) =>
-        phrases.Any(phrase => normalizedInput.Contains(phrase, StringComparison.OrdinalIgnoreCase));
+    // True when any phrase appears as whole words (plural allowed) inside the message, so "issues" counts but "tissues" does not.
+    // "No problem" and "no issue" are politeness, not frustration, so they are removed first.
+    private static bool ContainsAny(string normalizedInput, IReadOnlyList<string> phrases)
+    {
+        var text = Regex.Replace(normalizedInput, @"\b(?:no problems?|not a problem|no issues?)\b", " ", RegexOptions.IgnoreCase);
+        return phrases.Any(phrase => Regex.IsMatch(text, $@"\b{Regex.Escape(phrase)}s?\b", RegexOptions.IgnoreCase));
+    }
 
+    // Picks "Good morning/afternoon/evening": the one the user said, otherwise by the clock (before noon, before 6 pm, then evening).
     private static string ResolveGreeting(string normalizedInput, DateTimeOffset now)
     {
         if (normalizedInput.StartsWith("good morning", StringComparison.OrdinalIgnoreCase))
@@ -551,6 +584,7 @@ public static class AssistantPresenceStyle
         return "Good evening";
     }
 
+    // Returns ", Name" to append to a sentence, or empty when small talk is off or there is no name.
     private static string BuildOptionalAddress(JarvisOptions options, string preferredUserAddress)
     {
         if (!options.AssistantSmallTalkEnabled || string.IsNullOrWhiteSpace(preferredUserAddress))
@@ -561,6 +595,8 @@ public static class AssistantPresenceStyle
         return $", {preferredUserAddress.Trim()}";
     }
 
+    // Makes text comparable: lower case, punctuation removed, runs of spaces collapsed. "Thanks!!" becomes "thanks" and
+    // "What's your name?" becomes "whats your name" (apostrophes are removed).
     private static string NormalizeComparable(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -591,6 +627,7 @@ public static class AssistantPresenceStyle
         return new string(buffer, 0, index).Trim();
     }
 
+    // The mood detected in a request.
     private enum PresenceSignal
     {
         Neutral,

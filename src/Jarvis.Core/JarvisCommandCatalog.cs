@@ -1,9 +1,17 @@
+// JarvisCommandCatalog.cs: turns what the user said or typed into the exact command text a tool expects.
+// People say "could you please pull up my notepad" or "turn off the vpn"; tools only understand canonical commands such as
+// "open app notepad" or "vpn off". NormalizeToCommand and NormalizeVoiceDirective do that translation with fixed phrase lists and regexes,
+// without calling the language model. Anything they do not recognise is returned unchanged, so the planner (the LLM) can handle it.
+// The lists below (phrases and prefixes) are also given to the speech recognizer as grammars, see LoadPhraseGrammar in VoiceRuntime.cs.
+// Nothing here runs a tool or touches the system; it only rewrites text.
 using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
+// Static rule book for command rewriting. Partial because the regexes are source-generated (GeneratedRegex), which compiles them at build time.
 public static partial class JarvisCommandCatalog
 {
+    // Phrase lists: a whole utterance that must match exactly (after cleanup, see NormalizeForMatching) to become one fixed command.
     public static IReadOnlyList<string> HelpPhrases { get; } =
     [
         "help",
@@ -173,6 +181,7 @@ public static partial class JarvisCommandCatalog
     [GeneratedRegex(@"^(?:(?:go|enter) (?:to )?)?sleep(?: mode)?$|^put (?:the |my |this )?(?:system|computer|laptop|pc|machine) (?:to sleep|in(?:to)? sleep(?: mode)?)$")]
     private static partial Regex SleepRegex();
 
+    // Prefix lists: an utterance that STARTS with one of these is rewritten to a canonical verb followed by whatever came after it.
     // "note ..." and "make a note ..." mean a Sticky Note; see TryCanonicalizeStickyNoteCommand.
     public static IReadOnlyList<string> RememberPrefixes { get; } =
     [
@@ -239,17 +248,6 @@ public static partial class JarvisCommandCatalog
         "close app",
         "close window",
         "quit app"
-    ];
-
-    public static IReadOnlyList<string> WindowStatePrefixes { get; } =
-    [
-        "window state",
-        "minimize app",
-        "maximize app",
-        "restore app",
-        "minimize window",
-        "maximize window",
-        "restore window"
     ];
 
     public static IReadOnlyList<string> HotkeyPrefixes { get; } =
@@ -408,6 +406,9 @@ public static partial class JarvisCommandCatalog
         "hold "
     ];
 
+    // Main entry point. Tries a long chain of rules, and the first rule that matches decides the command. ORDER MATTERS, since a more specific
+    // rule must run before a general one that would also match (for example "write this down in notepad" must become a sticky note, not typing).
+    // Returns the input unchanged when no rule applies.
     public static string NormalizeToCommand(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -415,9 +416,11 @@ public static partial class JarvisCommandCatalog
             return string.Empty;
         }
 
+        // Drop politeness like "can you please" and compare in a simplified form (lowercase, no punctuation).
         var trimmed = StripLeadingConversationalPrefix(input.Trim());
         var normalized = NormalizeForMatching(trimmed);
 
+        // fixed whole-utterance phrases ("what time is it" becomes "time").
         if (ContainsExact(HelpPhrases, normalized))
         {
             return "help";
@@ -546,11 +549,13 @@ public static partial class JarvisCommandCatalog
             return writeDownCommand;
         }
 
+        // From here on, long or multi-part requests ("... and then ...", questions, 9+ words) are kept whole for the planner (LLM) to break into steps.
         if (ShouldPreserveNaturalLanguage(trimmed))
         {
             return trimmed;
         }
 
+        // simple prefix commands ("open ...", "remember ...", "move window ...") are rewritten to their canonical verb.
         if (TryCanonicalizeOpenCommand(trimmed, out var openCommand))
         {
             return openCommand;
@@ -694,6 +699,7 @@ public static partial class JarvisCommandCatalog
         return trimmed;
     }
 
+    // Entry point for text that came from speech recognition. Cleans up typical transcription habits, then uses NormalizeToCommand.
     public static string NormalizeVoiceDirective(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -734,6 +740,7 @@ public static partial class JarvisCommandCatalog
     /// </summary>
     public static Func<string, bool>? KnownApplicationNameCheck { get; set; }
 
+    // Speech recognition sometimes glues the verb to the name ("OpenDell"); this finds an "Open" directly followed by a capital letter or digit.
     [GeneratedRegex("^([Oo]pen)(?=[A-Z0-9])")]
     private static partial Regex GluedOpenRegex();
 
@@ -748,7 +755,7 @@ public static partial class JarvisCommandCatalog
 
     // "can you make a quick note that ...", "take a note: ...", "jot this down ...", "note that ...",
     // "open my sticky notes and make a note to ...". The note's words follow in "rest".
-    [GeneratedRegex(@"^(?:(?:hey|ok|okay|so|um|uh|alright|all\s+right)[,\s]+)*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|i\s+(?:need|want)\s+(?:you\s+)?to\s+|please\s+|go\s+ahead\s+and\s+|let'?s\s+)?(?:open\s+(?:up\s+)?(?:my\s+|the\s+)?(?:sticky\s+notes?|notepad|notes?)\s+and\s+(?:then\s+)?)?(?:(?:make|take|write|jot|add|create|leave|start|drop)\s+(?:me\s+)?(?:a\s+|an\s+|another\s+|one\s+)?(?:quick\s+|new\s+|little\s+|short\s+)?(?:sticky\s+)?note\b(?:\s+to\s+self\b)?|(?:write|jot|put|note)\s+(?:(?:this|that|it)\s+)?down\b|note(?=\s+that\b|\s*:)|sticky\s+note\b)(?<rest>.*)$", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"^(?:(?:hey|ok|okay|so|um|uh|alright|all\s+right)[,\s]+)*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|i\s+(?:need|want)\s+(?:you\s+)?to\s+|please\s+|go\s+ahead\s+and\s+|let'?s\s+)?(?:open\s+(?:up\s+)?(?:my\s+|the\s+)?(?:sticky\s+notes?|notepad|notes?)\s+and\s+(?:then\s+)?)?(?:(?:make|take|write|jot|add|create|leave|start|drop)\s+(?:me\s+)?(?:a\s+|an\s+|another\s+|one\s+)?(?:quick\s+|new\s+|little\s+|short\s+)?(?:sticky\s+)?note\b(?:\s+to\s+self\b)?|(?:write|jot|put|note)\s+(?:(?<ref>that)\s+|(?:this|it)\s+)?down\b|note(?=\s+that\b|\s*:)|sticky\s+note\b)(?<rest>.*)$", RegexOptions.IgnoreCase)]
     private static partial Regex StickyNoteRequestRegex();
 
     // "put milk and eggs on a sticky note", "add call mom to my sticky notes"
@@ -759,6 +766,7 @@ public static partial class JarvisCommandCatalog
     [GeneratedRegex(@"^[\s,:;-]*(?:(?:in|on|to|into|onto)\s+(?:my\s+|the\s+|a\s+)?(?:sticky\s+notes?|notepad|notes?(?:\s+app)?)\b)?[\s,:;-]*(?:(?:that\s+says|which\s+says|saying|to\s+say|to\s+remind\s+me(?:\s+to|\s+that)?|reminding\s+me(?:\s+to|\s+that)?|that|about|for\s+me|to|of)\b[\s,:;-]*)?", RegexOptions.IgnoreCase)]
     private static partial Regex NoteLeadInRegex();
 
+    // Rewrites sticky-note requests ("make a note to buy milk", "put eggs on a sticky note") to "write down <text>". True if it matched.
     private static bool TryCanonicalizeStickyNoteCommand(string input, out string command)
     {
         command = string.Empty;
@@ -788,8 +796,12 @@ public static partial class JarvisCommandCatalog
             return false;
         }
 
-        var note = NoteLeadInRegex().Replace(match.Groups["rest"].Value, string.Empty, 1).Trim();
-        command = note.Length == 0 ? "write down" : $"write down {note}";
+        var rest = match.Groups["rest"].Value;
+        var note = NoteLeadInRegex().Replace(rest, string.Empty, 1).Trim();
+        // A bare "that" ("add that to the sticky note") is kept for the tool, which reads it as the last exchange; stripping it would
+        // leave the tool asking what to write.
+        var bareThat = match.Groups["ref"].Success || rest.Trim(' ', '.', ',', '!').Equals("that", StringComparison.OrdinalIgnoreCase);
+        command = note.Length > 0 ? $"write down {note}" : bareThat ? "write down that" : "write down";
         return true;
     }
 
@@ -808,9 +820,11 @@ public static partial class JarvisCommandCatalog
     [GeneratedRegex(@"^(?:what'?s|what\s+is|whats)\s+(?:this|the)\s+" + PageWords + @"\s+(?:about|saying)$|^what\s+does\s+(?:this|the)\s+" + PageWords + @"\s+say(?:\s+about\s+(?<focus>.+))?$", RegexOptions.IgnoreCase)]
     private static partial Regex PageQuestionRegex();
 
+    // Matches a reference to the page in a request, e.g. " of this article", "on the page I'm on", so it can be removed to leave the focus words.
     [GeneratedRegex(@"(?:\s+(?:on|of|from|in|for))?\s*\b(?:this|the|that|current)\s+" + PageWords + @"\b(?:\s+i'?m\s+on)?", RegexOptions.IgnoreCase)]
     private static partial Regex PageReferenceRegex();
 
+    // Rewrites page requests ("read this article to me", "summarize this page", "what is this page about") to "page read" or "page summarize <focus>".
     private static bool TryCanonicalizePageCommand(string input, out string command)
     {
         command = string.Empty;
@@ -865,6 +879,7 @@ public static partial class JarvisCommandCatalog
     [GeneratedRegex(@"^(?:please\s+)?(?<verb>add|schedule|put|create|book|set\s+up)\s+(?<rest>.+)$", RegexOptions.IgnoreCase)]
     private static partial Regex CalendarAddRegex();
 
+    // Rewrites calendar requests: "add ... to my calendar" becomes "calendar add ...", and questions about a day become "calendar <yyyy-MM-dd>".
     private static bool TryCanonicalizeCalendarCommand(string input, out string command)
     {
         command = string.Empty;
@@ -917,6 +932,7 @@ public static partial class JarvisCommandCatalog
     [GeneratedRegex(@"^(?:please\s+)?(?:stop|end|finish|wrap\s+up)\s+(?:taking\s+)?(?:(?:the|my|this)\s+)?(?:(?:lecture|class|meeting)\s+)?(?:notes|nodes|recording)$|^(?:the\s+)?(?:lecture|class|meeting)\s+is\s+over$", RegexOptions.IgnoreCase)]
     private static partial Regex LectureNotesStopRegex();
 
+    // Rewrites "start lecture notes for X" / "stop recording" into "lecture notes start X" / "lecture notes stop". A recording needs a notes or record word.
     private static bool TryCanonicalizeLectureNotesCommand(string input, out string command)
     {
         command = string.Empty;
@@ -952,6 +968,7 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // Rewrites VPN requests to "vpn on", "vpn off" or "vpn status". Questions come first so "is my vpn on" never switches it.
     // "turn on my vpn", "disconnect the vpn", "is my vpn on?"
     private static bool TryCanonicalizeVpnCommand(string input, out string command)
     {
@@ -973,6 +990,8 @@ public static partial class JarvisCommandCatalog
         return command.Length > 0;
     }
 
+    // Rewrites "open notepad and write hello" or "write hello in notepad" to "type into notepad hello". Only runs when the app name is
+    // exactly an installed app, because "in" and "on" appear in ordinary sentences.
     private static bool TryCanonicalizeWriteIntoAppCommand(string input, out string command)
     {
         command = string.Empty;
@@ -1018,6 +1037,7 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // Handles "open <exact installed app name>" before the general rules, so names with dots or "and" ("Node.js", "Movies and TV") work.
     private static bool TryCanonicalizeOpenKnownApplication(string input, out string command)
     {
         command = string.Empty;
@@ -1040,6 +1060,7 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // True when the text looks like a sentence for the planner rather than a single command: 9+ words, a joining word such as "and" or "then", or ? ! ;
     private static bool ShouldPreserveNaturalLanguage(string value)
     {
         var trimmed = value.Trim();
@@ -1058,11 +1079,13 @@ public static partial class JarvisCommandCatalog
 
         var words = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
+        // Nine or more words is treated as a sentence, not a command.
         if (words.Length >= 9)
         {
             return true;
         }
 
+        // Words that suggest a second request in the same sentence, with spaces around them so they match whole words only.
         var clauseSignals = new[]
         {
             " and ",
@@ -1086,6 +1109,7 @@ public static partial class JarvisCommandCatalog
         return trimmed.IndexOfAny(['?', '!', ';']) >= 0;
     }
 
+    // Decides what "open <thing>" means: a web address becomes "browse", a file or folder path becomes "open path", a short app name becomes "open app".
     private static bool TryCanonicalizeOpenCommand(string input, out string command)
     {
         if (!input.StartsWith("open ", StringComparison.OrdinalIgnoreCase))
@@ -1104,7 +1128,8 @@ public static partial class JarvisCommandCatalog
             return false;
         }
 
-        remainder = StripLeadingFillerWords(remainder);
+        // "open the test site for me" -> "test site", "pull up excel again" -> "excel".
+        remainder = StripTrailingPoliteness(StripLeadingFillerWords(remainder));
 
         if (string.IsNullOrWhiteSpace(remainder))
         {
@@ -1134,11 +1159,13 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // Rewrites "click <thing>" / "tap <thing>" to "click element <thing>".
     private static bool TryCanonicalizeClickCommand(string input, out string command)
     {
         return TryCanonicalizeSinglePayloadCommand(input, ClickPrefixes, "click element", out command);
     }
 
+    // Rewrites "minimize/maximize/restore <window>" to "window state <window> minimize" and so on.
     private static bool TryCanonicalizeWindowStateCommand(string input, out string command)
     {
         if (TryCanonicalizeSinglePayloadCommand(input, ["window state"], "window state", out command))
@@ -1160,6 +1187,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Rewrites typing requests to "type into <target> <text>". It needs the word "into" so the target is clear; otherwise it leaves the text for the planner.
     private static bool TryCanonicalizeTypeCommand(string input, out string command)
     {
         if (TryCanonicalizeSinglePayloadCommand(
@@ -1213,6 +1241,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Rewrites media control phrases (play, pause, next track, mute, volume up/down) to "media <action>".
     private static bool TryCanonicalizeMediaCommand(string input, out string command)
     {
         if (TryCanonicalizePayloadCommand(input, ["media"], "media", out command))
@@ -1268,6 +1297,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Rewrites clipboard phrases (set, paste, clear, show) to "clipboard <action>".
     private static bool TryCanonicalizeClipboardCommand(string input, out string command)
     {
         if (TryCanonicalizePayloadCommand(input, SetClipboardPrefixes, "clipboard set", out command))
@@ -1301,6 +1331,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Rewrites "scroll ..." and "move down/up ..." to "scroll <target> <direction>".
     private static bool TryCanonicalizeScrollCommand(string input, out string command)
     {
         if (TryCanonicalizeSinglePayloadCommand(input, ["scroll window ", "scroll "], "scroll", out command))
@@ -1322,6 +1353,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Generic helper: if the input starts with a prefix, return "<verb> <rest>" (or just the verb when nothing follows).
     private static bool TryCanonicalizeSinglePayloadCommand(
         string input,
         IReadOnlyList<string> prefixes,
@@ -1346,6 +1378,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Helper for "move down/up <target>": produces "scroll <target> <direction>". A target is required.
     private static bool TryCanonicalizeDirectionalPayloadCommand(
         string input,
         string prefix,
@@ -1370,6 +1403,7 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // Helper for window state phrases: produces "window state <window> <state>". A window name is required.
     private static bool TryCanonicalizeDirectionalWindowStateCommand(
         string input,
         string prefix,
@@ -1394,6 +1428,7 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // Like TryCanonicalizeSinglePayloadCommand, but for "open app" it also refuses text that is clearly more than an app name.
     private static bool TryCanonicalizePayloadCommand(
         string input,
         IReadOnlyList<string> prefixes,
@@ -1417,6 +1452,12 @@ public static partial class JarvisCommandCatalog
                 return false;
             }
 
+            // "pull up excel again" -> "open app excel", the same cleanup "open ..." gets.
+            if (string.Equals(canonicalVerb, "open app", StringComparison.OrdinalIgnoreCase))
+            {
+                remainder = StripTrailingPoliteness(StripLeadingFillerWords(remainder));
+            }
+
             command = string.IsNullOrWhiteSpace(remainder)
                 ? canonicalVerb
                 : $"{canonicalVerb} {remainder}";
@@ -1427,6 +1468,7 @@ public static partial class JarvisCommandCatalog
         return false;
     }
 
+    // Last resort for speech: a bare short phrase such as "notepad" is treated as "open app notepad", but only when it is the exact name of an installed app.
     private static bool TryCanonicalizeImplicitOpenAppCommand(string input, out string command)
     {
         command = string.Empty;
@@ -1461,11 +1503,13 @@ public static partial class JarvisCommandCatalog
 
         var words = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
+        // More than five words is a sentence, not an app name.
         if (words.Length == 0 || words.Length > 5)
         {
             return false;
         }
 
+        // First words that show the phrase is a request or question, not an app name ("what time is it" must not become "open app").
         var blockedLeadingWords = new[]
         {
             "analyze",
@@ -1515,7 +1559,7 @@ public static partial class JarvisCommandCatalog
             return false;
         }
 
-        // Without this, any short phrase became "open app <phrase>": "Close Notepad" or "I'm glad it works".
+        // Only exact installed-app names count; otherwise any short phrase would become "open app <phrase>" ("Close Notepad", "I'm glad it works").
         if (KnownApplicationNameCheck is { } isKnownApplication && !isKnownApplication(candidate))
         {
             return false;
@@ -1525,6 +1569,7 @@ public static partial class JarvisCommandCatalog
         return true;
     }
 
+    // True if the text could be an app name: short, one clause, no sentence break, and none of the follow-on words below.
     private static bool LooksLikeSimpleLaunchTarget(string value)
     {
         var candidate = StripTrailingPoliteness(value.Trim());
@@ -1551,11 +1596,13 @@ public static partial class JarvisCommandCatalog
 
         var words = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
+        // App names are at most five words.
         if (words.Length == 0 || words.Length > 5)
         {
             return false;
         }
 
+        // Words that show the speaker is giving a second instruction or asking something, so the text is not just an app name.
         var followOnSignals = new[]
         {
             "and",
@@ -1593,17 +1640,20 @@ public static partial class JarvisCommandCatalog
         return !words.Any(word => followOnSignals.Contains(word, StringComparer.OrdinalIgnoreCase));
     }
 
+    // True if the cleaned-up input equals any phrase in the list, ignoring punctuation and capitals.
     private static bool ContainsExact(IReadOnlyList<string> phrases, string normalizedInput)
     {
         return phrases.Any(phrase => NormalizeForMatching(phrase) == normalizedInput);
     }
 
+    // True if the input is the command word alone or starts with it followed by a space.
     private static bool StartsWithCommand(string input, string value)
     {
         return input.Equals(value, StringComparison.OrdinalIgnoreCase)
             || input.StartsWith(value + " ", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Removes leading "my ", "the ", "up " and similar from an app name, repeatedly ("open up my notepad" -> "notepad").
     private static string StripLeadingFillerWords(string value)
     {
         var trimmed = value.Trim();
@@ -1612,13 +1662,14 @@ public static partial class JarvisCommandCatalog
         {
             if (trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
-                return trimmed[prefix.Length..].TrimStart();
+                return StripLeadingFillerWords(trimmed[prefix.Length..]);
             }
         }
 
         return trimmed;
     }
 
+    // Removes trailing "please", "thanks", "thank you", "for me", "again", repeatedly until none is left.
     private static string StripTrailingPoliteness(string value)
     {
         var trimmed = value.Trim();
@@ -1627,7 +1678,7 @@ public static partial class JarvisCommandCatalog
         {
             var changed = false;
 
-            foreach (var suffix in new[] { " please", " thanks", " thank you", " for me" })
+            foreach (var suffix in new[] { " please", " thanks", " thank you", " for me", " again" })
             {
                 if (!trimmed.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1646,6 +1697,7 @@ public static partial class JarvisCommandCatalog
         }
     }
 
+    // Removes leading polite openers such as "can you please" or "jarvis, could you", repeatedly until none is left.
     private static string StripLeadingConversationalPrefix(string value)
     {
         var current = value.Trim();
@@ -1692,6 +1744,7 @@ public static partial class JarvisCommandCatalog
         }
     }
 
+    // True for text that looks like a web address: starts with http(s):// or www., or has a dot and no spaces and is not a path.
     private static bool LooksLikeUrl(string value)
     {
         return value.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
@@ -1700,6 +1753,7 @@ public static partial class JarvisCommandCatalog
             || (value.Contains('.') && !value.Contains(' ') && !LooksLikePath(value));
     }
 
+    // True for text that looks like a file path or a well-known folder name: contains a slash, starts with ~ % or a dot, has a drive colon, or has a file extension.
     private static bool LooksLikePath(string value)
     {
         return value.Contains('\\')
@@ -1719,6 +1773,7 @@ public static partial class JarvisCommandCatalog
             || value.Equals("workspace", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Simplifies text for comparison: lowercase, apostrophes removed, anything that is not a letter or digit becomes a space, runs of spaces collapse.
     private static string NormalizeForMatching(string value)
     {
         var chars = value

@@ -1,3 +1,6 @@
+// OpenAiCompatibleStreamingSpeaker.cs: Jarvis's preferred voice. Sends the reply text to an OpenAI-style /audio/speech
+// endpoint (the local Kokoro server on 127.0.0.1:8178) and plays the audio as it arrives, so speech starts before the whole
+// sentence is rendered. Created by SpeakerFactory (Speech.cs). Falls back to the Windows voice (WindowsSpeechSpeaker) if the server fails.
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -7,24 +10,33 @@ using NAudio.Wave.SampleProviders;
 
 namespace Jarvis.App;
 
+// Speaker that streams audio from a text-to-speech HTTP server through the sound card (NAudio).
 internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
 {
+    // JSON settings for the request: camelCase names, and empty (null) fields are left out.
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
     };
 
+    // Protects _activeSpeechCts, which is touched by the speaking task and by Interrupt.
     private readonly object _sync = new();
+    // One reply at a time.
     private readonly SemaphoreSlim _gate = new(1, 1);
+    // No timeout on the HTTP client: a long reply can stream for minutes; cancellation (interrupt) ends it instead.
     private readonly HttpClient _httpClient;
     private readonly JarvisOptions _options;
     private readonly string _endpoint;
     private readonly string _model;
     private readonly string _voice;
+    // Optional style instructions for the voice (from the persona settings).
     private readonly string _instructions;
+    // Audio format requested from the server: "pcm" (raw, streams immediately) or "wav".
     private readonly string _responseFormat;
     private readonly string _apiKey;
+    // Windows voice used if the speech server cannot be reached.
     private readonly WindowsSpeechSpeaker _fallbackSpeaker;
+    // Lets Interrupt stop the reply currently playing.
     private CancellationTokenSource? _activeSpeechCts;
 
     private OpenAiCompatibleStreamingSpeaker(
@@ -51,6 +63,8 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
 
     public SpeakerStatusSnapshot CurrentStatus { get; private set; } = new(false, string.Empty, DateTimeOffset.UtcNow);
 
+    // Builds the speaker if settings allow it; returns false (so the Windows voice is used) when no model is set, the URL is invalid,
+    // local-only mode would send speech to a remote host, or a remote host has no API key.
     public static bool TryCreate(JarvisOptions options, out ISpeaker? speaker)
     {
         speaker = null;
@@ -80,6 +94,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
             return false;
         }
 
+        // Default voice name when none is configured.
         var voice = string.IsNullOrWhiteSpace(options.VoiceName)
             ? "coral"
             : options.VoiceName.Trim();
@@ -97,6 +112,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         return true;
     }
 
+    // Requests the audio, then plays it (raw PCM as a live stream, WAV after downloading it fully). Server errors switch to the Windows voice.
     public async Task SpeakAsync(string message, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(message))
@@ -120,6 +136,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
             PublishStatus(true, normalized);
 
             using var request = BuildRequest(normalized);
+            // ResponseHeadersRead returns as soon as the headers arrive, so audio can be played while the body is still downloading.
             using var response = await _httpClient.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
@@ -167,6 +184,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         }
     }
 
+    // Stops playback now, including the fallback voice.
     public void Interrupt()
     {
         CancellationTokenSource? cts;
@@ -187,6 +205,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         _fallbackSpeaker.Interrupt();
     }
 
+    // Builds the POST request: model, voice, the text, the audio format and optional instructions as JSON, plus a bearer key if one is set.
     private HttpRequestMessage BuildRequest(string message)
     {
         var payload = new Dictionary<string, object?>
@@ -215,8 +234,11 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         return request;
     }
 
+    // Plays raw 24 kHz, 16-bit, mono audio while it downloads. Audio goes into a buffer holding up to 8 seconds that a sound-card
+    // player drains; when the buffer is full the download waits instead of dropping audio.
     private async Task PlayPcmStreamAsync(Stream audioStream, CancellationToken cancellationToken)
     {
+        // 24000 samples per second, 16 bits, one channel: the format the speech server sends in "pcm" mode.
         var waveFormat = new WaveFormat(24000, 16, 1);
         var provider = new BufferedWaveProvider(waveFormat)
         {
@@ -255,6 +277,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
                 }
 
                 // A local voice renders faster than real time; wait for room rather than drop the tail.
+                // Wait for free space in the buffer.
                 while (provider.BufferedBytes + whole > provider.BufferLength)
                 {
                     await Task.Delay(30, cancellationToken);
@@ -269,6 +292,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
                 }
             }
 
+            // After the last data arrives, wait until the buffer has actually finished playing.
             while (provider.BufferedBytes > 0)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -282,6 +306,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         }
     }
 
+    // Downloads the whole WAV file first, then plays it with the configured volume.
     private async Task PlayBufferedWavAsync(Stream audioStream, CancellationToken cancellationToken)
     {
         await using var buffer = new MemoryStream();
@@ -313,6 +338,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         }
     }
 
+    // Final volume multiplier: the speaker volume setting limited to 0.10..2.0, then 60% in whisper mode (quiet speaking mode), floor 0.05.
     private double ResolveOutputGain()
     {
         var gain = Math.Clamp(_options.SpeakerVolumeMultiplier, 0.10, 2.0);
@@ -325,6 +351,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         return Math.Clamp(gain, 0.05, 2.0);
     }
 
+    // Multiplies every 16-bit sample by the gain and clamps to the 16-bit range so it cannot wrap around into noise.
     private static void ScalePcm16Mono(byte[] pcmBuffer, int bytesRecorded, double gain)
     {
         if (bytesRecorded < 2)
@@ -343,12 +370,14 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         }
     }
 
+    // Records and broadcasts the new speaking state.
     private void PublishStatus(bool isSpeaking, string message)
     {
         CurrentStatus = new SpeakerStatusSnapshot(isSpeaking, message, DateTimeOffset.UtcNow);
         StatusChanged?.Invoke(this, new SpeakerStatusChangedEventArgs(CurrentStatus));
     }
 
+    // Accepts a base URL or a full /audio/speech URL.
     private static string BuildEndpoint(string baseUrl)
     {
         var trimmed = baseUrl.Trim().TrimEnd('/');
@@ -361,6 +390,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         return $"{trimmed}/audio/speech";
     }
 
+    // The speech server defaults to the same one used for transcription when no separate voice URL is set.
     private static string ResolveVoiceBaseUrl(JarvisOptions options)
     {
         return string.IsNullOrWhiteSpace(options.VoiceBaseUrl)
@@ -368,6 +398,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
             : options.VoiceBaseUrl;
     }
 
+    // Uses the voice-specific API key, or falls back to the transcription key.
     private static string ResolveVoiceApiKey(JarvisOptions options)
     {
         var voiceApiKey = ApiKeyResolver.Resolve(
@@ -386,6 +417,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
             options.SpeechRecognitionApiKeyEnvironmentVariable);
     }
 
+    // Only "wav" is recognised; anything else means "pcm".
     private static string NormalizeResponseFormat(string? responseFormat)
     {
         if (string.Equals(responseFormat?.Trim(), "wav", StringComparison.OrdinalIgnoreCase))
@@ -396,6 +428,7 @@ internal sealed class OpenAiCompatibleStreamingSpeaker : ISpeaker
         return "pcm";
     }
 
+    // Shortens error bodies to 500 characters.
     private static string TrimForError(string text)
     {
         const int maxLength = 500;

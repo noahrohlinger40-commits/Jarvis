@@ -12,6 +12,9 @@ artifacts/
 # Logs
 *.log
 
+# Python bytecode cache
+__pycache__/
+
 # Runtime data: memories, transcripts, personal state
 data/*.json
 data/*.jsonl

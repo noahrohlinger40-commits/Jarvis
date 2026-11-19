@@ -1,9 +1,15 @@
+// WakeWordDetector.cs: decides whether a piece of recorded audio contains the wake word ("Jarvis" / "hey Jarvis").
+// OpenAiCompatibleVoiceRuntime calls Detect(audio) on each utterance when whisper's transcript had no name in it.
+// Two interchangeable back ends sit behind one wrapper: an external program such as openWakeWord (run as a child process on a
+// temporary WAV file, see WakeWordEngines.cs) or the Windows speech recogniser with a tiny grammar of just the wake phrases.
 using System.Speech.Recognition;
 using System.Text.Json;
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// Outcome of one check: whether the wake word was found, which spelling matched, confidence (0..1), whether it was the
+// name alone (ShouldArmOnly = just open the listening window), and any command spoken right after it.
 internal sealed record WakeWordDetectionResult(
     bool IsDetected,
     string Alias,
@@ -14,12 +20,15 @@ internal sealed record WakeWordDetectionResult(
     string RecognizedText = "",
     string InlineCommand = "")
 {
+    // Shared "nothing found" result.
     public static WakeWordDetectionResult None { get; } =
         new(false, string.Empty, 0, false, TimeSpan.Zero, TimeSpan.Zero);
 }
 
+// Public face of the detector; hides which back end is in use.
 internal sealed class WakeWordDetector : IDisposable
 {
+    // The actual detection method (recogniser or external program).
     private readonly IWakeWordDetectionBackend _backend;
 
     private WakeWordDetector(IWakeWordDetectionBackend backend)
@@ -29,11 +38,18 @@ internal sealed class WakeWordDetector : IDisposable
 
     public string DescriptionLabel => _backend.DescriptionLabel;
 
+    // True for a manifest-backed engine such as openWakeWord; the recognizer-grammar default is status-only.
+    /// <summary>True for a manifest-backed engine such as openWakeWord; the recognizer-grammar default is status-only.</summary>
+    public bool UsesExternalEngine => _backend is ExternalProcessWakeWordDetectionBackend;
+
+    // Builds a detector using the default microphone processing profile.
     public static WakeWordDetector? Create(JarvisOptions options)
     {
         return Create(options, MicrophoneProcessingProfileResolver.Resolve(options));
     }
 
+    // Builds the detector from settings, or returns null when wake detection is off or impossible (no phrases, no recogniser).
+    // Picks the external engine if its executable is configured, otherwise the Windows recogniser. Any failure means "no detector".
     public static WakeWordDetector? Create(JarvisOptions options, ResolvedMicrophoneProcessingProfile processingProfile)
     {
         if (!options.WakeWordEnabled || !options.SpeechRecognitionWakeDetectionEnabled)
@@ -94,6 +110,7 @@ internal sealed class WakeWordDetector : IDisposable
         }
     }
 
+    // Checks one utterance of 16-bit mono audio for the wake word.
     public WakeWordDetectionResult Detect(byte[] pcm16MonoAudio, int sampleRateHz)
     {
         return _backend.Detect(pcm16MonoAudio, sampleRateHz);
@@ -104,6 +121,7 @@ internal sealed class WakeWordDetector : IDisposable
         _backend.Dispose();
     }
 
+    // Collects every phrase that should count as the wake word: the normal aliases with greetings, plus those from the wake asset.
     internal static IReadOnlyList<string> BuildWakeChoices(JarvisOptions options, WakeWordAssetDescriptor? asset)
     {
         var choices = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -137,6 +155,8 @@ internal sealed class WakeWordDetector : IDisposable
         }
     }
 
+    // Checks whether a recognised text starts with one of the wake phrases and, if so, returns the matched phrase and the rest as the inline command.
+    // A phrase only matches as a whole word: "jarvisford" does not count, but "jarvis, open notepad" does (a space or , . ! ? : ; - may follow).
     internal static bool TryExtractDetectedWakeCommand(
         string recognizedText,
         IReadOnlyList<NormalizedWakeChoice> normalizedWakeChoices,
@@ -173,6 +193,7 @@ internal sealed class WakeWordDetector : IDisposable
         return false;
     }
 
+    // Removes stray punctuation around the command.
     internal static string NormalizeDetectedCommand(string text)
     {
         return text
@@ -181,6 +202,7 @@ internal sealed class WakeWordDetector : IDisposable
             .Trim();
     }
 
+    // Picks the installed Windows speech recogniser for the configured language, else the first one.
     private static RecognizerInfo? ResolveRecognizer(JarvisOptions options)
     {
         var installedRecognizers = SpeechRecognitionEngine.InstalledRecognizers().ToArray();
@@ -198,6 +220,9 @@ internal sealed class WakeWordDetector : IDisposable
             ?? installedRecognizers[0];
     }
 
+    // Works out how sure a detection must be before it counts (0..1, lower = more sensitive). Starts from the lower (more lenient) of the
+    // recogniser threshold (minus 0.10) and the sensitivity slider (0.70 down to 0.40), then an asset or engine can override it
+    // and each subtracts its own sensitivity bias. Final range is 0.22 to 0.82.
     private static double ResolveMinimumConfidence(
         JarvisOptions options,
         WakeWordAssetDescriptor? asset,
@@ -227,6 +252,7 @@ internal sealed class WakeWordDetector : IDisposable
         return threshold;
     }
 
+    // What every back end must offer: a label and a Detect method.
     private interface IWakeWordDetectionBackend : IDisposable
     {
         string DescriptionLabel { get; }
@@ -234,14 +260,18 @@ internal sealed class WakeWordDetector : IDisposable
         WakeWordDetectionResult Detect(byte[] pcm16MonoAudio, int sampleRateHz);
     }
 
+    // Uses the Windows recogniser with a small grammar (only wake phrases, or wake phrase + free speech) and feeds it the audio from memory.
     private sealed class RecognizerWakeWordDetectionBackend : IWakeWordDetectionBackend
     {
+        // Names of the two grammars loaded into the recogniser.
         private const string WakeGrammarName = "trained-wake-word";
         private const string WakeCommandGrammarName = "trained-wake-command";
 
+        // Only one recognition at a time; the engine is not thread safe.
         private readonly object _sync = new();
         private readonly JarvisOptions _options;
         private readonly SpeechRecognitionEngine _engine;
+        // Wake phrases pre-cleaned and sorted longest first, so "hey jarvis" is tried before "jarvis".
         private readonly IReadOnlyList<NormalizedWakeChoice> _normalizedWakeChoices;
         private readonly double _minimumConfidence;
         private bool _isDisposed;
@@ -269,6 +299,8 @@ internal sealed class WakeWordDetector : IDisposable
 
         public string DescriptionLabel { get; }
 
+        // Runs recognition on the audio (rejects audio under 125 ms, which is sample rate / 8 samples) and returns the first wake match
+        // that is confident enough. 2.5 seconds is the most it will wait for the recogniser.
         public WakeWordDetectionResult Detect(byte[] pcm16MonoAudio, int sampleRateHz)
         {
             if (sampleRateHz <= 0 || pcm16MonoAudio.Length < sampleRateHz / 8)
@@ -280,6 +312,7 @@ internal sealed class WakeWordDetector : IDisposable
 
             try
             {
+                // Wrap the raw audio as a WAV file in memory, which the recogniser can read.
                 using var stream = new MemoryStream(Pcm16WavWriter.WrapPcm16Mono(pcm16MonoAudio, sampleRateHz));
 
                 lock (_sync)
@@ -360,6 +393,7 @@ internal sealed class WakeWordDetector : IDisposable
             }
         }
 
+        // Loads two grammars: the wake phrase alone, and the wake phrase followed by free dictation.
         private void LoadWakeGrammars(RecognizerInfo recognizer, IReadOnlyList<string> wakeChoices)
         {
             var choices = new Choices(wakeChoices.ToArray());
@@ -381,6 +415,7 @@ internal sealed class WakeWordDetector : IDisposable
         }
     }
 
+    // Runs an external wake word program (for example openWakeWord) as a separate process for each utterance.
     private sealed class ExternalProcessWakeWordDetectionBackend : IWakeWordDetectionBackend
     {
         private readonly JarvisOptions _options;
@@ -414,6 +449,8 @@ internal sealed class WakeWordDetector : IDisposable
 
         public string DescriptionLabel => $"external wake engine \"{_wakeEngine.BuildShortLabel()}\"";
 
+        // Writes the audio to a temporary WAV file, runs the configured program with that file, parses its JSON output and deletes the file.
+        // Blocks the calling thread until the program ends or times out. Returns None on any failure.
         public WakeWordDetectionResult Detect(byte[] pcm16MonoAudio, int sampleRateHz)
         {
             if (sampleRateHz <= 0 || pcm16MonoAudio.Length < sampleRateHz / 8)
@@ -421,11 +458,13 @@ internal sealed class WakeWordDetector : IDisposable
                 return WakeWordDetectionResult.None;
             }
 
+            // Unique temp file name so two checks never collide.
             var tempFilePath = Path.Combine(Path.GetTempPath(), $"jarvis-wake-{Guid.NewGuid():N}.wav");
 
             try
             {
                 File.WriteAllBytes(tempFilePath, Pcm16WavWriter.WrapPcm16Mono(pcm16MonoAudio, sampleRateHz));
+                // Values substituted into the program's command-line template (audio file, sample rate, aliases, model path...).
                 var placeholders = BuildPlaceholders(tempFilePath, sampleRateHz);
                 var result = ConfiguredExternalProcessRunner.RunAsync(
                         _wakeEngine.ExecutablePath,
@@ -444,6 +483,7 @@ internal sealed class WakeWordDetector : IDisposable
                     return WakeWordDetectionResult.None;
                 }
 
+                // Parse the program's output into a result; its text is run through the same wake phrase matcher.
                 var detection = ExternalWakeEngineResponseParser.Parse(
                     result.StandardOutput,
                     _options,
@@ -471,6 +511,7 @@ internal sealed class WakeWordDetector : IDisposable
             {
                 try
                 {
+                    // Always remove the temporary audio file.
                     if (File.Exists(tempFilePath))
                     {
                         File.Delete(tempFilePath);
@@ -486,6 +527,7 @@ internal sealed class WakeWordDetector : IDisposable
         {
         }
 
+        // Fills in the placeholder values the engine's command line can refer to.
         private IReadOnlyDictionary<string, string> BuildPlaceholders(string audioFilePath, int sampleRateHz)
         {
             var placeholders = ConfiguredExternalProcessRunner.BuildCommonPlaceholders(_options, _processingProfile);
@@ -503,5 +545,6 @@ internal sealed class WakeWordDetector : IDisposable
         }
     }
 
+    // A wake phrase as written in settings and its cleaned form used for comparison.
     internal sealed record NormalizedWakeChoice(string Original, string Normalized);
 }

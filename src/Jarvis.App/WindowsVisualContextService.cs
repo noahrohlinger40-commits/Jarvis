@@ -1,7 +1,10 @@
+// WindowsVisualContextService.cs: Jarvis's "eyes" (IVisualContextService in Jarvis.Core): screenshots of a display or window,
+// the monitor list, and analysis of images, scans and text files via the language model's vision route (ModelRoute.Vision) or fast text route.
+// The agent's screen and document tools call it (created in AppBootstrapper.cs). The "OCR" and "UI detection" here are not Windows OCR
+// or UI Automation: the screenshot goes to a vision model asked to answer in a fixed JSON shape. Screenshots are saved as PNGs and old ones pruned.
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -12,6 +15,7 @@ namespace Jarvis.App;
 
 internal sealed class WindowsVisualContextService : IVisualContextService
 {
+    // File types analyze image accepts (the vision model reads these).
     private static readonly HashSet<string> SupportedImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".png",
@@ -24,6 +28,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         ".tiff"
     };
 
+    // File types analyze document reads as plain text.
     private static readonly HashSet<string> SupportedTextDocumentExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".txt",
@@ -51,18 +56,17 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         ".toml"
     };
 
+    // How model-returned JSON is read: web-style camelCase names, ignoring letter case.
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
     };
 
-    private static readonly JsonSerializerOptions IndentedJsonOptions = new(JsonOptions)
-    {
-        WriteIndented = true
-    };
-
+    // Where relative file paths are resolved from.
     private readonly string _workspaceRoot;
+    // Settings used here: capture folder and how many screenshots to keep.
     private readonly JarvisOptions _options;
+    // The language-model client; IsAvailable is false when no model provider is set up.
     private readonly IModelGateway _modelGateway;
 
     public WindowsVisualContextService(string workspaceRoot, JarvisOptions options, IModelGateway modelGateway)
@@ -72,19 +76,23 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         _modelGateway = modelGateway;
     }
 
+    // "screen analyze": take a screenshot (display or window chosen from the text in input), then ask the vision model a question about it. If no model is available or the model fails, the screenshot is still saved and reported.
     public async Task<ToolResult> AnalyzeCurrentScreenAsync(string input, CancellationToken cancellationToken)
     {
         CapturedScreen capture;
 
         try
         {
+            // ParseScreenRequest works out what to capture and what to ask from the user's words; CaptureScreen takes the picture.
             capture = CaptureScreen(ParseScreenRequest(input));
         }
+        // Cancellation is passed on; any other failure becomes a failed ToolResult rather than an exception.
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             return Failed("Visual analysis failed.", exception.Message, "The visual context service could not capture the requested display.");
         }
 
+        // Default question when the user only named a target.
         var question = string.IsNullOrWhiteSpace(capture.Request.Question)
             ? "Describe the captured display, the visible UI, notable text, and any state that matters right now."
             : capture.Request.Question;
@@ -97,6 +105,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
                 succeeded: true);
         }
 
+        // The text prompt: facts about the capture (displays, active window) followed by the question. The image goes alongside it below.
         var prompt = string.Join(
             Environment.NewLine,
             BuildCapturePromptContext(capture),
@@ -113,6 +122,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
                 ? $"I captured {capture.TargetLabel}, but the vision model returned an empty response."
                 : content.Trim();
 
+            // The first result string is what the model sees and may say; VerificationText and SummaryText are short notes for the agent's checks and the spoken reply.
             return new ToolResult(
                 $"Visual analysis for {capture.FilePath}:{Environment.NewLine}{content}",
                 VerificationText: $"Captured {capture.TargetLabel} to {capture.FilePath} and analyzed it with the vision route.",
@@ -127,6 +137,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // "screen capture": just save the screenshot and describe it; no model involved.
     public Task<ToolResult> CaptureScreenAsync(string input, CancellationToken cancellationToken)
     {
         try
@@ -140,6 +151,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // "screen ocr": ask the vision model to read all visible text and return JSON (summary, fullText, textBlocks).
     public async Task<ToolResult> ExtractScreenTextAsync(string input, CancellationToken cancellationToken)
     {
         CapturedScreen capture;
@@ -170,11 +182,13 @@ internal sealed class WindowsVisualContextService : IVisualContextService
 
         try
         {
+            // The reply is asked to be pure JSON, matching OcrExtractionContract.
             var content = await CompleteVisionPromptAsync(
                 "You are Jarvis. Perform OCR-style extraction on the supplied desktop screenshot. Return only JSON with keys `summary`, `fullText`, and `textBlocks`. Each `textBlocks` item must contain `text`, `region`, and `purpose`.",
                 [ChatMessageContentPart.FromText(prompt), await BuildImagePartAsync(capture.FilePath, cancellationToken)],
                 cancellationToken);
 
+            // If the model ignored the format and returned prose, ParseJson gives null and the raw text is shown instead.
             var extraction = ParseJson<OcrExtractionContract>(content);
 
             if (extraction is null)
@@ -196,6 +210,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             {
                 lines.Add("- Text blocks:");
 
+                // Show at most 10 text blocks to keep the result short.
                 foreach (var block in extraction.TextBlocks.Take(10))
                 {
                     lines.Add($"  - {Coalesce(block.Region, "unknown region")} | {Coalesce(block.Purpose, "unspecified")} | {Coalesce(block.Text, "(empty)")}");
@@ -216,6 +231,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // "screen ui": ask the vision model to list the visible UI elements as JSON (UiDetectionContract).
     public async Task<ToolResult> DetectScreenUiAsync(string input, CancellationToken cancellationToken)
     {
         CapturedScreen capture;
@@ -246,6 +262,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
 
         try
         {
+            // The reply is asked to be pure JSON, matching UiDetectionContract.
             var content = await CompleteVisionPromptAsync(
                 "You are Jarvis. Detect structured UI elements from the supplied desktop screenshot. Return only JSON with keys `summary`, `applicationGuess`, and `uiElements`. Each `uiElements` item must contain `label`, `role`, `text`, `state`, `region`, and `importance`.",
                 [ChatMessageContentPart.FromText(prompt), await BuildImagePartAsync(capture.FilePath, cancellationToken)],
@@ -272,6 +289,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             {
                 lines.Add("- UI elements:");
 
+                // Show at most 12 elements.
                 foreach (var element in detection.UiElements.Take(12))
                 {
                     lines.Add($"  - {Coalesce(element.Region, "unknown region")} | {Coalesce(element.Role, "control")} | {Coalesce(element.Label, "unnamed")} | text={Coalesce(element.Text, "(none)")} | state={Coalesce(element.State, "unknown")} | importance={Coalesce(element.Importance, "normal")}");
@@ -292,6 +310,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // "screen monitors": list the connected displays and mark the active one.
     public Task<ToolResult> ListDisplaysAsync(CancellationToken cancellationToken)
     {
         try
@@ -324,39 +343,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
-    public async Task<ToolResult> AnalyzeAmbientContextAsync(string input, CancellationToken cancellationToken)
-    {
-        var normalized = input.Trim();
-
-        if (string.IsNullOrWhiteSpace(normalized) || normalized.Equals("status", StringComparison.OrdinalIgnoreCase))
-        {
-            return BuildAmbientStatusResult();
-        }
-
-        if (StartsWithCommand(normalized, "webcam") || StartsWithCommand(normalized, "camera"))
-        {
-            var payload = TrimCommandPrefix(normalized, "webcam", "camera");
-            return await AnalyzeAmbientFrameAsync(payload, "Describe the room scene, visible people, gestures, and anything relevant for ambient activation.", "Ambient webcam analysis", cancellationToken);
-        }
-
-        if (StartsWithCommand(normalized, "presence") || StartsWithCommand(normalized, "gesture"))
-        {
-            return await AnalyzePresenceAsync(normalized, cancellationToken);
-        }
-
-        if (StartsWithCommand(normalized, "face recognition") || StartsWithCommand(normalized, "face"))
-        {
-            return await AnalyzeFaceRecognitionAsync(normalized, cancellationToken);
-        }
-
-        if (StartsWithCommand(normalized, "room sensors") || StartsWithCommand(normalized, "room"))
-        {
-            return await AnalyzeRoomSensorsAsync(TrimCommandPrefix(normalized, "room sensors", "room"), cancellationToken);
-        }
-
-        return BuildAmbientStatusResult();
-    }
-
+    // "analyze image <path> [:: question]": check the file exists and has a supported image type, then ask the vision model.
     public async Task<ToolResult> AnalyzeImageAsync(string input, CancellationToken cancellationToken)
     {
         var payload = ParsePayload(input);
@@ -407,6 +394,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             cancellationToken);
     }
 
+    // "analyze document <path> [:: question]": route by file type: images go to the vision model, PDFs are refused (no PDF reader), supported text files are read and summarized, anything else is rejected.
     public async Task<ToolResult> AnalyzeDocumentAsync(string input, CancellationToken cancellationToken)
     {
         var payload = ParsePayload(input);
@@ -440,7 +428,11 @@ internal sealed class WindowsVisualContextService : IVisualContextService
 
         if (string.Equals(extension, ".pdf", StringComparison.OrdinalIgnoreCase))
         {
-            return await AnalyzePdfDocumentAsync(resolvedPath, payload.Question, cancellationToken);
+            return new ToolResult(
+                "I can't read PDF files. Open the PDF, or give me a text or image file.",
+                Succeeded: false,
+                VerificationText: "The file is a PDF, which analyze document does not read, so nothing was read.",
+                SummaryText: "PDF files are not supported.");
         }
 
         if (!SupportedTextDocumentExtensions.Contains(extension))
@@ -455,6 +447,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return await AnalyzeTextDocumentAsync(resolvedPath, payload.Question, cancellationToken);
     }
 
+    // Read a text file, build a few facts about it (type, character count, line count) and hand it to the summarizer.
     private async Task<ToolResult> AnalyzeTextDocumentAsync(string resolvedPath, string question, CancellationToken cancellationToken)
     {
         var documentText = await File.ReadAllTextAsync(resolvedPath, cancellationToken);
@@ -484,67 +477,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             cancellationToken);
     }
 
-    private async Task<ToolResult> AnalyzePdfDocumentAsync(string resolvedPath, string question, CancellationToken cancellationToken)
-    {
-        PdfExtractionResult extraction;
-
-        try
-        {
-            extraction = ExtractPdfContent(resolvedPath);
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            return new ToolResult(
-                $"PDF analysis failed: {TrimError(exception.Message)}",
-                Succeeded: false,
-                VerificationText: $"The runtime could not parse the PDF at {resolvedPath}.",
-                SummaryText: "PDF analysis failed.");
-        }
-
-        var metadataLines = new List<string>
-        {
-            "Document type: PDF",
-            extraction.PageCount > 0 ? $"Estimated pages: {extraction.PageCount}" : "Estimated pages: unknown",
-            $"Extraction confidence: {extraction.Confidence}"
-        };
-
-        if (!string.IsNullOrWhiteSpace(extraction.Title))
-        {
-            metadataLines.Add($"Title: {extraction.Title}");
-        }
-
-        if (!string.IsNullOrWhiteSpace(extraction.Author))
-        {
-            metadataLines.Add($"Author: {extraction.Author}");
-        }
-
-        if (!string.IsNullOrWhiteSpace(extraction.Note))
-        {
-            metadataLines.Add($"Extraction note: {extraction.Note}");
-        }
-
-        if (string.IsNullOrWhiteSpace(extraction.Text))
-        {
-            var lines = new List<string> { $"PDF analysis for {resolvedPath}:" };
-            lines.AddRange(metadataLines.Select(line => $"- {line}"));
-            lines.Add("- Extracted text preview: No embedded text could be recovered from this PDF. It may be image-heavy or scanned.");
-
-            return new ToolResult(
-                string.Join(Environment.NewLine, lines),
-                Succeeded: false,
-                VerificationText: $"Inspected the PDF structure at {resolvedPath}, but no usable embedded text was recovered.",
-                SummaryText: "PDF extraction produced no usable text.");
-        }
-
-        return await AnalyzeStructuredTextDocumentAsync(
-            resolvedPath,
-            "PDF",
-            extraction.Text,
-            question,
-            metadataLines,
-            cancellationToken);
-    }
-
+    // A scan, receipt or form saved as an image: ask the vision model to read it and return JSON (DocumentAnalysisContract).
     private async Task<ToolResult> AnalyzeImageDocumentAsync(string resolvedPath, string question, CancellationToken cancellationToken)
     {
         if (!_modelGateway.IsAvailable)
@@ -590,6 +523,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // Summarize a text document: use only the first 16,000 characters (to stay within the model's context), and ask the fast text model for JSON. Without a model, return a short preview instead.
     private async Task<ToolResult> AnalyzeStructuredTextDocumentAsync(
         string resolvedPath,
         string sourceKind,
@@ -612,6 +546,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             ? "Summarize the document and highlight the most important details."
             : question.Trim();
 
+        // System message tells the model the JSON keys to return; the user message carries the question, path, facts and excerpt.
         var messages = new[]
         {
             new ChatMessage("system", [ChatMessageContentPart.FromText("You are Jarvis. Analyze the supplied document excerpt and return only JSON with keys `summary`, `documentType`, `confidence`, `extractedTextPreview`, `caveats`, `keyPoints`, `actionItems`, `sections`, and `keyFields`. Each `sections` item must contain `heading` and `purpose`. Each `keyFields` item must contain `label` and `value`. Keep the analysis grounded in the provided text; if OCR or PDF extraction appears incomplete, say so in `caveats`.")]),
@@ -622,6 +557,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         try
         {
             var response = await _modelGateway.CompleteAsync(
+                // Temperature 0.1 = nearly deterministic answers.
                 new ChatCompletionRequest(messages, Temperature: 0.1),
                 ModelRoute.Fast,
                 cancellationToken);
@@ -657,6 +593,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // Turn the parsed JSON into readable lines, with every list capped (8 to 10 entries) so the reply stays short.
     private static ToolResult BuildStructuredDocumentResult(
         string resolvedPath,
         DocumentAnalysisContract analysis,
@@ -718,6 +655,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             SummaryText: FirstSentence(Coalesce(analysis.Summary, analysis.DocumentType)));
     }
 
+    // A plain preview used when no model is available.
     private static string BuildDocumentPreview(
         string resolvedPath,
         string sourceKind,
@@ -735,6 +673,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return string.Join(Environment.NewLine, lines);
     }
 
+    // The lines sent to the model: question, path, facts about the file, then the text excerpt.
     private static IReadOnlyList<string> BuildDocumentPromptLines(
         string resolvedPath,
         string question,
@@ -752,6 +691,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return lines;
     }
 
+    // Collapse the text to one line and cut it to maxCharacters, marking the cut.
     private static string TruncateDocumentText(string documentText, int maxCharacters)
     {
         var normalized = NormalizeExtractedDocumentText(documentText);
@@ -764,6 +704,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return normalized[..maxCharacters].TrimEnd() + Environment.NewLine + "[document truncated]";
     }
 
+    // Same as above but for the short preview, ending in "..." when cut.
     private static string BuildPreviewText(string documentText, int maxCharacters)
     {
         var normalized = NormalizeExtractedDocumentText(documentText);
@@ -778,6 +719,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             : normalized[..maxCharacters].TrimEnd() + "...";
     }
 
+    // Number of lines = number of newline characters plus one.
     private static int CountLines(string documentText)
     {
         if (string.IsNullOrEmpty(documentText))
@@ -788,470 +730,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return documentText.Count(character => character == '\n') + 1;
     }
 
-    private static PdfExtractionResult ExtractPdfContent(string resolvedPath)
-    {
-        var bytes = File.ReadAllBytes(resolvedPath);
-        var rawText = Encoding.Latin1.GetString(bytes);
-        var pageCount = Regex.Matches(rawText, @"/Type\s*/Page\b", RegexOptions.CultureInvariant).Count;
-        var fragments = new List<string>();
-
-        foreach (var stream in EnumeratePdfStreams(bytes))
-        {
-            if (stream.Dictionary.Contains("/Subtype /Image", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var decoded = DecodePdfStream(stream.Data, stream.Dictionary);
-
-            if (decoded.Length == 0)
-            {
-                continue;
-            }
-
-            var extracted = ExtractTextFromPdfStream(decoded);
-
-            if (!string.IsNullOrWhiteSpace(extracted))
-            {
-                fragments.Add(extracted);
-            }
-        }
-
-        var extractedText = NormalizeExtractedDocumentText(string.Join(Environment.NewLine, fragments));
-
-        if (string.IsNullOrWhiteSpace(extractedText))
-        {
-            extractedText = NormalizeExtractedDocumentText(ExtractTextFromPdfStream(bytes));
-        }
-
-        var confidence = DeterminePdfExtractionConfidence(extractedText);
-        var note = confidence switch
-        {
-            "high" => "Embedded text extraction recovered a substantial amount of readable PDF text.",
-            "medium" => "Embedded text extraction recovered partial PDF text; layout and tables may be incomplete.",
-            _ => "This PDF appears image-heavy, scanned, or encoded with non-extractable text. Results may be incomplete."
-        };
-
-        return new PdfExtractionResult(
-            pageCount,
-            TryExtractPdfMetadata(rawText, "Title"),
-            TryExtractPdfMetadata(rawText, "Author"),
-            extractedText,
-            confidence,
-            note);
-    }
-
-    private static IEnumerable<PdfStreamCandidate> EnumeratePdfStreams(byte[] bytes)
-    {
-        var streamToken = Encoding.ASCII.GetBytes("stream");
-        var endStreamToken = Encoding.ASCII.GetBytes("endstream");
-        var index = 0;
-
-        while (TryFindBytes(bytes, streamToken, index, out var streamIndex))
-        {
-            if (!TryFindBytes(bytes, endStreamToken, streamIndex + streamToken.Length, out var endStreamIndex))
-            {
-                yield break;
-            }
-
-            var dataStart = streamIndex + streamToken.Length;
-
-            if (dataStart < bytes.Length && bytes[dataStart] == (byte)'\r')
-            {
-                dataStart++;
-            }
-
-            if (dataStart < bytes.Length && bytes[dataStart] == (byte)'\n')
-            {
-                dataStart++;
-            }
-
-            var dataEnd = endStreamIndex;
-
-            while (dataEnd > dataStart && (bytes[dataEnd - 1] == (byte)'\r' || bytes[dataEnd - 1] == (byte)'\n'))
-            {
-                dataEnd--;
-            }
-
-            if (dataEnd > dataStart)
-            {
-                var dictionaryStart = FindLastBytes(bytes, Encoding.ASCII.GetBytes("<<"), streamIndex);
-                var dictionaryEnd = FindLastBytes(bytes, Encoding.ASCII.GetBytes(">>"), streamIndex);
-
-                if (dictionaryStart >= 0 && dictionaryEnd >= dictionaryStart)
-                {
-                    var dictionaryBytes = bytes[dictionaryStart..(dictionaryEnd + 2)];
-                    var streamBytes = bytes[dataStart..dataEnd];
-                    yield return new PdfStreamCandidate(Encoding.Latin1.GetString(dictionaryBytes), streamBytes);
-                }
-            }
-
-            index = endStreamIndex + endStreamToken.Length;
-        }
-    }
-
-    private static byte[] DecodePdfStream(byte[] data, string dictionaryText)
-    {
-        if (data.Length == 0)
-        {
-            return [];
-        }
-
-        var current = data;
-
-        foreach (var filter in ExtractPdfFilters(dictionaryText))
-        {
-            current = filter switch
-            {
-                "ASCII85Decode" => DecodeAscii85(current),
-                "ASCIIHexDecode" => DecodeAsciiHex(current),
-                "FlateDecode" => DecodeFlate(current),
-                _ => []
-            };
-
-            if (current.Length == 0)
-            {
-                return [];
-            }
-        }
-
-        return current;
-    }
-
-    private static IReadOnlyList<string> ExtractPdfFilters(string dictionaryText)
-    {
-        var filterMatch = Regex.Match(
-            dictionaryText,
-            @"/Filter\s*(?<filters>\[[^\]]+\]|/[A-Za-z0-9]+)",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline | RegexOptions.CultureInvariant);
-
-        if (!filterMatch.Success)
-        {
-            return [];
-        }
-
-        return Regex.Matches(filterMatch.Groups["filters"].Value, @"/([A-Za-z0-9]+)", RegexOptions.CultureInvariant)
-            .Select(match => match.Groups[1].Value)
-            .ToArray();
-    }
-
-    private static byte[] DecodeFlate(byte[] data)
-    {
-        try
-        {
-            using var input = new MemoryStream(data);
-            using var zlib = new ZLibStream(input, CompressionMode.Decompress);
-            using var output = new MemoryStream();
-            zlib.CopyTo(output);
-            return output.ToArray();
-        }
-        catch
-        {
-            try
-            {
-                using var input = new MemoryStream(data);
-                using var deflate = new DeflateStream(input, CompressionMode.Decompress);
-                using var output = new MemoryStream();
-                deflate.CopyTo(output);
-                return output.ToArray();
-            }
-            catch
-            {
-                return [];
-            }
-        }
-    }
-
-    private static byte[] DecodeAsciiHex(byte[] data)
-    {
-        var hex = new StringBuilder();
-
-        foreach (var value in data)
-        {
-            var character = (char)value;
-
-            if (character == '>')
-            {
-                break;
-            }
-
-            if (Uri.IsHexDigit(character))
-            {
-                hex.Append(character);
-            }
-        }
-
-        if (hex.Length == 0)
-        {
-            return [];
-        }
-
-        if (hex.Length % 2 != 0)
-        {
-            hex.Append('0');
-        }
-
-        var result = new byte[hex.Length / 2];
-
-        for (var index = 0; index < result.Length; index++)
-        {
-            result[index] = Convert.ToByte(hex.ToString(index * 2, 2), 16);
-        }
-
-        return result;
-    }
-
-    private static byte[] DecodeAscii85(byte[] data)
-    {
-        var text = Encoding.ASCII.GetString(data);
-        var bytes = new List<byte>();
-        var group = new List<int>(5);
-
-        foreach (var character in text)
-        {
-            if (char.IsWhiteSpace(character) || character == '<' || character == '~')
-            {
-                continue;
-            }
-
-            if (character == 'z' && group.Count == 0)
-            {
-                bytes.AddRange([0, 0, 0, 0]);
-                continue;
-            }
-
-            if (character == '>')
-            {
-                break;
-            }
-
-            if (character < '!' || character > 'u')
-            {
-                continue;
-            }
-
-            group.Add(character - '!');
-
-            if (group.Count != 5)
-            {
-                continue;
-            }
-
-            AppendAscii85Group(bytes, group, 4);
-            group.Clear();
-        }
-
-        if (group.Count > 0)
-        {
-            var originalCount = group.Count;
-
-            while (group.Count < 5)
-            {
-                group.Add('u' - '!');
-            }
-
-            AppendAscii85Group(bytes, group, Math.Max(0, originalCount - 1));
-        }
-
-        return bytes.ToArray();
-    }
-
-    private static void AppendAscii85Group(List<byte> bytes, IReadOnlyList<int> group, int byteCount)
-    {
-        uint value = 0;
-
-        for (var index = 0; index < 5; index++)
-        {
-            value = value * 85u + (uint)group[index];
-        }
-
-        var decoded = new[]
-        {
-            (byte)(value >> 24),
-            (byte)(value >> 16),
-            (byte)(value >> 8),
-            (byte)value
-        };
-
-        for (var index = 0; index < byteCount && index < decoded.Length; index++)
-        {
-            bytes.Add(decoded[index]);
-        }
-    }
-
-    private static string ExtractTextFromPdfStream(byte[] data)
-    {
-        var text = Encoding.Latin1.GetString(data);
-        var fragments = new List<string>();
-
-        for (var index = 0; index < text.Length; index++)
-        {
-            if (text[index] == '(')
-            {
-                if (TryReadPdfLiteralString(text, ref index, out var literal)
-                    && IsLikelyReadableDocumentText(literal))
-                {
-                    fragments.Add(literal);
-                }
-
-                continue;
-            }
-
-            if (text[index] == '<'
-                && index + 1 < text.Length
-                && text[index + 1] != '<'
-                && TryReadPdfHexString(text, ref index, out var hexString)
-                && IsLikelyReadableDocumentText(hexString))
-            {
-                fragments.Add(hexString);
-            }
-        }
-
-        return NormalizeExtractedDocumentText(string.Join(" ", fragments));
-    }
-
-    private static bool TryReadPdfLiteralString(string text, ref int index, out string value)
-    {
-        value = string.Empty;
-
-        if (index >= text.Length || text[index] != '(')
-        {
-            return false;
-        }
-
-        var builder = new StringBuilder();
-        var depth = 0;
-
-        for (index++; index < text.Length; index++)
-        {
-            var character = text[index];
-
-            if (character == '\\')
-            {
-                if (index + 1 >= text.Length)
-                {
-                    break;
-                }
-
-                var next = text[++index];
-
-                if (next is >= '0' and <= '7')
-                {
-                    var octal = new StringBuilder();
-                    octal.Append(next);
-
-                    for (var count = 0; count < 2 && index + 1 < text.Length && text[index + 1] is >= '0' and <= '7'; count++)
-                    {
-                        octal.Append(text[++index]);
-                    }
-
-                    builder.Append((char)Convert.ToInt32(octal.ToString(), 8));
-                    continue;
-                }
-
-                builder.Append(next switch
-                {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'b' => '\b',
-                    'f' => '\f',
-                    _ => next
-                });
-                continue;
-            }
-
-            if (character == '(')
-            {
-                depth++;
-                builder.Append(character);
-                continue;
-            }
-
-            if (character == ')')
-            {
-                if (depth == 0)
-                {
-                    value = NormalizeExtractedDocumentText(builder.ToString());
-                    return true;
-                }
-
-                depth--;
-                builder.Append(character);
-                continue;
-            }
-
-            builder.Append(character);
-        }
-
-        return false;
-    }
-
-    private static bool TryReadPdfHexString(string text, ref int index, out string value)
-    {
-        value = string.Empty;
-
-        if (index >= text.Length || text[index] != '<')
-        {
-            return false;
-        }
-
-        var hex = new StringBuilder();
-
-        for (index++; index < text.Length; index++)
-        {
-            var character = text[index];
-
-            if (character == '>')
-            {
-                break;
-            }
-
-            if (Uri.IsHexDigit(character))
-            {
-                hex.Append(character);
-            }
-        }
-
-        if (hex.Length == 0)
-        {
-            return false;
-        }
-
-        if (hex.Length % 2 != 0)
-        {
-            hex.Append('0');
-        }
-
-        var bytes = new byte[hex.Length / 2];
-
-        for (var offset = 0; offset < bytes.Length; offset++)
-        {
-            bytes[offset] = Convert.ToByte(hex.ToString(offset * 2, 2), 16);
-        }
-
-        value = NormalizeExtractedDocumentText(DecodePdfTextBytes(bytes));
-        return !string.IsNullOrWhiteSpace(value);
-    }
-
-    private static string DecodePdfTextBytes(byte[] bytes)
-    {
-        if (bytes.Length >= 2)
-        {
-            if (bytes[0] == 0xFE && bytes[1] == 0xFF)
-            {
-                return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
-            }
-
-            if (bytes[0] == 0xFF && bytes[1] == 0xFE)
-            {
-                return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
-            }
-        }
-
-        return Encoding.Latin1.GetString(bytes);
-    }
-
+    // Make text one tidy line: remove null characters, turn line breaks into spaces, collapse runs of whitespace.
     private static string NormalizeExtractedDocumentText(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -1263,505 +742,12 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             .Replace("\0", string.Empty, StringComparison.Ordinal)
             .ReplaceLineEndings(" ");
 
+        // \s+ matches any run of whitespace (spaces, tabs, newlines); each run becomes one space.
         sanitized = Regex.Replace(sanitized, @"\s+", " ", RegexOptions.CultureInvariant).Trim();
         return sanitized;
     }
 
-    private static bool IsLikelyReadableDocumentText(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var normalized = NormalizeExtractedDocumentText(value);
-
-        if (normalized.Length < 3)
-        {
-            return false;
-        }
-
-        var letterOrDigitCount = normalized.Count(char.IsLetterOrDigit);
-        return letterOrDigitCount >= Math.Max(3, normalized.Length / 3);
-    }
-
-    private static string DeterminePdfExtractionConfidence(string extractedText)
-    {
-        var normalized = NormalizeExtractedDocumentText(extractedText);
-        var signal = normalized.Count(char.IsLetterOrDigit);
-
-        return signal switch
-        {
-            >= 500 => "high",
-            >= 140 => "medium",
-            _ => "low"
-        };
-    }
-
-    private static string TryExtractPdfMetadata(string rawText, string fieldName)
-    {
-        var match = Regex.Match(
-            rawText,
-            $@"/{Regex.Escape(fieldName)}\s*\((?<value>(?:\\.|[^\\)])*)\)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-        if (!match.Success)
-        {
-            return string.Empty;
-        }
-
-        try
-        {
-            return NormalizeExtractedDocumentText(Regex.Unescape(match.Groups["value"].Value));
-        }
-        catch
-        {
-            return NormalizeExtractedDocumentText(match.Groups["value"].Value);
-        }
-    }
-
-    private static bool TryFindBytes(byte[] source, byte[] pattern, int startIndex, out int index)
-    {
-        for (var offset = startIndex; offset <= source.Length - pattern.Length; offset++)
-        {
-            var matched = true;
-
-            for (var patternIndex = 0; patternIndex < pattern.Length; patternIndex++)
-            {
-                if (source[offset + patternIndex] != pattern[patternIndex])
-                {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if (matched)
-            {
-                index = offset;
-                return true;
-            }
-        }
-
-        index = -1;
-        return false;
-    }
-
-    private static int FindLastBytes(byte[] source, byte[] pattern, int endIndexExclusive)
-    {
-        for (var offset = Math.Min(endIndexExclusive - pattern.Length, source.Length - pattern.Length); offset >= 0; offset--)
-        {
-            var matched = true;
-
-            for (var patternIndex = 0; patternIndex < pattern.Length; patternIndex++)
-            {
-                if (source[offset + patternIndex] != pattern[patternIndex])
-                {
-                    matched = false;
-                    break;
-                }
-            }
-
-            if (matched)
-            {
-                return offset;
-            }
-        }
-
-        return -1;
-    }
-
-    private async Task<ToolResult> AnalyzeAmbientFrameAsync(
-        string input,
-        string defaultQuestion,
-        string prefix,
-        CancellationToken cancellationToken)
-    {
-        if (!_options.AmbientContextEnabled)
-        {
-            return DisabledAmbientResult();
-        }
-
-        var request = ResolveAmbientImageRequest(input);
-
-        if (string.IsNullOrWhiteSpace(request.ImagePath))
-        {
-            return new ToolResult(
-                "Ambient webcam input is not configured. Set `ambientWebcamFramePath` or pass an explicit image path.",
-                Succeeded: false,
-                VerificationText: "No ambient webcam frame path was configured or supplied.",
-                SummaryText: "Ambient webcam input is not configured.");
-        }
-
-        var resolvedPath = ResolvePath(request.ImagePath);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return new ToolResult(
-                $"Ambient webcam frame not found: {resolvedPath}",
-                Succeeded: false,
-                VerificationText: "The configured ambient webcam frame path does not exist.",
-                SummaryText: "Ambient webcam frame not found.");
-        }
-
-        if (!SupportedImageExtensions.Contains(Path.GetExtension(resolvedPath)))
-        {
-            return new ToolResult(
-                $"Ambient webcam frame must be an image file: {resolvedPath}",
-                Succeeded: false,
-                VerificationText: "The configured webcam frame path did not resolve to a supported image.",
-                SummaryText: "Ambient webcam frame is not a supported image.");
-        }
-
-        if (!_modelGateway.IsAvailable)
-        {
-            return new ToolResult(
-                $"Ambient webcam frame is available at {resolvedPath}, but no vision-capable model is configured.",
-                Succeeded: false,
-                VerificationText: $"Resolved the ambient webcam frame path to {resolvedPath}, but no vision route is available.",
-                SummaryText: "Ambient webcam analysis is unavailable.");
-        }
-
-        var question = string.IsNullOrWhiteSpace(request.Question)
-            ? defaultQuestion
-            : request.Question;
-        var sensorSummary = await LoadRoomSensorSummaryAsync(cancellationToken);
-        var prompt = string.Join(
-            Environment.NewLine,
-            $"Ambient context enabled: {_options.AmbientContextEnabled}",
-            $"Presence detection: {_options.AmbientPresenceDetectionEnabled}",
-            $"Gesture detection: {_options.AmbientGestureDetectionEnabled}",
-            $"Spatial audio cues: {_options.SpatialAudioCuesEnabled}",
-            $"Far-field listening: {_options.FarFieldListeningEnabled}",
-            string.IsNullOrWhiteSpace(sensorSummary) ? "Room sensors: not configured or no current snapshot." : $"Room sensors:{Environment.NewLine}{sensorSummary}",
-            $"Question: {question}");
-
-        return await AnalyzeSingleImageAsync(
-            resolvedPath,
-            prompt,
-            $"Read the ambient webcam frame from {resolvedPath} and analyzed it with the vision route.",
-            prefix,
-            cancellationToken);
-    }
-
-    private async Task<ToolResult> AnalyzePresenceAsync(string input, CancellationToken cancellationToken)
-    {
-        if (!_options.AmbientContextEnabled)
-        {
-            return DisabledAmbientResult();
-        }
-
-        var isGestureRequest = input.Contains("gesture", StringComparison.OrdinalIgnoreCase);
-
-        if (isGestureRequest && !_options.AmbientGestureDetectionEnabled)
-        {
-            return new ToolResult(
-                "Gesture detection is disabled. Set `ambientGestureDetectionEnabled` to `true` to allow ambient gesture analysis.",
-                Succeeded: false,
-                VerificationText: "The runtime blocked ambient gesture analysis because it is disabled in settings.",
-                SummaryText: "Ambient gesture detection is disabled.");
-        }
-
-        if (!isGestureRequest && !_options.AmbientPresenceDetectionEnabled)
-        {
-            return new ToolResult(
-                "Presence detection is disabled. Set `ambientPresenceDetectionEnabled` to `true` to allow ambient presence analysis.",
-                Succeeded: false,
-                VerificationText: "The runtime blocked ambient presence analysis because it is disabled in settings.",
-                SummaryText: "Ambient presence detection is disabled.");
-        }
-
-        var request = ResolveAmbientImageRequest(TrimCommandPrefix(input, "presence", "gesture"));
-
-        if (string.IsNullOrWhiteSpace(request.ImagePath))
-        {
-            return new ToolResult(
-                "Ambient presence analysis needs `ambientWebcamFramePath` or an explicit image path.",
-                Succeeded: false,
-                VerificationText: "No webcam frame was available for ambient presence analysis.",
-                SummaryText: "Ambient webcam input is not configured.");
-        }
-
-        var resolvedPath = ResolvePath(request.ImagePath);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return new ToolResult(
-                $"Ambient webcam frame not found: {resolvedPath}",
-                Succeeded: false,
-                VerificationText: "The configured ambient webcam frame path does not exist.",
-                SummaryText: "Ambient webcam frame not found.");
-        }
-
-        if (!_modelGateway.IsAvailable)
-        {
-            return new ToolResult(
-                $"Ambient webcam frame is available at {resolvedPath}, but presence analysis requires a vision-capable model.",
-                Succeeded: false,
-                VerificationText: "No vision route is available for ambient presence analysis.",
-                SummaryText: "Ambient presence analysis is unavailable.");
-        }
-
-        var sensorSummary = await LoadRoomSensorSummaryAsync(cancellationToken);
-        var question = string.IsNullOrWhiteSpace(request.Question)
-            ? (isGestureRequest
-                ? "Assess visible gestures or hand signals that could be used as triggers."
-                : "Assess whether someone is present, their posture, and their approximate distance from the camera.")
-            : request.Question;
-
-        var content = await CompleteVisionPromptAsync(
-            "You are Jarvis. Analyze the webcam frame and optional room-sensor snapshot for ambient activation. Return only JSON with keys `summary`, `someonePresent`, `peopleCount`, `primaryPosture`, `approximateDistance`, `gesture`, `activationRecommendation`, `confidence`, and `sensorNotes`. Do not infer identity.",
-            [ChatMessageContentPart.FromText(
-                string.Join(
-                    Environment.NewLine,
-                    string.IsNullOrWhiteSpace(sensorSummary) ? "Room sensors: unavailable." : $"Room sensors:{Environment.NewLine}{sensorSummary}",
-                    $"Question: {question}")),
-             await BuildImagePartAsync(resolvedPath, cancellationToken)],
-            cancellationToken);
-
-        var assessment = ParseJson<PresenceAssessmentContract>(content);
-
-        if (assessment is null)
-        {
-            return new ToolResult(
-                $"Ambient presence analysis for {resolvedPath}:{Environment.NewLine}{content}",
-                VerificationText: $"Read the ambient webcam frame from {resolvedPath} and analyzed it with the vision route.",
-                SummaryText: "Analyzed ambient presence.");
-        }
-
-        var lines = new List<string>
-        {
-            $"Ambient presence analysis for {resolvedPath}:",
-            $"- Summary: {Coalesce(assessment.Summary, "No presence summary returned.")}",
-            $"- Someone present: {assessment.SomeonePresent}",
-            $"- People count: {assessment.PeopleCount}",
-            $"- Primary posture: {Coalesce(assessment.PrimaryPosture, "Unknown")}",
-            $"- Approximate distance: {Coalesce(assessment.ApproximateDistance, "Unknown")}",
-            $"- Gesture: {Coalesce(assessment.Gesture, "None detected")}",
-            $"- Activation recommendation: {Coalesce(assessment.ActivationRecommendation, "No recommendation returned.")}",
-            $"- Confidence: {Coalesce(assessment.Confidence, "Unknown")}"
-        };
-
-        if (!string.IsNullOrWhiteSpace(assessment.SensorNotes))
-        {
-            lines.Add($"- Sensor notes: {assessment.SensorNotes}");
-        }
-
-        return new ToolResult(
-            string.Join(Environment.NewLine, lines),
-            VerificationText: $"Read the ambient webcam frame from {resolvedPath} and analyzed presence signals with the vision route.",
-            SummaryText: FirstSentence(Coalesce(assessment.Summary, assessment.ActivationRecommendation)));
-    }
-
-    private async Task<ToolResult> AnalyzeFaceRecognitionAsync(string input, CancellationToken cancellationToken)
-    {
-        if (!_options.AmbientContextEnabled)
-        {
-            return DisabledAmbientResult();
-        }
-
-        if (!_options.AmbientFaceRecognitionEnabled)
-        {
-            return new ToolResult(
-                "Face recognition is disabled. Enable `ambientFaceRecognitionEnabled` only if you actually need it.",
-                Succeeded: false,
-                VerificationText: "The runtime blocked face recognition because it is disabled in settings.",
-                SummaryText: "Face recognition is disabled.");
-        }
-
-        if (!_options.AmbientFaceRecognitionConsentGranted)
-        {
-            return new ToolResult(
-                "Face recognition remains blocked until you explicitly grant consent with `ambientFaceRecognitionConsentGranted`.",
-                Succeeded: false,
-                VerificationText: "The runtime blocked face recognition because consent has not been granted in settings.",
-                SummaryText: "Face recognition is blocked until consent is granted.");
-        }
-
-        var profiles = LoadFaceProfiles();
-
-        if (profiles.Count == 0)
-        {
-            return new ToolResult(
-                "Face recognition needs an enrolled profile list in `ambientFaceProfilesPath` with reference images.",
-                Succeeded: false,
-                VerificationText: "No usable face-recognition profiles were available.",
-                SummaryText: "No face-recognition profiles are configured.");
-        }
-
-        var request = ResolveAmbientImageRequest(TrimCommandPrefix(input, "face recognition", "face"));
-
-        if (string.IsNullOrWhiteSpace(request.ImagePath))
-        {
-            return new ToolResult(
-                "Face recognition needs `ambientWebcamFramePath` or an explicit image path.",
-                Succeeded: false,
-                VerificationText: "No ambient webcam frame was available for face recognition.",
-                SummaryText: "Ambient webcam input is not configured.");
-        }
-
-        var resolvedPath = ResolvePath(request.ImagePath);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return new ToolResult(
-                $"Ambient webcam frame not found: {resolvedPath}",
-                Succeeded: false,
-                VerificationText: "The configured ambient webcam frame path does not exist.",
-                SummaryText: "Ambient webcam frame not found.");
-        }
-
-        if (!_modelGateway.IsAvailable)
-        {
-            return new ToolResult(
-                $"Ambient webcam frame is available at {resolvedPath}, but face recognition requires a vision-capable model.",
-                Succeeded: false,
-                VerificationText: "No vision route is available for face recognition.",
-                SummaryText: "Face recognition is unavailable.");
-        }
-
-        var question = string.IsNullOrWhiteSpace(request.Question)
-            ? "Compare the current webcam frame against the enrolled profiles and report only likely matches."
-            : request.Question;
-        var userParts = new List<ChatMessageContentPart>
-        {
-            ChatMessageContentPart.FromText(
-                string.Join(
-                    Environment.NewLine,
-                    "The first image is the current webcam frame.",
-                    "Each later image is a labeled reference profile that the user explicitly enrolled.",
-                    "Prefer `unknown` over a weak guess.",
-                    $"Question: {question}")),
-            ChatMessageContentPart.FromText("Current webcam frame:"),
-            await BuildImagePartAsync(resolvedPath, cancellationToken)
-        };
-
-        foreach (var profile in profiles.Take(4))
-        {
-            userParts.Add(ChatMessageContentPart.FromText($"Reference profile: {profile.Name}. Notes: {Coalesce(profile.Notes, "None")}"));
-            userParts.Add(await BuildImagePartAsync(profile.ResolvedImagePath, cancellationToken));
-        }
-
-        var content = await CompleteVisionPromptAsync(
-            "You are Jarvis. Compare the webcam frame against the enrolled face reference images. Return only JSON with keys `summary`, `faceCount`, `unknownFaceCount`, `matches`, and `caution`. Each `matches` item must contain `name`, `confidence`, and `rationale`. Only report strong-enough matches. Do not infer sensitive traits.",
-            userParts,
-            cancellationToken);
-
-        var result = ParseJson<FaceRecognitionContract>(content);
-
-        if (result is null)
-        {
-            return new ToolResult(
-                $"Face recognition analysis for {resolvedPath}:{Environment.NewLine}{content}",
-                VerificationText: $"Compared the ambient webcam frame at {resolvedPath} against {profiles.Count} enrolled face profile(s) with the vision route.",
-                SummaryText: "Compared the webcam frame against enrolled face profiles.");
-        }
-
-        var lines = new List<string>
-        {
-            $"Face recognition analysis for {resolvedPath}:",
-            $"- Summary: {Coalesce(result.Summary, "No face-recognition summary returned.")}",
-            $"- Faces detected: {result.FaceCount}",
-            $"- Unknown faces: {result.UnknownFaceCount}"
-        };
-
-        if (result.Matches is { Length: > 0 })
-        {
-            lines.Add("- Matches:");
-
-            foreach (var match in result.Matches.Take(6))
-            {
-                lines.Add($"  - {Coalesce(match.Name, "unknown")} | confidence={Coalesce(match.Confidence, "unknown")} | {Coalesce(match.Rationale, "No rationale returned.")}");
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(result.Caution))
-        {
-            lines.Add($"- Caution: {result.Caution}");
-        }
-
-        return new ToolResult(
-            string.Join(Environment.NewLine, lines),
-            VerificationText: $"Compared the ambient webcam frame at {resolvedPath} against {profiles.Count} enrolled face profile(s) with the vision route.",
-            SummaryText: FirstSentence(Coalesce(result.Summary, result.Caution)));
-    }
-
-    private async Task<ToolResult> AnalyzeRoomSensorsAsync(string input, CancellationToken cancellationToken)
-    {
-        if (!_options.AmbientContextEnabled)
-        {
-            return DisabledAmbientResult();
-        }
-
-        var request = ResolveRoomSensorRequest(input);
-
-        if (string.IsNullOrWhiteSpace(request.Path))
-        {
-            return new ToolResult(
-                "Room-sensor input is not configured. Set `ambientRoomSensorSnapshotPath` or pass an explicit path.",
-                Succeeded: false,
-                VerificationText: "No room-sensor snapshot path was configured or supplied.",
-                SummaryText: "Room-sensor input is not configured.");
-        }
-
-        var resolvedPath = ResolvePath(request.Path);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return new ToolResult(
-                $"Room-sensor snapshot not found: {resolvedPath}",
-                Succeeded: false,
-                VerificationText: "The configured room-sensor snapshot path does not exist.",
-                SummaryText: "Room-sensor snapshot not found.");
-        }
-
-        var sensorText = await File.ReadAllTextAsync(resolvedPath, cancellationToken);
-        var preview = FormatSensorPreview(sensorText);
-
-        if (!_modelGateway.IsAvailable)
-        {
-            return new ToolResult(
-                $"Room sensor snapshot from {resolvedPath}:{Environment.NewLine}{preview}",
-                VerificationText: $"Loaded the room-sensor snapshot from {resolvedPath} without model summarization.",
-                SummaryText: "Loaded the room-sensor snapshot.");
-        }
-
-        var question = string.IsNullOrWhiteSpace(request.Question)
-            ? "Summarize the room-sensor snapshot and call out anything relevant for ambient activation."
-            : request.Question;
-
-        var messages = new[]
-        {
-            new ChatMessage("system", [ChatMessageContentPart.FromText("You are Jarvis. Analyze the supplied room-sensor snapshot and answer the user's question concisely.")]),
-            new ChatMessage("user", [ChatMessageContentPart.FromText(
-                $"Question: {question}{Environment.NewLine}Path: {resolvedPath}{Environment.NewLine}Snapshot:{Environment.NewLine}{preview}")])
-        };
-
-        try
-        {
-            var response = await _modelGateway.CompleteAsync(
-                new ChatCompletionRequest(messages, Temperature: 0.1),
-                ModelRoute.Fast,
-                cancellationToken);
-
-            var content = string.IsNullOrWhiteSpace(response.Content)
-                ? $"I read the room-sensor snapshot at {resolvedPath}, but the analysis model returned an empty response."
-                : response.Content.Trim();
-
-            return new ToolResult(
-                $"Room sensor analysis for {resolvedPath}:{Environment.NewLine}{content}",
-                VerificationText: $"Read the room-sensor snapshot from {resolvedPath} and summarized it with the fast model route.",
-                SummaryText: FirstSentence(content));
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            return new ToolResult(
-                $"Room sensor analysis failed: {TrimError(exception.Message)}",
-                Succeeded: false,
-                VerificationText: $"The room-sensor snapshot was read, but model analysis failed for {resolvedPath}.",
-                SummaryText: "Room sensor analysis failed.");
-        }
-    }
-
+    // Ask the vision model about one image file and wrap its answer (or the error) in a ToolResult.
     private async Task<ToolResult> AnalyzeSingleImageAsync(
         string filePath,
         string question,
@@ -1795,6 +781,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // Send one system message plus the user's parts (text and image) to the vision route and return the reply text.
     private async Task<string> CompleteVisionPromptAsync(
         string systemPrompt,
         IReadOnlyList<ChatMessageContentPart> userParts,
@@ -1814,6 +801,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return response.Content?.Trim() ?? string.Empty;
     }
 
+    // Turn an image file into the "data URL" form (base64 text inside the request) that vision APIs accept. TIFF is converted to PNG first because vision models do not take TIFF.
     private async Task<ChatMessageContentPart> BuildImagePartAsync(string filePath, CancellationToken cancellationToken)
     {
         var extension = Path.GetExtension(filePath);
@@ -1830,6 +818,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return ChatMessageContentPart.FromImageUrl(BuildDataUrl(filePath, bytes));
     }
 
+    // Take the actual screenshot. Steps: find displays and windows, work out the rectangle to capture, save as PNG, delete old captures.
     private CapturedScreen CaptureScreen(ScreenRequest request)
     {
         var displays = GetDisplays();
@@ -1840,8 +829,10 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
 
         var activeWindow = TryGetActiveWindowSnapshot();
+        // For "active window" this is the foreground window; for a named window it is the best title match.
         var targetWindow = ResolveTargetWindow(request, activeWindow);
         var targetDisplays = ResolveTargetDisplays(request, displays, activeWindow, targetWindow);
+        // The rectangle to copy: all displays combined, one window, or one display.
         var bounds = request.TargetKind switch
         {
             ScreenTargetKind.AllDisplays => CombineBounds(targetDisplays.Select(display => display.Bounds)),
@@ -1857,8 +848,10 @@ internal sealed class WindowsVisualContextService : IVisualContextService
 
         var captureDirectory = ResolveCaptureDirectory();
         Directory.CreateDirectory(captureDirectory);
+        // File name looks like screen-primary-20260101-120000.png.
         var filePath = Path.Combine(captureDirectory, BuildCaptureFileName(request, targetDisplays, targetWindow));
 
+        // Copy the pixels from the screen into a bitmap (GDI+ CopyFromScreen), then save it.
         using (var bitmap = new Bitmap(bounds.Width, bounds.Height))
         {
             using var graphics = Graphics.FromImage(bitmap);
@@ -1866,6 +859,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             bitmap.Save(filePath, ImageFormat.Png);
         }
 
+        // Keep only the newest few screenshots.
         PruneCaptureDirectory(captureDirectory);
 
         return new CapturedScreen(
@@ -1879,6 +873,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             BuildTargetLabel(request, targetDisplays, targetWindow));
     }
 
+    // Text summary of a capture (file, target, bounds, displays, windows) with the extra detail line.
     private ToolResult BuildCaptureResult(CapturedScreen capture, string detail, bool succeeded)
     {
         var lines = new List<string>
@@ -1899,40 +894,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             SummaryText: $"Captured {capture.TargetLabel}.");
     }
 
-    private ToolResult BuildAmbientStatusResult()
-    {
-        var webcamStatus = DescribeConfiguredFile(_options.AmbientWebcamFramePath, _options.AmbientWebcamFreshnessSeconds, "Webcam frame");
-        var roomSensorStatus = DescribeConfiguredFile(_options.AmbientRoomSensorSnapshotPath, _options.AmbientWebcamFreshnessSeconds, "Room sensor snapshot");
-        var faceProfiles = LoadFaceProfiles();
-        var lines = new List<string>
-        {
-            "Ambient context:",
-            $"- Ambient sensing: {(_options.AmbientContextEnabled ? "enabled" : "disabled")}",
-            $"- {webcamStatus}",
-            $"- Presence detection: {(_options.AmbientPresenceDetectionEnabled ? "enabled" : "disabled")}",
-            $"- Gesture detection: {(_options.AmbientGestureDetectionEnabled ? "enabled" : "disabled")}",
-            $"- Face recognition: {BuildFaceRecognitionStatus(faceProfiles.Count)}",
-            $"- {roomSensorStatus}",
-            $"- Spatial audio cues: {(_options.SpatialAudioCuesEnabled ? "enabled" : "disabled")}",
-            $"- Far-field listening: {(_options.FarFieldListeningEnabled ? "enabled" : "disabled")}",
-            $"- Displays detected: {GetDisplays().Length}"
-        };
-
-        return new ToolResult(
-            string.Join(Environment.NewLine, lines),
-            VerificationText: "Loaded the ambient capability settings and current input-source status.",
-            SummaryText: "Loaded the ambient context status.");
-    }
-
-    private ToolResult DisabledAmbientResult()
-    {
-        return new ToolResult(
-            "Ambient sensing is disabled. Set `ambientContextEnabled` to `true` in jarvis.settings.json to enable webcam and room-sensor context.",
-            Succeeded: false,
-            VerificationText: "The runtime blocked ambient sensing because it is disabled in settings.",
-            SummaryText: "Ambient sensing is disabled.");
-    }
-
+    // Use the folder from settings, or data\captures, resolved to Jarvis's data folder.
     private string ResolveCaptureDirectory()
     {
         return JarvisDataPaths.Resolve(string.IsNullOrWhiteSpace(_options.VisualCaptureDirectory)
@@ -1940,6 +902,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             : _options.VisualCaptureDirectory);
     }
 
+    // Turn the user's words into a ScreenRequest: which target, which display or window, and what question to ask about it.
     private static ScreenRequest ParseScreenRequest(string input)
     {
         var trimmed = input.Trim();
@@ -1952,64 +915,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return new ScreenRequest(target.Kind, target.DisplayIndex, target.WindowTarget, question, trimmed);
     }
 
-    private AmbientImageRequest ResolveAmbientImageRequest(string input)
-    {
-        var trimmed = input.Trim();
-        var (payloadPath, explicitQuestion) = ParsePayload(trimmed);
-
-        if (string.IsNullOrWhiteSpace(payloadPath))
-        {
-            return new AmbientImageRequest(_options.AmbientWebcamFramePath, explicitQuestion);
-        }
-
-        var looksLikePath = LooksLikePathCandidate(payloadPath);
-
-        if (looksLikePath)
-        {
-            return new AmbientImageRequest(payloadPath, explicitQuestion);
-        }
-
-        if (string.IsNullOrWhiteSpace(_options.AmbientWebcamFramePath))
-        {
-            return new AmbientImageRequest(payloadPath, explicitQuestion);
-        }
-
-        var combinedQuestion = string.IsNullOrWhiteSpace(explicitQuestion)
-            ? payloadPath
-            : $"{payloadPath} {explicitQuestion}".Trim();
-
-        return new AmbientImageRequest(_options.AmbientWebcamFramePath, combinedQuestion);
-    }
-
-    private RoomSensorRequest ResolveRoomSensorRequest(string input)
-    {
-        var trimmed = input.Trim();
-        var (payloadPath, explicitQuestion) = ParsePayload(trimmed);
-
-        if (string.IsNullOrWhiteSpace(payloadPath))
-        {
-            return new RoomSensorRequest(_options.AmbientRoomSensorSnapshotPath, explicitQuestion);
-        }
-
-        var looksLikePath = LooksLikePathCandidate(payloadPath);
-
-        if (looksLikePath)
-        {
-            return new RoomSensorRequest(payloadPath, explicitQuestion);
-        }
-
-        if (string.IsNullOrWhiteSpace(_options.AmbientRoomSensorSnapshotPath))
-        {
-            return new RoomSensorRequest(payloadPath, explicitQuestion);
-        }
-
-        var combinedQuestion = string.IsNullOrWhiteSpace(explicitQuestion)
-            ? payloadPath
-            : $"{payloadPath} {explicitQuestion}".Trim();
-
-        return new RoomSensorRequest(_options.AmbientRoomSensorSnapshotPath, combinedQuestion);
-    }
-
+    // Finds the target from phrases: "all displays"/"entire desktop", "primary monitor", "active display", "active window", "window <name>", "app <name>", "display 2"/"monitor 2"/"screen 2"; otherwise the active display.
     private static ScreenTargetRequest DetectScreenTarget(string input)
     {
         var trimmed = input.Trim();
@@ -2020,6 +926,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             return new ScreenTargetRequest(ScreenTargetKind.ActiveDisplay, 0, string.Empty, string.Empty);
         }
 
+        // Phrases that mean every monitor.
         if (normalized.Contains("all displays", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("all monitors", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("whole desktop", StringComparison.OrdinalIgnoreCase)
@@ -2029,6 +936,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             return new ScreenTargetRequest(ScreenTargetKind.AllDisplays, 0, string.Empty, trimmed);
         }
 
+        // Phrases that mean the primary (main) monitor.
         if (normalized.Contains("primary display", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("primary monitor", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("main display", StringComparison.OrdinalIgnoreCase)
@@ -2037,6 +945,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             return new ScreenTargetRequest(ScreenTargetKind.PrimaryDisplay, 0, string.Empty, trimmed);
         }
 
+        // Phrases that mean whichever monitor holds the active window.
         if (normalized.Contains("active display", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("active monitor", StringComparison.OrdinalIgnoreCase)
             || normalized.Contains("current display", StringComparison.OrdinalIgnoreCase)
@@ -2047,6 +956,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             return new ScreenTargetRequest(ScreenTargetKind.ActiveDisplay, 0, string.Empty, trimmed);
         }
 
+        // Phrases that mean the foreground window.
         if (StartsWithCommand(trimmed, "active window")
             || StartsWithCommand(trimmed, "current window")
             || StartsWithCommand(trimmed, "focused window")
@@ -2055,6 +965,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             return new ScreenTargetRequest(ScreenTargetKind.ActiveWindow, 0, string.Empty, trimmed);
         }
 
+        // "window chrome" captures the window that best matches "chrome".
         if (StartsWithCommand(trimmed, "window"))
         {
             var windowTarget = TrimCommandPrefix(trimmed, "window");
@@ -2065,6 +976,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
                 trimmed);
         }
 
+        // "app chrome" works the same way as "window chrome".
         if (StartsWithCommand(trimmed, "app"))
         {
             var windowTarget = TrimCommandPrefix(trimmed, "app");
@@ -2075,6 +987,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
                 trimmed);
         }
 
+        // Matches "display 2", "monitor2" or "screen 3": the word, optional spaces, then a number, capturing the number.
         var match = Regex.Match(normalized, @"\b(?:display|monitor|screen)\s*(\d+)\b", RegexOptions.IgnoreCase);
 
         if (match.Success && int.TryParse(match.Groups[1].Value, out var displayIndex) && displayIndex > 0)
@@ -2085,6 +998,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return new ScreenTargetRequest(ScreenTargetKind.ActiveDisplay, 0, string.Empty, string.Empty);
     }
 
+    // The question is meant to be whatever is left of the text after the part that named the target (for example "monitor 2 what is open" gives "what is open").
     private static string ExtractScreenQuestion(string payload, ScreenTargetRequest target)
     {
         if (!string.IsNullOrWhiteSpace(target.ConsumedInput))
@@ -2102,6 +1016,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return LooksLikeTargetOnly(payload) ? string.Empty : payload.Trim();
     }
 
+    // True when the text only names a target and asks nothing ("screen", "all monitors", "window 2"), so no custom question should be sent.
     private static bool LooksLikeTargetOnly(string input)
     {
         var normalized = NormalizeForMatching(input);
@@ -2141,6 +1056,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return tokens.All(token => allowed.Contains(token) || int.TryParse(token, out _));
     }
 
+    // Windows' list of monitors, numbered from 1.
     private static DisplayDescriptor[] GetDisplays()
     {
         return Screen.AllScreens
@@ -2149,6 +1065,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             .ToArray();
     }
 
+    // Which monitors to capture. For a window: every monitor it touches. Otherwise by target kind: all, the primary, a numbered one (an error if it does not exist), or the one holding the active window.
     private static DisplayDescriptor[] ResolveTargetDisplays(
         ScreenRequest request,
         IReadOnlyList<DisplayDescriptor> displays,
@@ -2169,6 +1086,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
                 }
             }
 
+            // Fallbacks if the window is not on any monitor: the active monitor, then the primary, then the first.
             return [ResolveActiveDisplay(displays, activeWindow) ?? displays.FirstOrDefault(display => display.IsPrimary) ?? displays[0]];
         }
 
@@ -2182,6 +1100,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         };
     }
 
+    // Which window to capture: the foreground window, or the best match for a name, or none for display captures.
     private static ActiveWindowSnapshot? ResolveTargetWindow(ScreenRequest request, ActiveWindowSnapshot? activeWindow)
     {
         return request.TargetKind switch
@@ -2192,6 +1111,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         };
     }
 
+    // Which monitor is the user working on: the one the foreground window sits on, otherwise the one with the mouse cursor.
     private static DisplayDescriptor? ResolveActiveDisplay(
         IReadOnlyList<DisplayDescriptor> displays,
         ActiveWindowSnapshot? activeWindow)
@@ -2212,6 +1132,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return displays.FirstOrDefault(display => display.Bounds.Contains(cursor));
     }
 
+    // The smallest rectangle containing all the given rectangles (used for "all displays").
     private static Rectangle CombineBounds(IEnumerable<Rectangle> rectangles)
     {
         var bounds = Rectangle.Empty;
@@ -2226,6 +1147,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return bounds;
     }
 
+    // Build the screenshot's file name from the target and the current time.
     private static string BuildCaptureFileName(
         ScreenRequest request,
         IReadOnlyList<DisplayDescriptor> targetDisplays,
@@ -2248,6 +1170,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return $"screen-{label}-{timestamp}.png";
     }
 
+    // Short human-readable name of what was captured, for messages.
     private static string BuildTargetLabel(
         ScreenRequest request,
         IReadOnlyList<DisplayDescriptor> targetDisplays,
@@ -2288,6 +1211,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         };
     }
 
+    // Facts about the capture (target, size, monitors, windows) put in front of the vision model's question.
     private string BuildCapturePromptContext(CapturedScreen capture)
     {
         var builder = new StringBuilder();
@@ -2319,12 +1243,14 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return builder.ToString().TrimEnd();
     }
 
+    // One-line description of a monitor: number, device name, bounds and work area (the area not covered by the taskbar).
     private static string DescribeDisplay(DisplayDescriptor display)
     {
         var primary = display.IsPrimary ? " | primary" : string.Empty;
         return $"Display {display.Index}{primary} | {display.DeviceName} | bounds {display.Bounds.Left},{display.Bounds.Top} {display.Bounds.Width}x{display.Bounds.Height} | work area {display.WorkingArea.Left},{display.WorkingArea.Top} {display.WorkingArea.Width}x{display.WorkingArea.Height}";
     }
 
+    // Make text safe for a file name: lower-case, bad characters and spaces become "-", repeated dashes collapse, at most 40 characters.
     private static string SanitizeFileSegment(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -2338,10 +1264,12 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             .Select(character => invalidChars.Contains(character) || char.IsWhiteSpace(character) ? '-' : character)
             .ToArray());
 
+        // "-{2,}" matches two or more dashes in a row, e.g. "a---b" becomes "a-b".
         sanitized = Regex.Replace(sanitized, "-{2,}", "-", RegexOptions.CultureInvariant).Trim('-');
         return string.IsNullOrWhiteSpace(sanitized) ? "window" : sanitized[..Math.Min(40, sanitized.Length)];
     }
 
+    // Describe the foreground window (handle, program, process id, title, position), or null if it cannot be read.
     private static ActiveWindowSnapshot? TryGetActiveWindowSnapshot()
     {
         try
@@ -2371,6 +1299,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // Find the visible window whose title or program name best matches the words in query, using ScoreWindowMatch; the highest score wins.
     private static ActiveWindowSnapshot? TryFindWindowSnapshot(string query)
     {
         if (string.IsNullOrWhiteSpace(query))
@@ -2382,6 +1311,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         ActiveWindowSnapshot? bestMatch = null;
         var bestScore = 0;
 
+        // Only windows that belong to a program's main window and have a title are considered.
         foreach (var process in Process.GetProcesses())
         {
             try
@@ -2409,6 +1339,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
                 bestScore = score;
                 bestMatch = new ActiveWindowSnapshot(handle, process.ProcessName, process.Id, title, GetWindowBounds(handle));
             }
+            // Some processes deny access; skip them.
             catch
             {
             }
@@ -2421,6 +1352,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return bestMatch;
     }
 
+    // Scores how well a window matches the query (0 = no match): exact title 120, program 110, normalized 100 and 96, then "contains" title 82, program 74. Only the ranking order matters.
     private static int ScoreWindowMatch(string rawQuery, string normalizedQuery, string title, string processName)
     {
         var normalizedTitle = NormalizeForMatching(title);
@@ -2460,6 +1392,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return score;
     }
 
+    // The window's rectangle on screen, or empty if Windows cannot give it.
     private static Rectangle GetWindowBounds(IntPtr handle)
     {
         return GetWindowRect(handle, out var rect)
@@ -2467,6 +1400,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             : Rectangle.Empty;
     }
 
+    // Read a window's title text via the Win32 API.
     private static string ReadWindowTitle(IntPtr handle)
     {
         var length = GetWindowTextLength(handle);
@@ -2481,133 +1415,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return builder.ToString();
     }
 
-    private string BuildFaceRecognitionStatus(int profileCount)
-    {
-        if (!_options.AmbientFaceRecognitionEnabled)
-        {
-            return "disabled";
-        }
-
-        if (!_options.AmbientFaceRecognitionConsentGranted)
-        {
-            return "blocked until explicit consent is granted";
-        }
-
-        return profileCount == 0
-            ? "enabled with consent, but no enrolled profiles are configured"
-            : $"enabled with consent and {profileCount} enrolled profile(s)";
-    }
-
-    private string DescribeConfiguredFile(string configuredPath, int freshnessSeconds, string label)
-    {
-        if (string.IsNullOrWhiteSpace(configuredPath))
-        {
-            return $"{label}: not configured";
-        }
-
-        var resolvedPath = ResolvePath(configuredPath);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return $"{label}: configured but missing at {resolvedPath}";
-        }
-
-        var lastWrite = File.GetLastWriteTimeUtc(resolvedPath);
-        var age = DateTimeOffset.UtcNow - lastWrite;
-        var freshness = age <= TimeSpan.FromSeconds(Math.Max(5, freshnessSeconds)) ? "fresh" : "stale";
-        return $"{label}: {resolvedPath} ({freshness}, updated {Math.Max(0, (int)age.TotalSeconds)}s ago)";
-    }
-
-    private async Task<string> LoadRoomSensorSummaryAsync(CancellationToken cancellationToken)
-    {
-        if (string.IsNullOrWhiteSpace(_options.AmbientRoomSensorSnapshotPath))
-        {
-            return string.Empty;
-        }
-
-        var resolvedPath = ResolvePath(_options.AmbientRoomSensorSnapshotPath);
-
-        if (!File.Exists(resolvedPath))
-        {
-            return string.Empty;
-        }
-
-        var content = await File.ReadAllTextAsync(resolvedPath, cancellationToken);
-        return FormatSensorPreview(content);
-    }
-
-    private IReadOnlyList<FaceProfile> LoadFaceProfiles()
-    {
-        if (string.IsNullOrWhiteSpace(_options.AmbientFaceProfilesPath))
-        {
-            return [];
-        }
-
-        var resolvedCatalogPath = ResolvePath(_options.AmbientFaceProfilesPath);
-
-        if (!File.Exists(resolvedCatalogPath))
-        {
-            return [];
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(File.ReadAllText(resolvedCatalogPath));
-            JsonElement profilesElement;
-
-            if (document.RootElement.ValueKind == JsonValueKind.Array)
-            {
-                profilesElement = document.RootElement;
-            }
-            else if (document.RootElement.ValueKind == JsonValueKind.Object
-                && document.RootElement.TryGetProperty("profiles", out var nestedProfiles)
-                && nestedProfiles.ValueKind == JsonValueKind.Array)
-            {
-                profilesElement = nestedProfiles;
-            }
-            else
-            {
-                return [];
-            }
-
-            var profiles = new List<FaceProfile>();
-
-            foreach (var item in profilesElement.EnumerateArray())
-            {
-                if (!item.TryGetProperty("name", out var nameElement)
-                    || nameElement.ValueKind != JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                if (!item.TryGetProperty("imagePath", out var pathElement)
-                    || pathElement.ValueKind != JsonValueKind.String)
-                {
-                    continue;
-                }
-
-                var resolvedImagePath = ResolvePath(pathElement.GetString() ?? string.Empty);
-
-                if (!File.Exists(resolvedImagePath))
-                {
-                    continue;
-                }
-
-                var notes = item.TryGetProperty("notes", out var notesElement) && notesElement.ValueKind == JsonValueKind.String
-                    ? notesElement.GetString() ?? string.Empty
-                    : string.Empty;
-
-                profiles.Add(new FaceProfile(nameElement.GetString() ?? "unknown", resolvedImagePath, notes));
-            }
-
-            return profiles;
-        }
-        catch
-        {
-            return [];
-        }
-    }
-
+    // Delete screenshots beyond the newest N (from settings, at least 1). Errors are ignored because cleanup is optional.
     private void PruneCaptureDirectory(string captureDirectory)
     {
         var retentionCount = Math.Max(1, _options.VisualCaptureRetentionCount);
@@ -2630,6 +1438,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // Turn a user-supplied path into a full path: strip quotes, expand a leading "~" to the user's home folder, and treat relative paths as relative to the workspace folder.
     private string ResolvePath(string target)
     {
         var trimmed = target.Trim().Trim('"');
@@ -2648,6 +1457,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return Path.GetFullPath(Path.Combine(_workspaceRoot, trimmed));
     }
 
+    // Split "path :: question" at the first double colon. Without "::" the whole text is the path (or target) and the question is empty.
     private static (string Path, string Question) ParsePayload(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -2659,6 +1469,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return parts.Length == 2 ? (parts[0], parts[1]) : (input.Trim(), string.Empty);
     }
 
+    // Build the "data:image/png;base64,..." text. Unknown types are labelled PNG (screenshots and converted TIFFs are PNG).
     private static string BuildDataUrl(string filePath, byte[] bytes)
     {
         var mimeType = Path.GetExtension(filePath).ToLowerInvariant() switch
@@ -2673,6 +1484,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return $"data:{mimeType};base64,{Convert.ToBase64String(bytes)}";
     }
 
+    // Standard failure results used by the methods above.
     private static ToolResult Unavailable(string message)
     {
         return new ToolResult(
@@ -2691,6 +1503,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             SummaryText: heading);
     }
 
+    // The first sentence (up to the first . ! or ?), or the first 160 characters if there is no punctuation. Used for spoken summaries.
     private static string FirstSentence(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -2709,6 +1522,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return normalized[..(punctuationIndex + 1)];
     }
 
+    // Shorten an error message to 220 characters.
     private static string TrimError(string text)
     {
         const int maxLength = 220;
@@ -2716,6 +1530,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
+    // Lower-case, replace punctuation with spaces and collapse repeated spaces, so "Google Chrome - Home" and "google chrome home" compare equal.
     private static string NormalizeForMatching(string value)
     {
         var chars = value
@@ -2726,12 +1541,14 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return string.Join(' ', new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
 
+    // True if the input is exactly the command word or starts with it followed by a space (so "window" matches "window chrome" but not "windows").
     private static bool StartsWithCommand(string input, string value)
     {
         return input.Equals(value, StringComparison.OrdinalIgnoreCase)
             || input.StartsWith(value + " ", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Remove the command word and any leading separators (space, comma, colon, semicolon, dash).
     private static string TrimCommandPrefix(string input, params string[] commands)
     {
         foreach (var command in commands)
@@ -2745,44 +1562,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         return input.Trim();
     }
 
-    private static bool LooksLikePathCandidate(string value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        if (value.Contains('\\')
-            || value.Contains('/')
-            || value.StartsWith("~", StringComparison.Ordinal)
-            || value.Contains(":\\", StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return !string.IsNullOrWhiteSpace(Path.GetExtension(value));
-    }
-
-    private static string FormatSensorPreview(string sensorText)
-    {
-        if (string.IsNullOrWhiteSpace(sensorText))
-        {
-            return "No sensor snapshot content.";
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(sensorText);
-            return JsonSerializer.Serialize(document.RootElement, IndentedJsonOptions);
-        }
-        catch (JsonException)
-        {
-            return sensorText.Length <= 4000
-                ? sensorText.Trim()
-                : sensorText[..4000].TrimEnd() + Environment.NewLine + "[sensor snapshot truncated]";
-        }
-    }
-
+    // Read model-returned text as JSON of type T. Returns null if it is empty or not valid, so callers can fall back to showing the raw text.
     private static T? ParseJson<T>(string content) where T : class
     {
         if (string.IsNullOrWhiteSpace(content))
@@ -2807,6 +1587,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         }
     }
 
+    // Models often wrap JSON in a markdown code fence or add chatter. Remove a leading code fence, then keep only the text from the first { to the last }.
     private static string ExtractJson(string content)
     {
         var trimmed = content.Trim();
@@ -2835,6 +1616,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             : trimmed;
     }
 
+    // The primary text if it has any, otherwise the fallback.
     private static string Coalesce(string? primary, string? fallback)
     {
         return string.IsNullOrWhiteSpace(primary)
@@ -2842,6 +1624,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
             : primary.Trim();
     }
 
+    // Win32 calls from user32.dll: foreground window, title, owning process and screen rectangle.
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetForegroundWindow();
 
@@ -2858,6 +1641,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
+    // Win32 RECT (left, top, right, bottom in screen pixels).
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT
     {
@@ -2867,14 +1651,19 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         public int Bottom;
     }
 
+    // Data shapes used inside this file. ScreenRequest: what to capture and what to ask.
     private sealed record ScreenRequest(ScreenTargetKind TargetKind, int DisplayIndex, string WindowTarget, string Question, string RawInput);
 
+    // ScreenTargetRequest: the target found in the words, and the text that named it (ConsumedInput).
     private sealed record ScreenTargetRequest(ScreenTargetKind Kind, int DisplayIndex, string WindowTarget, string ConsumedInput);
 
+    // One monitor: 1-based number, device name, whether it is the primary, its full bounds and its work area.
     private sealed record DisplayDescriptor(int Index, string DeviceName, bool IsPrimary, Rectangle Bounds, Rectangle WorkingArea);
 
+    // A window: handle, program name, process id, title and position.
     private sealed record ActiveWindowSnapshot(IntPtr Handle, string ProcessName, int ProcessId, string Title, Rectangle Bounds);
 
+    // The result of a capture: the request, the saved file, the captured rectangle, all monitors, the captured monitors, and the active/target windows.
     private sealed record CapturedScreen(
         ScreenRequest Request,
         string FilePath,
@@ -2885,16 +1674,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
         ActiveWindowSnapshot? TargetWindow,
         string TargetLabel);
 
-    private sealed record AmbientImageRequest(string ImagePath, string Question);
-
-    private sealed record RoomSensorRequest(string Path, string Question);
-
-    private sealed record FaceProfile(string Name, string ResolvedImagePath, string Notes);
-
-    private sealed record PdfStreamCandidate(string Dictionary, byte[] Data);
-
-    private sealed record PdfExtractionResult(int PageCount, string Title, string Author, string Text, string Confidence, string Note);
-
+    // The JSON shapes the model is asked to return for "screen ocr", "screen ui" and document analysis. Property names must match the keys named in the prompts above.
     private sealed record OcrExtractionContract(string Summary, string FullText, OcrTextBlockContract[] TextBlocks);
 
     private sealed record OcrTextBlockContract(string Text, string Region, string Purpose);
@@ -2918,26 +1698,7 @@ internal sealed class WindowsVisualContextService : IVisualContextService
 
     private sealed record DocumentFieldContract(string Label, string Value);
 
-    private sealed record PresenceAssessmentContract(
-        string Summary,
-        bool SomeonePresent,
-        int PeopleCount,
-        string PrimaryPosture,
-        string ApproximateDistance,
-        string Gesture,
-        string ActivationRecommendation,
-        string Confidence,
-        string SensorNotes);
-
-    private sealed record FaceRecognitionContract(
-        string Summary,
-        int FaceCount,
-        int UnknownFaceCount,
-        FaceRecognitionMatchContract[] Matches,
-        string Caution);
-
-    private sealed record FaceRecognitionMatchContract(string Name, string Confidence, string Rationale);
-
+    // What a screen request points at.
     private enum ScreenTargetKind
     {
         ActiveDisplay,

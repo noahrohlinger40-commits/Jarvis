@@ -1,8 +1,16 @@
+// Decides what Jarvis should remember (and what it must NOT save) from each conversation turn. It is rule-based: plain phrases
+// and regular expressions, no language model. After a turn the assistant (JarvisAssistant.cs, with help from Tools.cs and ActionSafety.cs) asks this class:
+// (1) PrepareTurn: may this turn be logged at all? (2) ExtractLearnedPreferences: did the user state a preference or fact?
+// (3) BuildEpisodicMemory / BuildConversationSummary: what is worth recording about what just happened?
+// It also parses spoken reminders ('remind me to call mom at 5'). The results are MemoryWriteRequest objects that JsonMemoryStore saves.
+// Caution: matching is by substring and loose patterns, so it can occasionally learn something from a sentence that merely contains the phrase.
 using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
+// The verdict from PrepareTurn: the text to act on, the privacy mode ('persistent', 'off-the-record' or 'sensitive'),
+// whether to write the transcript and automatic memory, and a reason shown to the user.
 internal sealed record TurnPersistencePlan(
     string EffectiveInput,
     string PrivacyMode,
@@ -10,8 +18,10 @@ internal sealed record TurnPersistencePlan(
     bool PersistAutomaticMemory,
     string Reason);
 
+// Static helpers that turn conversation text into memory-write requests. Holds no state.
 internal static class MemoryAutomation
 {
+    // Phrases that, at the start of a message, mean 'do not record this turn at all'.
     private static readonly string[] WholeTurnPrivacyPrefixes =
     [
         "off the record",
@@ -24,6 +34,8 @@ internal static class MemoryAutomation
         "private request"
     ];
 
+    // Words that suggest secrets (passwords, keys, codes). If any appears anywhere in a message the turn is not saved.
+    // Matching is a plain substring test, so harmless words that contain one of these (for example 'token' inside 'tokenizer') are blocked too: it errs on the side of not saving.
     private static readonly string[] SensitiveSignals =
     [
         "password",
@@ -39,25 +51,45 @@ internal static class MemoryAutomation
         "otp"
     ];
 
+    // Matches 13 to 19 digits, optionally separated by single spaces or dashes: a payment-card-looking number such as '4111 1111 1111 1111'.
     private static readonly Regex CardLikeNumberRegex = new(@"\b(?:\d[ -]?){13,19}\b", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    // Matches 'I'm in Tallahassee' / 'my location is X' / 'home is X'; the group 'location' is everything after the phrase.
     private static readonly Regex LocationRegex = new(@"\b(?:i am in|i'm in|my location is|home is|default location is)\s+(?<location>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'use Spotify for music' / 'prefer VS Code when coding'; groups: app (up to 41 characters) and task.
     private static readonly Regex AppPreferenceRegex = new(@"\b(?:use|prefer)\s+(?<app>[a-z0-9][a-z0-9 .&+\-]{1,40})\s+(?:for|when)\s+(?<task>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'when I start coding, open Spotify': a trigger first, then open/launch/start an app.
     private static readonly Regex AutomationLeadRegex = new(@"\b(?:when|if)\s+i\s+(?<trigger>[^,]+?)[, ]+(?:open|launch|start)\s+(?<app>[a-z0-9][a-z0-9 .&+\-]{1,40})$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches the reverse order: 'open Spotify when I start coding'.
     private static readonly Regex AutomationTailRegex = new(@"\b(?:open|launch|start)\s+(?<app>[a-z0-9][a-z0-9 .&+\-]{1,40})\s+when\s+i\s+(?<trigger>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'every morning, check my email' (a day part or weekday, then the action).
     private static readonly Regex RoutineRegex = new(@"\b(?:every|each)\s+(?<when>morning|afternoon|evening|night|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[, ]+(?<action>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Like RoutineRegex but with a time: 'every weekday at 8, open Outlook'.
     private static readonly Regex TimedRoutineRegex = new(@"\b(?:every|each)\s+(?<when>morning|afternoon|evening|night|weekday|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+at\s+(?<time>[^,]+?)\b[, ]+(?<action>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches routines tied to an event: 'before work, I stretch' / 'after class, review notes'.
     private static readonly Regex AnchoredRoutineRegex = new(@"\b(?:before|after)\s+(?<anchor>work|school|class|lunch|dinner|bed|sleep|the gym|gym)\b[, ]+(?:i\s+)?(?<action>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'my morning routine is coffee then email'.
     private static readonly Regex NamedRoutineRegex = new(@"\b(?:my|the)\s+(?<when>morning|afternoon|evening|night|weekday|weekend)\s+routine\s+(?:is|looks like|usually means)\s+(?<action>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'I usually / normally / tend to ...' followed by the habit.
     private static readonly Regex HabitRegex = new(@"\b(?:i usually|i normally|i tend to)\s+(?<habit>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'my favorite app is Notion for notes' (the 'for ...' part is optional).
     private static readonly Regex FavoriteAppRegex = new(@"\b(?:my favorite app is|i always use|i mostly use)\s+(?<app>[a-z0-9][a-z0-9 .&+\-]{1,40})(?:\s+for\s+(?<task>.+))?$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'my <person, project, device or place> is/named <value>', e.g. 'my laptop is named Atlas' or 'my boss is Dana'. The list of allowed labels is spelled out in the pattern.
     private static readonly Regex MyNamedThingRegex = new(@"\bmy\s+(?<label>wife|husband|spouse|boss|manager|partner|girlfriend|boyfriend|mom|mother|dad|father|brother|sister|roommate|project|side project|laptop|desktop|phone|headset|microphone|keyboard|office|home office|gym|gym playlist|coding playlist)\s+(?:is|is named|named)\s+(?<value>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'I'm working on / building <project>'.
     private static readonly Regex WorkingOnProjectRegex = new(@"\b(?:i am working on|i'm working on|i am building|i'm building|my project is)\s+(?<project>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches 'I work from / study at / train at <place>'.
     private static readonly Regex WorkFromPlaceRegex = new(@"\b(?:i work from|i study at|i train at)\s+(?<place>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches how the user wants to be addressed: 'call me Noah', 'my nickname is X', 'my name is X'.
     private static readonly Regex AddressPreferenceRegex = new(@"\b(?:call me|you can call me|my nickname is|my preferred name is|refer to me as|address me as|my name is)\s+(?<name>.+)$", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Matches the start of a reminder request: 'remind me (to/about/that)' or 'set/add/create/make a (new) reminder'.
     private static readonly Regex ReminderPrefixRegex = new(@"^(?:remind\s+me|(?:set|add|create|make)\s+(?:a\s+)?(?:new\s+)?reminder)(?:\s+(?:(?:to|about|that)\b)?|$)", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // The next two patterns read relative reminder times. ReminderSpan is the reusable part: either 'half an' or a number word/digits,
+    // then a unit (seconds, minutes, hours, days). Named groups: half, n (the amount), u (the unit).
     // "in 10 minutes", "after an hour", "30 seconds from now", "half an hour from now"
     private const string ReminderSpan = @"(?:(?<half>half\s+an)|(?<n>an?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty|\d+(?:\.\d+)?))\s*(?<u>seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b";
+    // Matches 'in <span>' / 'after <span>' or '<span> from now'. The pattern is written once and reused through ReminderSpan.
     private static readonly Regex RelativeReminderRegex = new($@"\b(?:in|after)\s+{ReminderSpan}|\b{ReminderSpan}\s+from\s+now\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    // Tone words recognised in requests like 'keep replies concise'.
     private static readonly string[] ToneTerms =
     [
         "concise",
@@ -77,10 +109,12 @@ internal static class MemoryAutomation
         "energetic"
     ];
 
+    // First gate for every user message: decides whether the turn may be written to the transcript and to automatic memory.
     public static TurnPersistencePlan PrepareTurn(string input)
     {
         var trimmed = input.Trim();
 
+        // Check 1: the user explicitly said 'off the record' etc. Strip that phrase and process the rest, but save nothing.
         foreach (var prefix in WholeTurnPrivacyPrefixes)
         {
             if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
@@ -97,6 +131,7 @@ internal static class MemoryAutomation
                 "The user explicitly marked this turn as off the record.");
         }
 
+        // Check 2: it looks like it contains a secret, so process it but save nothing.
         if (LooksSensitive(trimmed))
         {
             return new TurnPersistencePlan(
@@ -107,9 +142,11 @@ internal static class MemoryAutomation
                 "Sensitive content was detected, so Jarvis will not persist this turn.");
         }
 
+        // Otherwise the turn may be saved normally.
         return new TurnPersistencePlan(trimmed, "persistent", PersistTranscript: true, PersistAutomaticMemory: true, string.Empty);
     }
 
+    // Packages what Jarvis can see right now (clock, active app, window, recent activity, default location) into a context snapshot attached to new memories. Keeps at most 5 distinct recent activities.
     public static InteractionContextSnapshot BuildInteractionContext(
         DesktopContextSnapshot desktopContext,
         string defaultLocation,
@@ -133,6 +170,8 @@ internal static class MemoryAutomation
             activities);
     }
 
+    // Runs every detector below on the user's message and collects whatever it recognised (usually zero or one item).
+    // Duplicates within the same message are removed.
     public static IReadOnlyList<MemoryWriteRequest> ExtractLearnedPreferences(
         string userInput,
         InteractionContextSnapshot context)
@@ -221,6 +260,8 @@ internal static class MemoryAutomation
             .ToArray();
     }
 
+    // After a turn, writes a short 'Task outcome' note if a useful tool (open app, read file, search web...) succeeded.
+    // Uses at most the first two successful tools. Returns null when nothing worth recording happened.
     public static MemoryWriteRequest? BuildEpisodicMemory(
         string userInput,
         IReadOnlyList<AssistantToolExecution> toolResults,
@@ -256,8 +297,10 @@ internal static class MemoryAutomation
             RetentionPolicy: "episodic");
     }
 
+    // True if the message starts like a reminder request.
     public static bool IsReminderRequest(string input) => ReminderPrefixRegex.IsMatch(input.Trim());
 
+    // Builds the memory note for a reminder: marked pending and kept until completed, with a high fixed importance (0.82).
     public static MemoryWriteRequest BuildReminderMemory(
         string reminderText,
         DateTimeOffset reminderAtLocal,
@@ -279,6 +322,8 @@ internal static class MemoryAutomation
             ReminderStatus: "pending");
     }
 
+    // Condenses older conversation turns into one 'summary' note. It skips turns already covered by an earlier summary and turns marked
+    // off the record, always leaves the newest 6 turns un-summarized, and only summarizes when at least 6 older turns are waiting (taking at most 8).
     public static MemoryWriteRequest? BuildConversationSummary(
         IReadOnlyList<AssistantTurn> turns,
         IReadOnlyList<MemoryNote> notes)
@@ -288,6 +333,7 @@ internal static class MemoryAutomation
             return null;
         }
 
+        // End time of the latest existing summary, so the same turns are not summarized twice.
         var summarizedThroughUtc = notes
             .Where(note => string.Equals(note.Kind, "summary", StringComparison.OrdinalIgnoreCase))
             .Max(note => note.SummaryWindowEndUtc) ?? DateTimeOffset.MinValue;
@@ -298,6 +344,7 @@ internal static class MemoryAutomation
             .OrderBy(turn => turn.TimestampUtc)
             .ToArray();
 
+        // Tuning numbers: keep the latest 6 turns as live context, need 6 older turns before summarizing, and fold at most 8 into one summary.
         const int reserveRecentTurnCount = 6;
         const int minimumSummaryTurnCount = 6;
         const int summaryWindowTurnCount = 8;
@@ -317,12 +364,14 @@ internal static class MemoryAutomation
             return null;
         }
 
+        // The up-to-3 distinct things the user asked for.
         var requests = olderTurns
             .Select(turn => TrimSentence(turn.UserInput))
             .Where(text => !string.IsNullOrWhiteSpace(text))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(3)
             .ToArray();
+        // The up-to-3 distinct successful tool results.
         var outcomes = olderTurns
             .SelectMany(turn => turn.ToolResults ?? Array.Empty<AssistantToolExecution>())
             .Where(result => result.Succeeded && !string.IsNullOrWhiteSpace(result.Summary))
@@ -336,6 +385,7 @@ internal static class MemoryAutomation
             return null;
         }
 
+        // Up to 3 distinct apps that were active.
         var apps = olderTurns
             .Select(turn => turn.Context?.ActiveApp)
             .Where(app => !string.IsNullOrWhiteSpace(app))
@@ -346,6 +396,7 @@ internal static class MemoryAutomation
         var location = olderTurns
             .Select(turn => turn.Context?.Location)
             .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
+        // The most common time of day among the turns.
         var dominantTimeOfDay = olderTurns
             .Select(turn => turn.Context?.TimeOfDay)
             .Where(value => !string.IsNullOrWhiteSpace(value))
@@ -354,6 +405,7 @@ internal static class MemoryAutomation
             .Select(group => group.Key)
             .FirstOrDefault() ?? string.Empty;
         var recentActivity = outcomes.Length > 0 ? outcomes : requests;
+        // Context attached to the summary, stamped with the last summarized turn's time.
         var summaryContext = new InteractionContextSnapshot(
             olderTurns[^1].TimestampUtc,
             dominantTimeOfDay,
@@ -376,6 +428,7 @@ internal static class MemoryAutomation
             SummaryWindowEndUtc: olderTurns[^1].TimestampUtc);
     }
 
+    // True if the text contains a secret-looking word (see SensitiveSignals) or a card-like number.
     public static bool LooksSensitive(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -391,6 +444,7 @@ internal static class MemoryAutomation
         return CardLikeNumberRegex.IsMatch(input);
     }
 
+    // Detects 'keep replies concise / more formal...': needs a reply-related word AND one of the tone words. Takes the first tone word found.
     private static bool TryExtractTonePreference(
         string input,
         InteractionContextSnapshot context,
@@ -413,7 +467,8 @@ internal static class MemoryAutomation
             return false;
         }
 
-        var tone = ToneTerms.FirstOrDefault(term => lowered.Contains(term, StringComparison.OrdinalIgnoreCase));
+        // Whole words ("shorter" and "warmer" count): "informal" must not save "formal", and "directory" must not save "direct".
+        var tone = ToneTerms.FirstOrDefault(term => Regex.IsMatch(lowered, $@"\b{term}(?:er)?\b"));
 
         if (string.IsNullOrWhiteSpace(tone))
         {
@@ -429,6 +484,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects how Noah wants to be addressed, including the negative form ('don't call me X').
     private static bool TryExtractAddressPreference(
         string input,
         InteractionContextSnapshot context,
@@ -482,6 +538,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects requests about answer format: bullets, step-by-step, paragraphs, more detail or shorter.
     private static bool TryExtractResponseStylePreference(
         string input,
         InteractionContextSnapshot context,
@@ -525,9 +582,7 @@ internal static class MemoryAutomation
             content = "Response style preference: prefer detailed replies.";
             tag = "detailed";
         }
-        else if (lowered.Contains("concise", StringComparison.Ordinal)
-                 || lowered.Contains("brief", StringComparison.Ordinal)
-                 || lowered.Contains("short", StringComparison.Ordinal))
+        else if (Regex.IsMatch(lowered, @"\b(?:concise|brief|short)(?:er)?\b"))
         {
             content = "Response style preference: prefer concise replies.";
             tag = "concise";
@@ -551,6 +606,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects chattiness preferences: emojis, small talk, light humor.
     private static bool TryExtractConversationPreference(
         string input,
         InteractionContextSnapshot context,
@@ -613,6 +669,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects wording corrections such as 'say X instead of Y' or 'don't say X'; stores the whole sentence.
     private static bool TryExtractPhrasingPreference(
         string input,
         InteractionContextSnapshot context,
@@ -636,6 +693,7 @@ internal static class MemoryAutomation
         return false;
     }
 
+    // Detects 'use <app> for <task>'.
     private static bool TryExtractAppPreference(
         string input,
         InteractionContextSnapshot context,
@@ -666,6 +724,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects where the user says they are; also stores it as the note's location context.
     private static bool TryExtractLocationPreference(
         string input,
         InteractionContextSnapshot context,
@@ -695,6 +754,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'when I <do something>, open <app>' in either word order.
     private static bool TryExtractAutomationPreference(
         string input,
         InteractionContextSnapshot context,
@@ -730,6 +790,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects routines, trying the most specific pattern first (timed, then event-anchored, then named, then plain 'every morning...').
     private static bool TryExtractRoutinePreference(
         string input,
         InteractionContextSnapshot context,
@@ -829,6 +890,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'I usually ...'.
     private static bool TryExtractHabitPreference(
         string input,
         InteractionContextSnapshot context,
@@ -861,6 +923,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'my favorite app is ...'.
     private static bool TryExtractFavoritePreference(
         string input,
         InteractionContextSnapshot context,
@@ -897,6 +960,8 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'my <label> is <name>' and maps the label to a kind: people become 'relationship', gadgets 'device', office/gym 'place',
+    // playlists 'playlist', project 'project'.
     private static bool TryExtractRelationshipMemory(
         string input,
         InteractionContextSnapshot context,
@@ -949,6 +1014,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'I'm working on / building <project>'.
     private static bool TryExtractProjectMemory(
         string input,
         InteractionContextSnapshot context,
@@ -981,6 +1047,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'my laptop/phone/... is <name>'. Overlaps with TryExtractRelationshipMemory, which also matches these sentences; the store later merges notes about the same entity.
     private static bool TryExtractDeviceMemory(
         string input,
         InteractionContextSnapshot context,
@@ -1022,6 +1089,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Detects 'my office/gym is <place>' or 'I work from / study at <place>'.
     private static bool TryExtractPlaceMemory(
         string input,
         InteractionContextSnapshot context,
@@ -1079,6 +1147,7 @@ internal static class MemoryAutomation
         return true;
     }
 
+    // Wraps a learned preference as a write request (source 'learned').
     private static MemoryWriteRequest BuildPreference(
         string content,
         string category,
@@ -1095,6 +1164,7 @@ internal static class MemoryAutomation
             CreatedAtUtc: DateTimeOffset.UtcNow);
     }
 
+    // Wraps a learned fact about a person, device, project, place or routine as a write request with an attached entity, kept long-term with high importance (0.80 for relationships, 0.70 otherwise).
     private static MemoryWriteRequest BuildStructuredMemory(
         string content,
         string category,
@@ -1128,6 +1198,7 @@ internal static class MemoryAutomation
             ]);
     }
 
+    // True if the message is about how replies should look or sound (a cheap pre-check before the style detector).
     private static bool LooksLikeReplyShapingRequest(string lowered)
     {
         return lowered.Contains("reply", StringComparison.Ordinal)
@@ -1151,6 +1222,8 @@ internal static class MemoryAutomation
     /// True only with both a task and a time still ahead. Either way the outputs hold what was understood
     /// (an empty task, or <c>default</c> for no time), so the caller can ask for just the missing part.
     /// </summary>
+    // Details: the relative form ('in 10 minutes') is tried first; otherwise the calendar's own date/time reader (CalendarText) is used.
+    // A time with no date means its next occurrence; a date with no time means 9:00 AM.
     internal static bool TryParseReminder(
         string input,
         DateTimeOffset nowLocal,
@@ -1160,6 +1233,7 @@ internal static class MemoryAutomation
         reminderText = string.Empty;
         reminderAtLocal = default;
 
+        // Step 1: the message must start like a reminder request.
         var prefix = ReminderPrefixRegex.Match(input.Trim());
 
         if (!prefix.Success)
@@ -1168,6 +1242,7 @@ internal static class MemoryAutomation
         }
 
         var payload = input.Trim()[prefix.Length..];
+        // Step 2: find the time, either relative ('in 10 minutes') or calendar-style, and cut it out of the text.
         var relative = RelativeReminderRegex.Match(payload);
 
         if (relative.Success)
@@ -1193,6 +1268,7 @@ internal static class MemoryAutomation
             }
         }
 
+        // Step 3: what is left is the task; the next regexes tidy it up. Valid only if the task is non-empty and the time is in the future.
         // Words stranded by the removed time: "to stretch" from "in 10 minutes to stretch", "call mom at".
         reminderText = Regex.Replace(payload, @"\s+", " ").Trim(' ', ',', '.', ';', ':', '-');
         // An answer to "What should I remind you about?" can restate the request: "(and I want you to) remind me about my medication".
@@ -1201,6 +1277,7 @@ internal static class MemoryAutomation
         return reminderText.Length > 0 && reminderAtLocal > nowLocal;
     }
 
+    // Converts a relative-time match into a duration: the amount (number word or digits; 'half an' = 0.5) times the unit taken from the first letter (s, m, h, otherwise days).
     private static TimeSpan ParseRelativeReminder(Match match)
     {
         var amount = match.Groups["half"].Success ? 0.5 : match.Groups["n"].Value.ToLowerInvariant() switch
@@ -1230,6 +1307,7 @@ internal static class MemoryAutomation
         };
     }
 
+    // Writes the plain-text body of a conversation summary.
     private static string BuildSummaryText(
         IReadOnlyList<AssistantTurn> turns,
         IReadOnlyList<string> requests,
@@ -1261,6 +1339,7 @@ internal static class MemoryAutomation
         return string.Join(" ", parts);
     }
 
+    // Buckets the hour: 5-11 morning, 12-16 afternoon, 17-21 evening, otherwise night.
     private static string GetTimeOfDay(DateTimeOffset localTime)
     {
         return localTime.Hour switch
@@ -1272,6 +1351,7 @@ internal static class MemoryAutomation
         };
     }
 
+    // Which tools are worth remembering the outcome of (opening, reading, searching, running, screen analysis).
     private static bool ShouldCaptureToolOutcome(string toolName)
     {
         var normalized = toolName.Trim().ToLowerInvariant();
@@ -1285,7 +1365,6 @@ internal static class MemoryAutomation
             or "research"
             or "run"
             or "screen"
-            or "ambient"
             or "analyze image"
             or "analyze document";
     }
@@ -1301,6 +1380,7 @@ internal static class MemoryAutomation
         return char.ToUpperInvariant(trimmed[0]) + trimmed[1..];
     }
 
+    // Flattens line breaks and cuts text at 180 characters so long text does not bloat memory.
     private static string TrimSentence(string value)
     {
         if (string.IsNullOrWhiteSpace(value))

@@ -1,10 +1,15 @@
+// ApiKeyResolution.cs: finds an API key (for the model, speech or voice services) without keeping secrets in the
+// settings file. ApiKeyResolver is called from ModelGateway.cs and the speech/voice code; WindowsCredentialStore is
+// the small Windows Credential Manager wrapper it uses. Local LM Studio needs no key, so this often returns empty.
 using System.Runtime.InteropServices;
 using System.Text;
 
 namespace Jarvis.Core;
 
+// Looks for a key in three places, in this order: the value typed in settings, Windows Credential Manager, then an environment variable.
 public static class ApiKeyResolver
 {
+    // Returns the first non-empty key found, or an empty string when none is configured.
     public static string Resolve(string directValue, string credentialTarget, string envVar)
     {
         if (!string.IsNullOrWhiteSpace(directValue))
@@ -26,10 +31,13 @@ public static class ApiKeyResolver
     }
 }
 
+// Reads and writes "generic" entries in Windows Credential Manager (the same vault Windows uses for saved passwords) through advapi32.dll.
 internal static class WindowsCredentialStore
 {
+    // Windows constant CRED_TYPE_GENERIC: an app-defined secret rather than a network login.
     private const int CredTypeGeneric = 1;
 
+    // Reads the secret saved under the given name; returns false (and an empty secret) if it is missing or unreadable.
     public static bool TryReadGenericSecret(string target, out string secret)
     {
         secret = string.Empty;
@@ -54,6 +62,7 @@ internal static class WindowsCredentialStore
                 return false;
             }
 
+            // The secret is stored as UTF-16 bytes, so copy them out and decode as Unicode, trimming trailing null characters.
             var bytes = new byte[credential.CredentialBlobSize];
             Marshal.Copy(credential.CredentialBlob, bytes, 0, bytes.Length);
             secret = Encoding.Unicode.GetString(bytes).TrimEnd('\0').Trim();
@@ -65,6 +74,7 @@ internal static class WindowsCredentialStore
         }
     }
 
+    // Saves a secret under the given name for the current Windows user.
     public static bool TryWriteGenericSecret(string target, string secret)
     {
         if (!OperatingSystem.IsWindows())
@@ -96,6 +106,7 @@ internal static class WindowsCredentialStore
         }
     }
 
+    // Native Windows calls (P/Invoke): write a credential, read one, and free the memory Windows allocated for a read.
     [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CredWriteW(ref Credential credential, int flags);
 
@@ -105,6 +116,7 @@ internal static class WindowsCredentialStore
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern void CredFree(IntPtr credentialPtr);
 
+    // Mirrors the Windows CREDENTIALW struct; field order and types must match it exactly or the native call reads garbage.
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct Credential
     {

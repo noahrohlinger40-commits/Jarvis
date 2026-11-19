@@ -1,10 +1,16 @@
+// VoiceRecognitionText.cs: text-side helpers for speech. Cleans up what whisper (or the Windows recogniser) heard, spots the
+// wake word ("Jarvis") in a transcript and strips it to leave the command, builds the vocabulary hint sent to whisper, and
+// recognises yes/no answers. Used by both voice runtimes (OpenAiCompatibleVoiceRuntime, SpeechRecognitionVoiceRuntime).
+// Whisper often mis-spells the name ("Jervis", "Garbus"), so matching is deliberately forgiving here.
 using System.Text.RegularExpressions;
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// Static helper class (no state). "partial" only because the whitespace regex is generated at compile time (see the end of the file).
 internal static partial class VoiceRecognitionText
 {
+    // Greeting words that may come right before the wake word: "hey Jarvis", "okay Jarvis".
     private static readonly string[] WakeLeadIns =
     [
         "hey",
@@ -16,6 +22,7 @@ internal static partial class VoiceRecognitionText
         "yo"
     ];
 
+    // Filler words that may appear before the wake word without stopping it counting as the start of the sentence ("um, hey Jarvis ...").
     private static readonly HashSet<string> WakeSkippableTokens = new(StringComparer.Ordinal)
     {
         "uh",
@@ -32,6 +39,7 @@ internal static partial class VoiceRecognitionText
         "yo"
     };
 
+    // Misspellings of "Jarvis" that are treated as the real name.
     private static readonly HashSet<string> CanonicalWakeVariants = new(StringComparer.Ordinal)
     {
         "jarvis",
@@ -45,6 +53,7 @@ internal static partial class VoiceRecognitionText
         "gargus"
     };
 
+    // Short spoken answers that mean "yes" when Jarvis asks for confirmation.
     private static readonly HashSet<string> ConfirmationApprovals = new(StringComparer.Ordinal)
     {
         "yes",
@@ -59,6 +68,7 @@ internal static partial class VoiceRecognitionText
         "go ahead"
     };
 
+    // Short spoken answers that mean "no" or "say it again".
     private static readonly HashSet<string> ConfirmationDenials = new(StringComparer.Ordinal)
     {
         "no",
@@ -72,6 +82,8 @@ internal static partial class VoiceRecognitionText
         "try again"
     };
 
+    // Tidies a transcript: fixes a wrong wake-word spelling in the first three words, collapses spaces, fixes spacing around
+    // punctuation, optionally applies the user's saved corrections, and capitalises the first letter.
     public static string NormalizeTranscript(string text, JarvisOptions options, bool applyPersonalCorrections = true)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -81,6 +93,7 @@ internal static partial class VoiceRecognitionText
 
         var tokens = Tokenize(text);
 
+        // Only the first three words are checked, because the wake word is said at the start.
         for (var index = 0; index < Math.Min(tokens.Count, 3); index++)
         {
             var corrected = CorrectWakeToken(tokens[index].Match, options);
@@ -93,7 +106,9 @@ internal static partial class VoiceRecognitionText
 
         var normalized = string.Join(' ', tokens.Select(token => token.Original));
         normalized = WhitespaceRegex().Replace(normalized.Trim(), " ");
+        // Regex "\s+([.,!?;:])" removes spaces before punctuation: "open notepad ." becomes "open notepad.".
         normalized = Regex.Replace(normalized, "\\s+([.,!?;:])", "$1");
+        // Regex "([.,!?;:])([^\s])" adds a space after punctuation stuck to the next word: "hi,there" becomes "hi, there".
         normalized = Regex.Replace(normalized, "([.,!?;:])([^\\s])", "$1 $2");
 
         if (applyPersonalCorrections)
@@ -109,6 +124,8 @@ internal static partial class VoiceRecognitionText
         return normalized;
     }
 
+    // Replaces words the recogniser keeps getting wrong with what the user said they meant (saved in settings; see VoiceCorrectionLearning).
+    // Longest phrases are applied first so a short correction cannot break a longer one.
     public static string ApplyPersonalCorrections(string text, JarvisOptions options)
     {
         if (string.IsNullOrWhiteSpace(text) || options.SpeechRecognitionCorrections.Length == 0)
@@ -132,6 +149,8 @@ internal static partial class VoiceRecognitionText
                 continue;
             }
 
+            // Regex built from the heard phrase: whole-word match only. (?<![\p{L}\p{N}]) means "not preceded by a letter or digit" and
+            // (?![\p{L}\p{N}]) "not followed by one", so "art" does not match inside "party".
             var pattern = $@"(?<![\p{{L}}\p{{N}}]){Regex.Escape(heard)}(?![\p{{L}}\p{{N}}])";
             corrected = Regex.Replace(
                 corrected,
@@ -146,14 +165,18 @@ internal static partial class VoiceRecognitionText
         return corrected;
     }
 
+    // Looks for the wake word at the start of the transcript. Returns true with the command after it ("Jarvis open notepad" gives
+    // "open notepad"; "Jarvis" alone gives an empty command, meaning "I'm listening"). Falls back to a mid-sentence search.
     public static bool TryExtractWakeCommand(string recognizedText, JarvisOptions options, out string commandText)
     {
         var tokens = Tokenize(recognizedText);
 
+        // First pass: the name (or an alias with a greeting) within the first three words, allowing a little fuzziness.
         foreach (var prefix in BuildWakePrefixTokens(options))
         {
             for (var startIndex = 0; startIndex <= Math.Min(2, tokens.Count - prefix.Length); startIndex++)
             {
+                // When it does not start at word 0, everything before it must be filler like "um" or "hey".
                 if (startIndex > 0
                     && tokens.Take(startIndex).Any(token => !WakeSkippableTokens.Contains(token.Match)))
                 {
@@ -182,10 +205,12 @@ internal static partial class VoiceRecognitionText
             }
         }
 
+        // Second pass: exact name anywhere in the sentence.
         // Pauses get merged into one utterance, so "so if I say Jarvis open Spotify" is common.
         // Mid-sentence only an exact wake word counts; fuzzy matching there would catch "Travis" or "Marvin".
         for (var startIndex = 0; startIndex < tokens.Count; startIndex++)
         {
+            // Tokens are already normalised, so compare with the name after the same normalisation.
             if (tokens[startIndex].Match != CorrectWakeToken(CanonicalizeForMatching(options.WakePhrase), null))
             {
                 continue;
@@ -207,6 +232,7 @@ internal static partial class VoiceRecognitionText
         return false;
     }
 
+    // All spoken forms of the wake word (and with greetings) for the Windows recogniser's wake grammar.
     public static IReadOnlyList<string> BuildWakeGrammarChoices(JarvisOptions options)
     {
         var phrases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -224,6 +250,8 @@ internal static partial class VoiceRecognitionText
         return phrases.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
+    // Builds the "prompt" sent with every whisper request: a short list of context, the wake word spellings, common commands
+    // and the user's own corrections, which nudges whisper to spell app names and commands correctly.
     public static string BuildTranscriptionPrompt(JarvisOptions options)
     {
         var wakeAsset = WakeWordAssetCatalog.ResolveConfiguredAsset(options);
@@ -275,12 +303,15 @@ internal static partial class VoiceRecognitionText
         return string.Join(' ', instructions);
     }
 
+    // True when the answer is a yes ("yes", "go ahead", ...).
     public static bool LooksLikeConfirmationApproval(string input) =>
         ConfirmationApprovals.Contains(CanonicalizeForMatching(input));
 
+    // True when the answer is a no or a request to repeat ("cancel", "try again", ...).
     public static bool LooksLikeConfirmationDenial(string input) =>
         ConfirmationDenials.Contains(CanonicalizeForMatching(input));
 
+    // Every wake phrase as a list of words: each alias alone and with each greeting in front.
     private static IReadOnlyList<string[]> BuildWakePrefixTokens(JarvisOptions options)
     {
         var prefixes = new List<string[]>();
@@ -318,6 +349,8 @@ internal static partial class VoiceRecognitionText
         }
     }
 
+    // Every spelling that should count as the wake word: wake phrase, assistant name, configured aliases, the known
+    // whisper misspellings (only when the phrase is "jarvis"), and aliases of the loaded wake-word asset.
     public static IReadOnlyList<string> BuildWakeAliases(JarvisOptions options)
     {
         var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -370,6 +403,7 @@ internal static partial class VoiceRecognitionText
         }
     }
 
+    // Turns an app alias target into something readable for the whisper prompt: "spotify:" -> "spotify", "C:\...\Code.exe" -> "Code".
     private static string DescribeAppAliasTarget(string target)
     {
         var trimmed = target.Trim();
@@ -383,6 +417,7 @@ internal static partial class VoiceRecognitionText
         return string.IsNullOrWhiteSpace(leaf) ? trimmed : leaf;
     }
 
+    // Splits text into words, keeping each word as spoken (Original) and a cleaned lower-case form used for comparison (Match).
     private static List<SpokenToken> Tokenize(string text)
     {
         return text
@@ -400,6 +435,7 @@ internal static partial class VoiceRecognitionText
             .ToList();
     }
 
+    // Lower-cases a word, trims punctuation and curly quotes, and swaps known wake-word misspellings for "jarvis".
     private static string NormalizeTokenForMatching(string token)
     {
         var trimmed = token
@@ -412,6 +448,7 @@ internal static partial class VoiceRecognitionText
         return CorrectWakeToken(trimmed.ToLowerInvariant(), null);
     }
 
+    // If the word is a known misspelling of Jarvis, return the proper wake word; otherwise unchanged.
     private static string CorrectWakeToken(string token, JarvisOptions? options)
     {
         if (string.IsNullOrWhiteSpace(token))
@@ -431,6 +468,7 @@ internal static partial class VoiceRecognitionText
         return token;
     }
 
+    // Removes stray punctuation around the command text.
     private static string NormalizeCommandText(string text)
     {
         return text
@@ -439,6 +477,8 @@ internal static partial class VoiceRecognitionText
             .Trim();
     }
 
+    // Does a heard word match the expected wake word? Exact, or after fixing misspellings, or close enough by edit distance:
+    // one letter off for short words, two for words of six or more letters.
     private static bool IsWakeTokenMatch(string actual, string expected)
     {
         if (string.Equals(actual, expected, StringComparison.Ordinal))
@@ -466,6 +506,8 @@ internal static partial class VoiceRecognitionText
         return ComputeLevenshteinDistance(actualCanonical, expectedCanonical) <= allowedDistance;
     }
 
+    // Levenshtein distance: the smallest number of single-letter insertions, deletions or changes that turn one word into the other
+    // ("jervis" to "jarvis" is 1). Uses one row of a table that is updated in place.
     private static int ComputeLevenshteinDistance(string left, string right)
     {
         var costs = new int[right.Length + 1];
@@ -494,6 +536,7 @@ internal static partial class VoiceRecognitionText
         return costs[right.Length];
     }
 
+    // Lower-cases and replaces everything except letters, digits, '.' and spaces with spaces, then collapses repeated spaces.
     private static string CanonicalizeForMatching(string value)
     {
         var chars = value
@@ -504,8 +547,10 @@ internal static partial class VoiceRecognitionText
         return string.Join(' ', new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
 
+    // Matches one or more whitespace characters.
     [GeneratedRegex("\\s+")]
     private static partial Regex WhitespaceRegex();
 
+    // One word of a transcript: as heard, and in cleaned form for matching.
     private sealed record SpokenToken(string Original, string Match);
 }

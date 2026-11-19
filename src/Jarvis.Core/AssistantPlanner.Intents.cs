@@ -1,10 +1,40 @@
+// Intent classification and the simple routes of the planner. "Intent" means which route a request takes: direct tool,
+// simple reply, research, full planner, background, visual or a clarifying question. First a cheap keyword guess
+// (ClassifyHeuristically, with the word lists in AssistantPlanner.Formatting.cs); if that is unsure, a quick model call
+// double-checks. Also holds the fallback and summary replies the main loop in AssistantPlanner.cs uses.
+// Slice of the StructuredAssistantPlanner class; RequestSurface at the top is a separate public helper.
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
+/// <summary>Spots a request that names something to look at on this PC or online, which only the planner's tools can reach.</summary>
+public static class RequestSurface
+{
+    // Matches a word that names something outside the chat to look at (email, Discord, a file, a page...) or a link ("://").
+    // Such requests need the planner's tools, not a plain chat answer.
+    private static readonly Regex Named = new(
+        @"://|\b(?:e-?mails?|outlook|inbox|drafts?|messages?|dms?|discord|teams|canvas|notion|linkedin|sharepoint|calendar|files?|folders?|documents?|docs?|pdfs?|pages?|websites?|sites?|posts?|channels?|tabs?|sheets?|spreadsheets?|database|projects?|reports?|story|excel|figma|github|spotify)\b",
+        RegexOptions.IgnoreCase);
+
+    // True when the input mentions a named surface such as email, Discord or a file.
+    public static bool IsNamed(string input) => !string.IsNullOrWhiteSpace(input) && Named.IsMatch(input);
+
+    // A pasted link counts: nobody pastes one just to have it opened and left there.
+    // Matches phrasing that asks what is ON a page rather than just opening it: "look through", "read", "summarize",
+    // "what is", "catch me up", "any new", "unread", "find", or a link. Example: "check my Discord for anything new".
+    private static readonly Regex AboutThePage = new(
+        @"://|\b(?:look(?:ing)?\s+(?:through|at|over|for)|go(?:ing)?\s+through|read|check|see\s+(?:if|what|who)|make\s+sure|summar\w*|what(?:'?s|\s+is|\s+are)|catch\s+me\s+up|respond|reply|answer|any(?:thing)?\s+new|unread|missed|find|browse)\b",
+        RegexOptions.IgnoreCase);
+
+    /// <summary>True when the request wants to know what is on a page, not only to have it opened.</summary>
+    public static bool AsksAboutThePage(string input) => !string.IsNullOrWhiteSpace(input) && AboutThePage.IsMatch(input);
+}
+
 internal sealed partial class StructuredAssistantPlanner
 {
+    // Entry point that checks for cancellation, then does the real work in ClassifyIntentCoreAsync.
     private Task<IntentDecision> ClassifyIntentAsync(
         string input,
         AssistantPlanningRequest request,
@@ -18,6 +48,8 @@ internal sealed partial class StructuredAssistantPlanner
         return ClassifyIntentCoreAsync(input, request, pendingSession, resumedSession, sessionId, activity, cancellationToken);
     }
 
+    // Picks the route. A resumed workflow always goes to the planner; otherwise the keyword guess is used, and a fast model call
+    // may override it when the guess is shaky.
     private async Task<IntentDecision> ClassifyIntentCoreAsync(
         string input,
         AssistantPlanningRequest request,
@@ -71,6 +103,8 @@ internal sealed partial class StructuredAssistantPlanner
         return decision;
     }
 
+    // The keyword-based guess, checked in priority order: pending question, ambiguous request, a tool name found in the
+    // words (cheap direct route), small talk, research, an explicit action request, and finally a plain conversational reply.
     private IntentDecision ClassifyHeuristically(string input, AssistantPlanningRequest request, PersistedAgentSession? pendingSession)
     {
         if (pendingSession is not null)
@@ -100,7 +134,6 @@ internal sealed partial class StructuredAssistantPlanner
         if (TryInferToolHint(input, out var toolHint))
         {
             var intent = string.Equals(toolHint, "screen", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(toolHint, "ambient", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(toolHint, "analyze image", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(toolHint, "analyze document", StringComparison.OrdinalIgnoreCase)
                 ? AgentIntentKind.Visual
@@ -162,6 +195,8 @@ internal sealed partial class StructuredAssistantPlanner
             RunInBackground: false);
     }
 
+    // Decides whether the guess needs a second opinion from the model. Strong guesses (tool, research, planner) are trusted;
+    // only the uncertain chat-like ones, or longer ones (over 24 characters), are checked. Skipped when the model is offline.
     private bool ShouldUseModelIntentClassification(
         string input,
         IntentDecision heuristicDecision,
@@ -188,6 +223,7 @@ internal sealed partial class StructuredAssistantPlanner
             || LooksLikeTaskContextQuestion(input);
     }
 
+    // Asks the fast model for a JSON classification. Any failure means "keep the keyword guess" (returns null).
     private async Task<IntentDecision?> TryClassifyIntentWithModelAsync(
         string input,
         AssistantPlanningRequest request,
@@ -233,6 +269,8 @@ internal sealed partial class StructuredAssistantPlanner
         }
     }
 
+    // Builds the prompt for the classifier: instructions, the keyword guess, the tools, and a little recent context
+    // (trimmed to 900 characters each so the call stays fast).
     private ChatMessage[] BuildIntentClassificationMessages(
         AssistantPlanningRequest request,
         string input,
@@ -243,14 +281,12 @@ internal sealed partial class StructuredAssistantPlanner
         return
         [
             new ChatMessage("system", [ChatMessageContentPart.FromText(BuildPersonaScopedSystemPrompt(
-                "Classify the user's request for routing. Return only JSON with keys intent, reason, toolHint, toolInput, askFollowUp, followUpQuestion, runInBackground. Allowed intent values: direct_tool, simple_reply, planner, research, visual. Use direct_tool only when one immediate tool call is enough. Use visual for screen, ambient, image, or document understanding requests. Use research only for open-domain web questions. Use planner for local computer actions or multi-step workflows. Use simple_reply for conversational answers that can be grounded in the supplied context without taking an action. Ask a follow-up only when a specific missing detail blocks the next step. Email and task snapshot questions are usually simple_reply unless the user explicitly wants to send, draft, create, edit, or update something. toolHint must be one of the allowed tool names or empty. toolInput must contain only the argument tail, not the command name."))]),
+                "Classify the user's request for routing. Return only JSON with keys intent, reason, toolHint, toolInput, askFollowUp, followUpQuestion, runInBackground. Allowed intent values: direct_tool, simple_reply, planner, research, visual. Use direct_tool only when one immediate tool call is enough. Use visual for screen, image, or document understanding requests. Use research only for open-domain web questions. Use planner for local computer actions or multi-step workflows. Use simple_reply for conversational answers that can be grounded in the supplied context without taking an action. Ask a follow-up only when a specific missing detail blocks the next step. Email and task snapshot questions are usually simple_reply unless the user explicitly wants to send, draft, create, edit, or update something. toolHint must be one of the allowed tool names or empty. toolInput must contain only the argument tail, not the command name."))]),
             new ChatMessage("user", [ChatMessageContentPart.FromText(string.Join(
                 Environment.NewLine,
                 $"User input: {input}",
                 $"Heuristic guess: intent={MapIntentToClassifierValue(heuristicDecision.Intent)}; reason={heuristicDecision.Reason}; toolHint={heuristicDecision.ToolHint}; runInBackground={heuristicDecision.RunInBackground}",
                 $"Allowed tool hints: {toolHints}",
-                "Relevant user state:",
-                TruncateForContext(request.UserState.ToPromptText(), 900),
                 "Recent conversation:",
                 TruncateForContext(BuildReplyRecentTurnBlock(request.RecentTurns), 900),
                 "Recent tool evidence:",
@@ -260,6 +296,8 @@ internal sealed partial class StructuredAssistantPlanner
         ];
     }
 
+    // Turns the model's JSON answer into a decision, correcting inconsistent answers: a follow-up question always
+    // means Clarification, and a direct-tool answer without a known tool name is discarded (returns null).
     private IntentDecision? BuildIntentDecisionFromModelClassification(
         string input,
         AssistantPlanningRequest request,
@@ -332,6 +370,7 @@ internal sealed partial class StructuredAssistantPlanner
             runInBackground);
     }
 
+    // Direct route: runs the single tool the classifier chose and returns its output as the reply.
     private async Task<AssistantPlanningResult> ExecuteDirectToolIntentAsync(
         IntentDecision decision,
         Func<PlannerToolCall, CancellationToken, Task<PlannerToolResult>> executeToolAsync,
@@ -349,13 +388,15 @@ internal sealed partial class StructuredAssistantPlanner
             SessionId: sessionId);
     }
 
+    // Simple reply route: one model call with recent context and no tools. If the model is offline or fails,
+    // a canned offline reply is used instead.
     private async Task<AssistantPlanningResult> ExecuteSimpleReplyAsync(
         AssistantPlanningRequest request,
         string sessionId,
         PersistedAgentSession? resumedSession,
         CancellationToken cancellationToken)
     {
-        var offlineFallback = BuildOfflineSimpleReply(request);
+        var offlineFallback = BuildOfflineSimpleReply(request.UserInput);
 
         if (!_modelGateway.IsAvailable)
         {
@@ -395,6 +436,8 @@ internal sealed partial class StructuredAssistantPlanner
         }
     }
 
+    // Research route: web search for citations, then (if the model is up) a model call that answers from those sources only.
+    // Without a model, or without results, it returns a plain list of the sources found.
     private async Task<AssistantPlanningResult> ExecuteResearchIntentAsync(
         string input,
         string sessionId,
@@ -469,6 +512,8 @@ internal sealed partial class StructuredAssistantPlanner
         }
     }
 
+    // Used when the planner loop itself fails: tries a plain conversational answer if no tool has run yet, otherwise summarises
+    // what the tools did, and ends the saved session.
     private async Task<AssistantPlanningResult> BuildFallbackPlannedResultAsync(
         AssistantPlanningRequest request,
         string sessionId,
@@ -501,6 +546,7 @@ internal sealed partial class StructuredAssistantPlanner
             SessionId: sessionId);
     }
 
+    // Plain model reply used as a last resort when the planner model call failed.
     private async Task<string> TryBuildContextualFallbackReplyAsync(
         AssistantPlanningRequest request,
         string sessionId,
@@ -529,6 +575,8 @@ internal sealed partial class StructuredAssistantPlanner
         }
     }
 
+    // Final reply after tool work: a short model-written summary of what the tools did, or a plain-text summary if the model
+    // is unavailable. A waiting approval prompt is returned as is.
     private async Task<string> BuildPlannedSummaryAsync(
         string userInput,
         IReadOnlyList<PlannerToolResult> toolResults,
@@ -541,6 +589,12 @@ internal sealed partial class StructuredAssistantPlanner
             return AppendCitations("I could not complete that request with the available tools.", citations);
         }
 
+        // A gate's own text says what is waiting and how to answer; a model summary of a "finished workflow" could lose that.
+        if (string.Equals(ResolveVerificationStatus(toolResults[^1]), "awaiting_approval", StringComparison.OrdinalIgnoreCase))
+        {
+            return toolResults[^1].Output;
+        }
+
         if (!_modelGateway.IsAvailable)
         {
             return AppendCitations(BuildOfflinePlanSummary(toolResults), citations);
@@ -548,13 +602,13 @@ internal sealed partial class StructuredAssistantPlanner
 
         var toolText = string.Join(
             Environment.NewLine,
-            toolResults.Select(result =>
-                $"- {result.ApiName}({result.Input}): purpose={result.Purpose}; expectedEvidence={result.ExpectedEvidence}; success={!result.IsError}; verificationStatus={result.VerificationStatus}; verificationSummary={result.VerificationSummary}; verification={result.Verification}; summary={result.Summary}; output={TrimToolOutput(result.ApiName, result.Output).ReplaceLineEndings(" ")}"));
+            toolResults.TakeLast(Math.Max(1, _options.PlannerRecentToolResultCount)).Select(result =>
+                $"- {result.ApiName}({result.Input}): success={!result.IsError}; output={TrimToolOutput(result.ApiName, result.Output).ReplaceLineEndings(" ")}"));
 
         var messages = new[]
         {
             new ChatMessage("system", [ChatMessageContentPart.FromText(
-                BuildPersonaScopedSystemPrompt("Summarize the finished workflow for the user. Do not dump raw tool output. Mention whether the action actually succeeded based on the verification evidence."))]),
+                BuildPersonaScopedSystemPrompt("Summarize the finished workflow for the user. Do not dump raw tool output. Mention whether the action actually succeeded based on the tool results. If every tool only read something (screen, notes, status), say what was read and that nothing was done; never describe an action no tool performed."))]),
             new ChatMessage("user", [ChatMessageContentPart.FromText(
                 $"User request: {userInput}{Environment.NewLine}Tool results:{Environment.NewLine}{toolText}")])
         };
@@ -573,6 +627,10 @@ internal sealed partial class StructuredAssistantPlanner
                 ? BuildOfflinePlanSummary(toolResults)
                 : response.Content.Trim();
 
+            // This summary is its own model call, so it can narrate an action just like
+            // the planner reply; when nothing acted this turn (reads only), a narrated action is replaced by the honest line.
+            if (!ActionClaimGuard.Acted(toolResults) && ActionClaimGuard.IsUnverifiedClaim(content)) content = ActionClaimGuard.HonestReplyAfter(toolResults);
+
             return AppendCitations(content, citations);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -583,219 +641,7 @@ internal sealed partial class StructuredAssistantPlanner
         }
     }
 
-    private async Task<ReflectionDecision> ReflectAsync(
-        string userInput,
-        IReadOnlyList<PlannerToolResult> toolResults,
-        string sessionId,
-        IProgress<AssistantActivityEvent> activity,
-        CancellationToken cancellationToken)
-    {
-        if (toolResults.Count == 0)
-        {
-            return new ReflectionDecision(false, string.Empty, false, string.Empty, false, string.Empty);
-        }
-
-        if (!_options.PlannerReflectionEnabled || !_modelGateway.IsAvailable)
-        {
-            return BuildHeuristicReflectionDecision(toolResults);
-        }
-
-        var toolText = string.Join(
-            Environment.NewLine,
-            toolResults.TakeLast(Math.Max(1, _options.PlannerRecentToolResultCount)).Select(result =>
-                $"- tool={result.ApiName}; input={result.Input}; purpose={result.Purpose}; expectedEvidence={result.ExpectedEvidence}; success={!result.IsError}; verificationStatus={result.VerificationStatus}; verificationSummary={result.VerificationSummary}; verification={result.Verification}; summary={result.Summary}; output={TrimToolOutput(result.ApiName, result.Output).ReplaceLineEndings(" ")}"));
-
-        var messages = new[]
-        {
-            new ChatMessage("system", [ChatMessageContentPart.FromText(
-                "You are a critic for a tool-using assistant. Return only JSON with keys goalSatisfied (bool), askFollowUp (bool), followUpQuestion (string), retryRecommended (bool), correctionNote (string), summary (string).")]),
-            new ChatMessage("user", [ChatMessageContentPart.FromText(
-                $"User request: {userInput}{Environment.NewLine}Recent tool results:{Environment.NewLine}{toolText}")])
-        };
-
-        try
-        {
-            activity.Report(new AssistantActivityEvent(
-                AssistantActivityKind.Reflection,
-                "Reviewing the last tool results before deciding on the next step.",
-                sessionId,
-                IsTransient: true,
-                Detail: toolResults[^1].Summary));
-
-            var response = await ExecuteModelCallAsync(
-                new ChatCompletionRequest(messages, Temperature: 0, User: BuildModelSessionKey(sessionId, "reflection")),
-                "reflection",
-                sessionId,
-                activity,
-                ModelRoute.Fast,
-                cancellationToken);
-
-            var reflection = ParseJson<ReflectionDecisionContract>(response.Content);
-
-            if (reflection is null)
-            {
-                throw new InvalidOperationException("The reflection response did not contain valid JSON.");
-            }
-
-            return NormalizeReflectionDecision(
-                toolResults,
-                new ReflectionDecision(
-                reflection.GoalSatisfied,
-                reflection.Summary ?? string.Empty,
-                reflection.AskFollowUp,
-                reflection.FollowUpQuestion ?? string.Empty,
-                reflection.RetryRecommended,
-                reflection.CorrectionNote ?? string.Empty));
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            var heuristic = BuildHeuristicReflectionDecision(toolResults);
-            var correctionNote = FirstNonEmpty(
-                heuristic.CorrectionNote,
-                $"Reflection fallback: {TrimError(exception.Message)}");
-
-            return heuristic with { CorrectionNote = correctionNote };
-        }
-    }
-
-    private static ReflectionDecision BuildHeuristicReflectionDecision(IReadOnlyList<PlannerToolResult> toolResults)
-    {
-        if (toolResults.Count == 0)
-        {
-            return new ReflectionDecision(false, string.Empty, false, string.Empty, false, string.Empty);
-        }
-
-        var last = toolResults[^1];
-        var verificationStatus = ResolveVerificationStatus(last);
-        var summary = FirstNonEmpty(last.VerificationSummary, last.Summary, TrimForFeed(last.Output));
-
-        if (last.IsError)
-        {
-            return new ReflectionDecision(
-                false,
-                summary,
-                false,
-                string.Empty,
-                true,
-                FirstNonEmpty(
-                    last.VerificationSummary,
-                    "The last tool failed, so a different approach or tool is needed."));
-        }
-
-        if (string.Equals(verificationStatus, "awaiting_approval", StringComparison.OrdinalIgnoreCase))
-        {
-            return new ReflectionDecision(
-                true,
-                FirstNonEmpty(summary, "The workflow is paused pending approval."),
-                false,
-                string.Empty,
-                false,
-                string.Empty);
-        }
-
-        if (string.Equals(verificationStatus, "unconfirmed", StringComparison.OrdinalIgnoreCase))
-        {
-            return new ReflectionDecision(
-                false,
-                summary,
-                false,
-                string.Empty,
-                true,
-                FirstNonEmpty(
-                    last.VerificationSummary,
-                    "The expected evidence is still unconfirmed, so gather more evidence before finishing."));
-        }
-
-        return new ReflectionDecision(
-            true,
-            summary,
-            false,
-            string.Empty,
-            false,
-            string.Empty);
-    }
-
-    private static ReflectionDecision NormalizeReflectionDecision(
-        IReadOnlyList<PlannerToolResult> toolResults,
-        ReflectionDecision decision)
-    {
-        if (toolResults.Count == 0)
-        {
-            return decision;
-        }
-
-        var last = toolResults[^1];
-        var verificationStatus = ResolveVerificationStatus(last);
-        var summary = FirstNonEmpty(decision.Summary, last.VerificationSummary, last.Summary, TrimForFeed(last.Output));
-
-        if (last.IsError)
-        {
-            return decision with
-            {
-                GoalSatisfied = false,
-                Summary = summary,
-                RetryRecommended = true,
-                CorrectionNote = FirstNonEmpty(
-                    decision.CorrectionNote,
-                    last.VerificationSummary,
-                    "The last tool failed, so a different approach or tool is needed.")
-            };
-        }
-
-        if (string.Equals(verificationStatus, "awaiting_approval", StringComparison.OrdinalIgnoreCase))
-        {
-            return decision with
-            {
-                GoalSatisfied = true,
-                AskFollowUp = false,
-                FollowUpQuestion = string.Empty,
-                RetryRecommended = false,
-                CorrectionNote = string.Empty,
-                Summary = FirstNonEmpty(summary, "The workflow is paused pending approval.")
-            };
-        }
-
-        if (string.Equals(verificationStatus, "unconfirmed", StringComparison.OrdinalIgnoreCase))
-        {
-            if (decision.AskFollowUp)
-            {
-                return decision with
-                {
-                    GoalSatisfied = false,
-                    Summary = summary
-                };
-            }
-
-            return decision with
-            {
-                GoalSatisfied = false,
-                Summary = summary,
-                RetryRecommended = true,
-                CorrectionNote = FirstNonEmpty(
-                    decision.CorrectionNote,
-                    last.VerificationSummary,
-                    "The expected evidence is still unconfirmed, so gather more evidence before finishing.")
-            };
-        }
-
-        if (!decision.GoalSatisfied
-            && !decision.AskFollowUp
-            && !decision.RetryRecommended
-            && string.IsNullOrWhiteSpace(decision.CorrectionNote))
-        {
-            return decision with
-            {
-                Summary = summary,
-                RetryRecommended = true,
-                CorrectionNote = FirstNonEmpty(
-                    last.VerificationSummary,
-                    "The evidence is incomplete, so continue the workflow.")
-            };
-        }
-
-        return decision with { Summary = summary };
-    }
-
+    // The route chosen for a request, with the reason (shown in the UI), the tool to run for direct routes, and any follow-up question.
     private sealed record IntentDecision(
         AgentIntentKind Intent,
         string Reason,
@@ -805,14 +651,7 @@ internal sealed partial class StructuredAssistantPlanner
         string FollowUpQuestion,
         bool RunInBackground);
 
-    private sealed record ReflectionDecision(
-        bool GoalSatisfied,
-        string Summary,
-        bool AskFollowUp,
-        string FollowUpQuestion,
-        bool RetryRecommended,
-        string CorrectionNote);
-
+    // The JSON shape the classifier model is asked to return.
     private sealed record IntentClassificationContract(
         string? Intent,
         string? Reason,
@@ -822,378 +661,7 @@ internal sealed partial class StructuredAssistantPlanner
         string? FollowUpQuestion,
         bool? RunInBackground);
 
-    private sealed record ReflectionDecisionContract(
-        bool GoalSatisfied,
-        bool AskFollowUp,
-        string? FollowUpQuestion,
-        bool RetryRecommended,
-        string? CorrectionNote,
-        string? Summary);
-
-    private static string BuildOfflineSimpleReply(AssistantPlanningRequest request)
-    {
-        if (TryBuildOfflineUserStateReply(request.UserInput, request.UserState, out var contextualReply))
-        {
-            return contextualReply;
-        }
-
-        return BuildOfflineSimpleReply(request.UserInput);
-    }
-
-    private static bool TryBuildOfflineUserStateReply(string input, UserStateSnapshot snapshot, out string reply)
-    {
-        if (LooksLikeUserStatePlanningQuestion(input))
-        {
-            reply = BuildOfflineUserStatePlanningReply(input, snapshot);
-            return true;
-        }
-
-        if (LooksLikeEmailContextQuestion(input))
-        {
-            reply = BuildOfflineEmailReply(snapshot);
-            return true;
-        }
-
-        if (LooksLikeTaskContextQuestion(input))
-        {
-            reply = BuildOfflineTaskReply(snapshot);
-            return true;
-        }
-
-        reply = string.Empty;
-        return false;
-    }
-
-    private static string BuildOfflineEmailReply(UserStateSnapshot snapshot)
-    {
-        if (snapshot.EmailItems.Length == 0)
-        {
-            return "No email context is available in the local user-state snapshot.";
-        }
-
-        var emailAttention = BuildAttentionItems(snapshot)
-            .Where(item => string.Equals(item.Kind, "email", StringComparison.OrdinalIgnoreCase))
-            .Take(3)
-            .ToArray();
-        var unreadCount = snapshot.EmailItems.Count(item => item.IsUnread);
-        var items = emailAttention.Length > 0
-            ? emailAttention
-            : snapshot.EmailItems
-                .Take(3)
-                .Select(item => new UserStateAttentionItem(
-                    "email",
-                    item.Title,
-                    item.Detail,
-                    item.IsUnread ? 45 : 20,
-                    item.IsUnread ? "unread" : "email item",
-                    Unread: item.IsUnread))
-                .ToArray();
-
-        var lines = items.Select(item =>
-            $"- {item.Title}: {item.Detail}{(item.Unread ? " | unread" : string.Empty)} | {item.Reason}");
-
-        return string.Join(
-            Environment.NewLine,
-            unreadCount > 0
-                ? $"Email snapshot: {unreadCount} unread item(s) out of {snapshot.EmailItems.Length} total."
-                : $"Email snapshot: {snapshot.EmailItems.Length} item(s) are available.",
-            string.Join(Environment.NewLine, lines));
-    }
-
-    private static string BuildOfflineTaskReply(UserStateSnapshot snapshot)
-    {
-        if (snapshot.TaskItems.Length == 0)
-        {
-            return "No task context is available in the local user-state snapshot.";
-        }
-
-        var items = BuildAttentionItems(snapshot)
-            .Where(item => string.Equals(item.Kind, "task", StringComparison.OrdinalIgnoreCase))
-            .Take(4)
-            .ToArray();
-        var lines = items.Select(item =>
-            $"- {item.Title}: {item.Detail}{(string.IsNullOrWhiteSpace(item.DueAt) ? string.Empty : $" | due {item.DueAt}")} | {item.Reason}");
-
-        return string.Join(
-            Environment.NewLine,
-            $"Task snapshot: {snapshot.TaskItems.Length} task item(s) are available.",
-            string.Join(Environment.NewLine, lines));
-    }
-
-    private static string BuildOfflineUserStatePlanningReply(string input, UserStateSnapshot snapshot)
-    {
-        var attentionItems = BuildAttentionItems(snapshot)
-            .Where(item => ShouldIncludeAttentionItemForQuestion(item, input))
-            .Take(4)
-            .ToArray();
-
-        if (attentionItems.Length == 0)
-        {
-            return snapshot.EmailItems.Length == 0 && snapshot.TaskItems.Length == 0
-                ? "No email or task context is available in the local user-state snapshot."
-                : "The local user-state snapshot does not contain enough urgent email or task detail to prioritize confidently.";
-        }
-
-        var lines = attentionItems.Select(item =>
-            $"- [{item.Kind}] {item.Title}: {item.Detail}{(string.IsNullOrWhiteSpace(item.DueAt) ? string.Empty : $" | due {item.DueAt}")} | {item.Reason}");
-        var recommended = attentionItems[0];
-
-        return string.Join(
-            Environment.NewLine,
-            $"Attention snapshot: {snapshot.TaskItems.Length} task item(s), {snapshot.EmailItems.Length} email item(s).",
-            $"Suggested next focus: {BuildAttentionRecommendation(recommended)}",
-            "Top attention items:",
-            string.Join(Environment.NewLine, lines));
-    }
-
-    private static string BuildUserStateDecisionSupportBlock(UserStateSnapshot snapshot)
-    {
-        if (snapshot.EmailItems.Length == 0 && snapshot.TaskItems.Length == 0)
-        {
-            return "No email or task state is available.";
-        }
-
-        var attentionItems = BuildAttentionItems(snapshot).Take(5).ToArray();
-        var lines = new List<string>
-        {
-            $"Counts: {snapshot.TaskItems.Length} task item(s), {snapshot.EmailItems.Length} email item(s)."
-        };
-
-        if (attentionItems.Length == 0)
-        {
-            lines.Add("No urgent attention items were derived from the current snapshot.");
-            return string.Join(Environment.NewLine, lines);
-        }
-
-        lines.Add("Derived attention priorities:");
-        lines.AddRange(attentionItems.Select(item =>
-            $"- [{item.Kind}] {item.Title} | priority={item.Priority} | {item.Reason}{(string.IsNullOrWhiteSpace(item.DueAt) ? string.Empty : $" | due {item.DueAt}")}"));
-        lines.Add($"Suggested next focus: {BuildAttentionRecommendation(attentionItems[0])}");
-        return string.Join(Environment.NewLine, lines);
-    }
-
-    private static UserStateAttentionItem[] BuildAttentionItems(UserStateSnapshot snapshot)
-    {
-        var items = new List<UserStateAttentionItem>();
-        items.AddRange(snapshot.TaskItems.Select(BuildTaskAttentionItem));
-        items.AddRange(snapshot.EmailItems.Select(BuildEmailAttentionItem));
-
-        return items
-            .OrderByDescending(item => item.Priority)
-            .ThenBy(item => item.Kind, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(item => item.Title, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static UserStateAttentionItem BuildTaskAttentionItem(UserStateItem item)
-    {
-        var priority = 48;
-        var reasons = new List<string>();
-
-        if (TryParseDueAt(item.DueAt, out var dueAt))
-        {
-            var delta = dueAt - DateTimeOffset.Now;
-
-            if (delta < TimeSpan.Zero)
-            {
-                priority += 55;
-                reasons.Add("overdue");
-            }
-            else if (delta <= TimeSpan.FromHours(24))
-            {
-                priority += 42;
-                reasons.Add("due within 24 hours");
-            }
-            else if (delta <= TimeSpan.FromDays(3))
-            {
-                priority += 24;
-                reasons.Add("due within 3 days");
-            }
-            else
-            {
-                priority += 8;
-                reasons.Add("has a due date");
-            }
-        }
-
-        if (ContainsUrgencySignal(item.Title, item.Detail, item.Category))
-        {
-            priority += 20;
-            reasons.Add("urgent wording");
-        }
-
-        if (ContainsActionSignal(item.Title, item.Detail, item.Category))
-        {
-            priority += 10;
-            reasons.Add("action-oriented");
-        }
-
-        return new UserStateAttentionItem(
-            "task",
-            item.Title,
-            item.Detail,
-            priority,
-            FirstNonEmpty(string.Join(", ", reasons), "active task"),
-            item.DueAt);
-    }
-
-    private static UserStateAttentionItem BuildEmailAttentionItem(UserStateItem item)
-    {
-        var priority = item.IsUnread ? 42 : 18;
-        var reasons = new List<string>();
-
-        if (item.IsUnread)
-        {
-            reasons.Add("unread");
-        }
-
-        if (ContainsUrgencySignal(item.Title, item.Detail, item.Category))
-        {
-            priority += 24;
-            reasons.Add("urgent wording");
-        }
-
-        if (ContainsActionSignal(item.Title, item.Detail, item.Category))
-        {
-            priority += 18;
-            reasons.Add("may need a reply or action");
-        }
-
-        return new UserStateAttentionItem(
-            "email",
-            item.Title,
-            item.Detail,
-            priority,
-            FirstNonEmpty(string.Join(", ", reasons), item.IsUnread ? "unread email" : "email item"),
-            Unread: item.IsUnread);
-    }
-
-    private static bool ShouldIncludeAttentionItemForQuestion(UserStateAttentionItem item, string input)
-    {
-        var value = input.Trim().ToLowerInvariant();
-        var mentionsEmail = value.Contains("email", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("emails", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("inbox", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("mail", StringComparison.OrdinalIgnoreCase);
-        var mentionsTask = value.Contains("task", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("tasks", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("todo", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("to-do", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("to do", StringComparison.OrdinalIgnoreCase);
-
-        if (mentionsEmail && !mentionsTask)
-        {
-            return string.Equals(item.Kind, "email", StringComparison.OrdinalIgnoreCase);
-        }
-
-        if (mentionsTask && !mentionsEmail)
-        {
-            return string.Equals(item.Kind, "task", StringComparison.OrdinalIgnoreCase);
-        }
-
-        return true;
-    }
-
-    private static string BuildAttentionRecommendation(UserStateAttentionItem item)
-    {
-        return item.Kind switch
-        {
-            "task" => $"Start with task \"{item.Title}\" because it is {item.Reason}.",
-            "email" => $"Check email \"{item.Title}\" first because it is {item.Reason}.",
-            _ => item.Title
-        };
-    }
-
-    private static bool LooksLikeUserStatePlanningQuestion(string input)
-    {
-        var value = input.Trim().ToLowerInvariant();
-
-        if (value.StartsWith("send ", StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith("reply ", StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith("compose ", StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith("draft ", StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith("add task", StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith("create task", StringComparison.OrdinalIgnoreCase)
-            || value.StartsWith("set task", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var mentionsUserStateSurface = value.Contains("email", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("emails", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("inbox", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("mail", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("task", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("tasks", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("todo", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("to-do", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("to do", StringComparison.OrdinalIgnoreCase);
-        var planningSignals = value.Contains("priority", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("prioritize", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("triage", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("urgent", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("attention", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("what should i work on", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("what should i do first", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("what should i tackle", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("what needs", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("what do i need", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("what's next", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("whats next", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("next up", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("focus on", StringComparison.OrdinalIgnoreCase);
-
-        return planningSignals && (mentionsUserStateSurface
-            || value.Contains("work on", StringComparison.OrdinalIgnoreCase)
-            || value.Contains("do first", StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool ContainsUrgencySignal(params string[] values)
-    {
-        var signals = new[]
-        {
-            "urgent",
-            "asap",
-            "today",
-            "tonight",
-            "immediately",
-            "deadline",
-            "critical",
-            "high priority"
-        };
-
-        return values.Any(value => signals.Any(signal => value.Contains(signal, StringComparison.OrdinalIgnoreCase)));
-    }
-
-    private static bool ContainsActionSignal(params string[] values)
-    {
-        var signals = new[]
-        {
-            "reply",
-            "respond",
-            "action required",
-            "follow up",
-            "follow-up",
-            "review",
-            "approve",
-            "send",
-            "finish",
-            "complete"
-        };
-
-        return values.Any(value => signals.Any(signal => value.Contains(signal, StringComparison.OrdinalIgnoreCase)));
-    }
-
-    private static bool TryParseDueAt(string dueAt, out DateTimeOffset value)
-    {
-        if (DateTimeOffset.TryParse(dueAt, CultureInfo.CurrentCulture, DateTimeStyles.AssumeLocal, out value))
-        {
-            return true;
-        }
-
-        return DateTimeOffset.TryParse(dueAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out value);
-    }
-
+    // Status of a tool result: the recorded one, or "failed"/"observed" as a default.
     private static string ResolveVerificationStatus(PlannerToolResult result)
     {
         if (!string.IsNullOrWhiteSpace(result.VerificationStatus))
@@ -1204,28 +672,7 @@ internal sealed partial class StructuredAssistantPlanner
         return result.IsError ? "failed" : "observed";
     }
 
-    private static string FirstNonEmpty(params string[] values)
-    {
-        foreach (var value in values)
-        {
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                return value.Trim();
-            }
-        }
-
-        return string.Empty;
-    }
-
-    private sealed record UserStateAttentionItem(
-        string Kind,
-        string Title,
-        string Detail,
-        int Priority,
-        string Reason,
-        string DueAt = "",
-        bool Unread = false);
-
+    // Adds the assistant's name and persona text in front of a task-specific instruction.
     private string BuildPersonaScopedSystemPrompt(string taskInstruction)
     {
         return string.Join(
@@ -1238,6 +685,7 @@ internal sealed partial class StructuredAssistantPlanner
             taskInstruction);
     }
 
+    // Lower-cases and replaces underscores/hyphens with spaces so "direct_tool" and "Direct Tool" compare equal.
     private static string NormalizeClassifierLabel(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -1255,6 +703,7 @@ internal sealed partial class StructuredAssistantPlanner
             .ToLowerInvariant();
     }
 
+    // Maps a route back to the label the classifier prompt uses (Background is shown to the model as "planner").
     private static string MapIntentToClassifierValue(AgentIntentKind intent) =>
         intent switch
         {
@@ -1268,6 +717,7 @@ internal sealed partial class StructuredAssistantPlanner
             _ => "simple_reply"
         };
 
+    // Maps the label returned by the model to a route; false for anything unrecognised.
     private static bool TryMapClassifierIntent(string? value, out AgentIntentKind intent)
     {
         switch (NormalizeClassifierLabel(value))
@@ -1296,6 +746,7 @@ internal sealed partial class StructuredAssistantPlanner
         }
     }
 
+    // Matches the model's tool name against the real tool list (by API name or command name); unknown names give an empty string.
     private static string NormalizeClassifierToolHint(string? toolHint, IReadOnlyList<PlannerToolDefinition> tools)
     {
         var normalized = NormalizeClassifierLabel(toolHint);
@@ -1317,9 +768,9 @@ internal sealed partial class StructuredAssistantPlanner
         return string.Empty;
     }
 
+    // Tools that look at the screen or a file rather than act on the computer.
     private static bool IsVisualTool(string toolHint) =>
         string.Equals(toolHint, "screen", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(toolHint, "ambient", StringComparison.OrdinalIgnoreCase)
         || string.Equals(toolHint, "analyze image", StringComparison.OrdinalIgnoreCase)
         || string.Equals(toolHint, "analyze document", StringComparison.OrdinalIgnoreCase);
 }

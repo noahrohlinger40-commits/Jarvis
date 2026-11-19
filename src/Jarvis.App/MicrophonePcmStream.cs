@@ -1,3 +1,6 @@
+// MicrophonePcmStream.cs: a "microphone as a Stream" adapter used by the Windows System.Speech fallback
+// (SpeechRecognitionVoiceRuntime in VoiceRuntime.cs) and by LectureRecorder. NAudio records a chosen microphone and queues
+// the chunks; Stream.Read blocks until audio arrives. Also boosts quiet microphones (automatic gain) and reports a level for the meter.
 using System.Collections.Concurrent;
 using NAudio.Wave;
 
@@ -10,24 +13,32 @@ namespace Jarvis.App;
 /// </summary>
 internal sealed class MicrophonePcmStream : Stream
 {
+    // 16 kHz, the standard sample rate for speech recognition.
     public const int SampleRateHz = 16_000;
 
+    // Cap on queued chunks (about 256 x buffer length of audio); beyond this new audio is dropped rather than blocking.
     private const int MaxQueuedChunks = 256;
 
     // Conversational speech sits around 0.05-0.10 RMS; this maps it to roughly 0.25-0.5 for the meter.
     private const double LevelDisplayScale = 5.0;
 
+    // Thread-safe queue between the recording thread (producer) and the recognizer's Read call (consumer).
     private readonly BlockingCollection<byte[]> _chunks = new(MaxQueuedChunks);
     private readonly WaveInEvent _waveIn;
+    // Most the automatic gain may multiply the volume by, and the peak level (0..1) it aims for.
     private readonly double _inputGainCap;
     private readonly double _targetPeakLevel;
+    // Current gain, smoothed so volume does not jump between chunks.
     private double _smoothedGain = 1.0;
+    // The chunk currently being handed out to Read, and how far into it we are.
     private byte[] _current = [];
     private int _currentOffset;
+    // Bytes returned to the reader so far; reported as the stream Position.
     private long _totalBytesRead;
     private bool _captureStopped;
     private bool _disposed;
 
+    // Opens the given input device. Buffer length is limited to 20-200 ms.
     public MicrophonePcmStream(int deviceNumber, int bufferMilliseconds, double inputGainCap, double targetPeakLevel)
     {
         _inputGainCap = Math.Max(1.0, inputGainCap);
@@ -51,6 +62,7 @@ internal sealed class MicrophonePcmStream : Stream
     /// </summary>
     public event Action<double>? LevelMeasured;
 
+    // Starts recording from the microphone.
     public void StartCapture()
     {
         _waveIn.StartRecording();
@@ -86,6 +98,7 @@ internal sealed class MicrophonePcmStream : Stream
         }
     }
 
+    // Called by NAudio per chunk: copies it (NAudio reuses its buffer), boosts it and queues it.
     private void OnDataAvailable(object? sender, WaveInEventArgs eventArgs)
     {
         if (eventArgs.BytesRecorded < 2)
@@ -95,6 +108,7 @@ internal sealed class MicrophonePcmStream : Stream
 
         var chunk = new byte[eventArgs.BytesRecorded - (eventArgs.BytesRecorded % 2)];
         Buffer.BlockCopy(eventArgs.Buffer, 0, chunk, 0, chunk.Length);
+        // The chunk length is rounded down to a whole number of 2-byte samples so none is split.
         ApplyAutomaticGain(chunk);
 
         try
@@ -108,6 +122,7 @@ internal sealed class MicrophonePcmStream : Stream
         }
     }
 
+    // Measures peak and RMS (average loudness), then scales the samples so the loudest reaches the target peak, within limits.
     private void ApplyAutomaticGain(byte[] pcm16Mono)
     {
         var peak = 0.0;
@@ -122,6 +137,7 @@ internal sealed class MicrophonePcmStream : Stream
             sumSquares += sample * sample;
         }
 
+        // RMS: square each sample, average, square root. 0 is silence and 1 is full scale.
         var rms = Math.Sqrt(sumSquares / Math.Max(1, sampleCount));
         double targetGain;
 
@@ -132,11 +148,15 @@ internal sealed class MicrophonePcmStream : Stream
         }
         else
         {
+            // Gain = target peak / actual peak, at least 1 (never turn quiet audio down) and at most the cap. The peak is floored at 0.025
+            // so near-silence is not multiplied by a huge number.
             targetGain = Math.Clamp(_targetPeakLevel / Math.Max(peak, 0.025), 1.0, _inputGainCap);
         }
 
+        // Smoothing: 76% previous gain, 24% new, so the volume changes gradually.
         _smoothedGain = (_smoothedGain * 0.76) + (targetGain * 0.24);
 
+        // Gains up to 1.02 count as 1 (no change, saves work).
         var appliedGain = _smoothedGain <= 1.02 ? 1.0 : _smoothedGain;
         LevelMeasured?.Invoke(Math.Clamp(rms * appliedGain * LevelDisplayScale, 0, 1));
 
@@ -145,6 +165,7 @@ internal sealed class MicrophonePcmStream : Stream
             return;
         }
 
+        // Multiply each sample, clamp to the 16-bit range, and write the two bytes back (little-endian).
         for (var index = 0; index < pcm16Mono.Length; index += 2)
         {
             var amplified = (int)Math.Round(BitConverter.ToInt16(pcm16Mono, index) * _smoothedGain);
@@ -154,6 +175,7 @@ internal sealed class MicrophonePcmStream : Stream
         }
     }
 
+    // Called by System.Speech. Fills the whole requested buffer, waiting for more microphone audio if needed.
     public override int Read(byte[] buffer, int offset, int count)
     {
         if (count <= 0)
@@ -197,6 +219,7 @@ internal sealed class MicrophonePcmStream : Stream
         return totalCopied;
     }
 
+    // Stops the microphone and frees the queue.
     protected override void Dispose(bool disposing)
     {
         if (disposing && !_disposed)

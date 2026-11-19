@@ -1,7 +1,12 @@
+// OperationsHudControls.cs: small custom WinForms controls used to draw the main window's "heads-up display":
+// GlassPanel (rounded gradient card), several transparent container panels, SignalWaveformControl (live
+// microphone waveform and level meter) and ActionCueOverlayForm (a brief banner shown at the top of the screen
+// when Jarvis performs an action). All drawing is done by hand with GDI+.
 using System.Drawing.Drawing2D;
 
 namespace Jarvis.App;
 
+// A card-like panel with rounded corners, a diagonal two-colour gradient, a thin accent line along the top and a border.
 internal sealed class GlassPanel : Panel
 {
     private int _cornerRadius = 22;
@@ -15,14 +20,17 @@ internal sealed class GlassPanel : Panel
         Padding = new Padding(18);
     }
 
+    // Gradient start colour (top-left).
     public Color SurfaceColor { get; set; } = Color.FromArgb(16, 26, 42);
 
+    // Gradient end colour (bottom-right).
     public Color SurfaceColor2 { get; set; } = Color.FromArgb(12, 20, 34);
 
     public Color BorderColor { get; set; } = Color.FromArgb(56, 86, 118);
 
     public Color AccentColor { get; set; } = Color.FromArgb(106, 220, 197);
 
+    // Corner roundness in pixels (never below 8). Changing it reshapes the panel.
     public int CornerRadius
     {
         get => _cornerRadius;
@@ -34,6 +42,7 @@ internal sealed class GlassPanel : Panel
         }
     }
 
+    // Re-cut the panel's rounded shape once it exists and whenever it is resized.
     protected override void OnCreateControl()
     {
         base.OnCreateControl();
@@ -46,20 +55,23 @@ internal sealed class GlassPanel : Panel
         UpdateRegion();
     }
 
+    // Paint the background ourselves instead of using the standard one. The area is shrunk by 1 pixel so the border is not clipped at the edge.
     protected override void OnPaintBackground(PaintEventArgs e)
     {
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var rectangle = ClientRectangle;
 
+        rectangle.Width -= 1;
+        rectangle.Height -= 1;
+
+        // GDI+ throws "Out of memory" for a gradient over a zero-size rectangle, so guard after the trim.
         if (rectangle.Width <= 0 || rectangle.Height <= 0)
         {
             return;
         }
 
-        rectangle.Width -= 1;
-        rectangle.Height -= 1;
-
         using var path = CreateRoundedRectangle(rectangle, CornerRadius);
+        // 115 degrees: the gradient runs diagonally.
         using var brush = new LinearGradientBrush(rectangle, SurfaceColor, SurfaceColor2, 115f);
         e.Graphics.FillPath(brush, path);
 
@@ -70,6 +82,7 @@ internal sealed class GlassPanel : Panel
         e.Graphics.DrawPath(borderPen, path);
     }
 
+    // Set the control's Region (its visible outline) to the rounded rectangle, so the corners are truly transparent and clicks outside them pass through.
     private void UpdateRegion()
     {
         if (!IsHandleCreated || Width <= 0 || Height <= 0)
@@ -81,6 +94,7 @@ internal sealed class GlassPanel : Panel
         Region = new Region(path);
     }
 
+    // Build a rounded-rectangle outline from four quarter-circle arcs (top-left, top-right, bottom-right, bottom-left). If the radius is too small, a plain rectangle is returned.
     internal static GraphicsPath CreateRoundedRectangle(Rectangle rectangle, int radius)
     {
         var diameter = Math.Min(radius * 2, Math.Min(rectangle.Width, rectangle.Height));
@@ -106,6 +120,7 @@ internal sealed class GlassPanel : Panel
     }
 }
 
+// A scrolling vertical flow panel with double buffering (reduces flicker) and a transparent background.
 internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
 {
     public BufferedFlowLayoutPanel()
@@ -120,6 +135,7 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
     }
 }
 
+// A plain panel that supports a transparent background and double buffering.
 internal sealed class TransparentPanel : Panel
 {
     public TransparentPanel()
@@ -131,6 +147,7 @@ internal sealed class TransparentPanel : Panel
     }
 }
 
+// A flow-layout panel that supports a transparent background and double buffering.
 internal sealed class TransparentFlowLayoutPanel : FlowLayoutPanel
 {
     public TransparentFlowLayoutPanel()
@@ -142,6 +159,7 @@ internal sealed class TransparentFlowLayoutPanel : FlowLayoutPanel
     }
 }
 
+// A table-layout panel that supports a transparent background.
 internal sealed class TransparentTableLayoutPanel : TableLayoutPanel
 {
     public TransparentTableLayoutPanel()
@@ -151,11 +169,16 @@ internal sealed class TransparentTableLayoutPanel : TableLayoutPanel
     }
 }
 
+// Draws the recent microphone loudness as a row of vertical bars that fade in towards the newest, a moving sweep highlight, and a level meter on the right. Fed by PushSignal; animated by AdvanceAnimation.
 internal sealed class SignalWaveformControl : Control
 {
+    // Recent loudness values (0 to 1), oldest first, capped at 84.
     private readonly Queue<float> _samples = new();
+    // Protects the sample queue and levels, because signals arrive from audio threads while painting happens on the UI thread.
     private readonly object _sync = new();
+    // When the last real signal arrived; used to decay the display when audio stops.
     private DateTimeOffset _lastSignalUtc = DateTimeOffset.UtcNow;
+    // Position of the moving sweep highlight, 0 to 1 across the waveform.
     private float _sweepPosition;
 
     public SignalWaveformControl()
@@ -169,6 +192,7 @@ internal sealed class SignalWaveformControl : Control
 
     public Color AccentColor { get; set; } = Color.FromArgb(106, 220, 197);
 
+    // Average loudness (RMS) and loudest instant (peak) of the latest audio, from 0 to 1.
     public double RmsLevel { get; private set; }
 
     public double PeakLevel { get; private set; }
@@ -179,6 +203,7 @@ internal sealed class SignalWaveformControl : Control
 
     public bool IsSpeaking { get; private set; }
 
+    // Accept one audio reading: update the levels and add a sample. Peak is scaled down (x 0.68) so spikes do not dominate the bars.
     public void PushSignal(VoiceSignalSnapshot signal)
     {
         lock (_sync)
@@ -194,12 +219,14 @@ internal sealed class SignalWaveformControl : Control
         Invalidate();
     }
 
+    // When Jarvis is speaking, the meter and sweep use a different colour.
     public void SetSpeaking(bool isSpeaking)
     {
         IsSpeaking = isSpeaking;
         Invalidate();
     }
 
+    // Called on a timer: move the sweep, and if no signal has arrived for 100 ms let the levels fade out (about 14% / 18% per call) so the bars settle to zero instead of freezing.
     public void AdvanceAnimation()
     {
         lock (_sync)
@@ -217,6 +244,7 @@ internal sealed class SignalWaveformControl : Control
                 PeakLevel *= 0.82;
                 EnqueueSample((float)Math.Max(RmsLevel, PeakLevel * 0.68));
 
+                // Snap tiny values to zero to stop the fade at some point.
                 if (RmsLevel < 0.003)
                 {
                     RmsLevel = 0;
@@ -237,6 +265,7 @@ internal sealed class SignalWaveformControl : Control
         Invalidate();
     }
 
+    // Layout: waveform on the left, a 28-pixel-wide meter on the right.
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
@@ -256,6 +285,7 @@ internal sealed class SignalWaveformControl : Control
         using var baselinePen = new Pen(Color.FromArgb(42, 88, 118), 1f);
         e.Graphics.DrawLine(baselinePen, waveformArea.Left, (int)baselineY, waveformArea.Right, (int)baselineY);
 
+        // Copy the samples under the lock so painting does not race with PushSignal.
         float[] samples;
 
         lock (_sync)
@@ -265,6 +295,7 @@ internal sealed class SignalWaveformControl : Control
 
         if (samples.Length == 0)
         {
+            // No data yet: draw a faint flat line.
             samples = Enumerable.Repeat(0.02f, 32).ToArray();
         }
 
@@ -278,6 +309,7 @@ internal sealed class SignalWaveformControl : Control
             var height = Math.Max(4f, sample * waveformArea.Height * (IsSpeechDetected ? 0.96f : 0.78f));
             var x = waveformArea.Left + (index * barWidth);
             var y = baselineY - (height / 2f);
+            // Older bars are more transparent (alpha 28 to 233).
             var alpha = 28 + (int)(205 * ((index + 1f) / samples.Length));
             var color = Color.FromArgb(alpha, AccentColor);
 
@@ -288,7 +320,14 @@ internal sealed class SignalWaveformControl : Control
             e.Graphics.FillPath(brush, barPath);
         }
 
+        // The sweep highlight: a soft gradient band 52 pixels wide that travels across the waveform.
         var sweepX = waveformArea.Left + (waveformArea.Width * _sweepPosition);
+        if (waveformArea.Height <= 0)
+        {
+            DrawMeter(e.Graphics, meterArea);
+            return;
+        }
+
         using var sweepBrush = new LinearGradientBrush(
             new Rectangle((int)sweepX - 26, waveformArea.Top, 52, waveformArea.Height),
             Color.FromArgb(0, AccentColor),
@@ -299,6 +338,7 @@ internal sealed class SignalWaveformControl : Control
         DrawMeter(e.Graphics, meterArea);
     }
 
+    // Draw the vertical level meter showing the peak: orange while speaking, a warmer colour while the wake window is open, otherwise the accent colour.
     private void DrawMeter(Graphics graphics, Rectangle meterArea)
     {
         using var trackBrush = new SolidBrush(Color.FromArgb(18, 40, 58));
@@ -313,6 +353,11 @@ internal sealed class SignalWaveformControl : Control
                 ? Color.FromArgb(255, 138, 101)
                 : AccentColor;
 
+        if (fillArea.Width <= 0 || fillArea.Height <= 0)
+        {
+            return;
+        }
+
         using var fillBrush = new LinearGradientBrush(fillArea, Color.FromArgb(120, meterColor), meterColor, 90f);
         using var fillPath = GlassPanel.CreateRoundedRectangle(fillArea, 10);
         graphics.FillPath(fillBrush, fillPath);
@@ -321,6 +366,7 @@ internal sealed class SignalWaveformControl : Control
         graphics.DrawPath(borderPen, trackPath);
     }
 
+    // Add a sample and drop the oldest ones beyond 84.
     private void EnqueueSample(float sample)
     {
         const int maxSamples = 84;
@@ -333,6 +379,7 @@ internal sealed class SignalWaveformControl : Control
     }
 }
 
+// A banner that fades in and out at the top-centre of a screen to show what Jarvis is doing (headline plus detail line). It does not take focus. Shown by ShowCue.
 internal sealed class ActionCueOverlayForm : Form
 {
     private readonly System.Windows.Forms.Timer _timer;
@@ -342,6 +389,7 @@ internal sealed class ActionCueOverlayForm : Form
     private string _detail = string.Empty;
     private Color _accent = Color.FromArgb(106, 220, 197);
     private DateTimeOffset _startedUtc;
+    // How long one banner stays up in total.
     private TimeSpan _duration = TimeSpan.FromMilliseconds(1500);
 
     public ActionCueOverlayForm()
@@ -350,11 +398,13 @@ internal sealed class ActionCueOverlayForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         TopMost = true;
+        // Starts invisible; OnTick animates Opacity.
         Opacity = 0;
         Width = 760;
         Height = 110;
         BackColor = Color.Black;
 
+        // A 16 ms timer (about 60 frames per second) drives the fade.
         _timer = new System.Windows.Forms.Timer
         {
             Interval = 16
@@ -362,8 +412,10 @@ internal sealed class ActionCueOverlayForm : Form
         _timer.Tick += OnTick;
     }
 
+    // Showing it must not steal focus from the user's current window.
     protected override bool ShowWithoutActivation => true;
 
+    // Show or restart the banner on the given monitor, centred near the top, at most 48 pixels narrower than the work area.
     public void ShowCue(Screen screen, string headline, string detail, Color accent)
     {
         _headline = headline.Trim();
@@ -397,6 +449,12 @@ internal sealed class ActionCueOverlayForm : Form
         rectangle.Width -= 1;
         rectangle.Height -= 1;
 
+        if (rectangle.Width <= 0 || rectangle.Height <= 0)
+        {
+            return;
+        }
+
+        // Rounded dark panel with an accent outline and a thick accent bar on the left, then the two lines of text.
         using var path = GlassPanel.CreateRoundedRectangle(rectangle, 28);
         using var brush = new LinearGradientBrush(rectangle, Color.FromArgb(32, 12, 24, 38), Color.FromArgb(28, 7, 14, 24), 90f);
         e.Graphics.FillPath(brush, path);
@@ -438,6 +496,7 @@ internal sealed class ActionCueOverlayForm : Form
         base.Dispose(disposing);
     }
 
+    // Each frame: fade in over the first 18% of the time, fade out over the last 25%, and hide when the time is up.
     private void OnTick(object? sender, EventArgs eventArgs)
     {
         var elapsed = DateTimeOffset.UtcNow - _startedUtc;

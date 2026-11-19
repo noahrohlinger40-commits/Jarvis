@@ -1,13 +1,18 @@
+// DesktopAutomationAdvancedTools.cs: the assistant tools for windows, media keys and the clipboard (windows, move/resize/snap window, media, clipboard).
+// Each tool recognises typed commands (CanHandle), parses them with UiCommandParsing (bottom of this file) and calls IDesktopAutomationService.
+// The tool classes follow the IAssistantTool pattern: Name, Description (shown to the model), CanHandle (is this input mine?), ExecuteAsync (do it).
 using System.Globalization;
 
 namespace Jarvis.Core;
 
+// Tool that lists open desktop windows, optionally filtered by a word ("windows code").
 public sealed class WindowsTool : IAssistantTool
 {
     public string Name => "windows";
 
     public string Description => "List visible desktop windows. `windows` or `windows code`.";
 
+    // Matches "windows", "list windows", "show windows" or "visible windows" at the start of the input.
     public bool CanHandle(string input) => UiCommandParsing.TryParseWindowsQuery(input, out _);
 
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
@@ -23,12 +28,14 @@ public sealed class WindowsTool : IAssistantTool
     }
 }
 
+// Tool that moves a window so its top-left corner is at the given screen coordinates.
 public sealed class MoveWindowTool : IAssistantTool
 {
     public string Name => "move window";
 
     public string Description => "Move a window to screen coordinates. `move window notepad 120 80`.";
 
+    // Matches move window / move app / position window, but not when the target is a vague reference such as "it" or "this" (this tool cannot know which window they mean).
     public bool CanHandle(string input)
     {
         var matches = ToolInputHelper.StartsWithCommand(input, Name)
@@ -53,6 +60,7 @@ public sealed class MoveWindowTool : IAssistantTool
     }
 }
 
+// Tool that resizes a window to a width and height in pixels.
 public sealed class ResizeWindowTool : IAssistantTool
 {
     public string Name => "resize window";
@@ -82,6 +90,7 @@ public sealed class ResizeWindowTool : IAssistantTool
     }
 }
 
+// Tool that snaps a window to part of the screen (left half, a corner, centre and so on).
 public sealed class SnapWindowTool : IAssistantTool
 {
     public string Name => "snap window";
@@ -112,6 +121,7 @@ public sealed class SnapWindowTool : IAssistantTool
     }
 }
 
+// Tool that sends the keyboard media keys (play, pause, next, previous, volume, mute) to Windows.
 public sealed class MediaTool : IAssistantTool
 {
     public string Name => "media";
@@ -133,6 +143,7 @@ public sealed class MediaTool : IAssistantTool
     }
 }
 
+// Tool that reads or changes the clipboard: show, history, restore an older entry, set text, clear, or paste into a window.
 public sealed class ClipboardTool : IAssistantTool
 {
     public string Name => "clipboard";
@@ -148,6 +159,7 @@ public sealed class ClipboardTool : IAssistantTool
             return new ToolResult("Usage: clipboard | set clipboard <text> | clear clipboard | paste clipboard into <window>");
         }
 
+        // The first word chosen by TryParseClipboardCommand decides which service call runs. "restore" and "paste" fall through to a usage message if their argument is missing or not a number.
         var result = action switch
         {
             "show" => await context.DesktopAutomation.GetClipboardAsync(cancellationToken),
@@ -166,8 +178,10 @@ public sealed class ClipboardTool : IAssistantTool
     }
 }
 
+// Text parsing for the commands in this file. The class is split over several files; this part handles windows, media and clipboard commands.
 internal static partial class UiCommandParsing
 {
+    // "windows [filter]": whatever follows the command word becomes the filter.
     public static bool TryParseWindowsQuery(string input, out string target)
     {
         target = ToolInputHelper.GetCommandTail(input, "windows", "list windows", "show windows", "visible windows");
@@ -177,12 +191,14 @@ internal static partial class UiCommandParsing
             || ToolInputHelper.StartsWithCommand(input, "visible windows");
     }
 
+    // "move window <name> <x> <y>": the last two words must be numbers, everything before them is the window name.
     public static bool TryParseMoveWindow(string input, out string target, out int x, out int y)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "move window", "move app", "position window");
         return TryParseTargetAndTrailingIntegers(remainder, out target, out x, out y);
     }
 
+    // Same shape as move but both numbers must be above zero.
     public static bool TryParseResizeWindow(string input, out string target, out int width, out int height)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "resize window", "resize app");
@@ -191,6 +207,7 @@ internal static partial class UiCommandParsing
             && height > 0;
     }
 
+    // Snap command: accepts "name :: position" or "name position". For the plain form it tries a two-word position first (so "top right" is not read as "right") and then a one-word position.
     public static bool TryParseSnapWindow(string input, out string target, out string position)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "snap window", "snap app", "dock window");
@@ -213,6 +230,7 @@ internal static partial class UiCommandParsing
             return TryNormalizeSnapPosition(structuredParts[1], out position);
         }
 
+        // Try two-word positions before one-word positions so "code top right" gives target "code" and position "top right".
         foreach (var candidateLength in new[] { 2, 1 })
         {
             var parts = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -236,6 +254,7 @@ internal static partial class UiCommandParsing
         return false;
     }
 
+    // Turns spoken media phrases into short commands: "media next", "next track", "skip track", "volume up 3", "mute" and so on.
     public static bool TryParseMediaCommand(string input, out string command)
     {
         command = string.Empty;
@@ -290,6 +309,7 @@ internal static partial class UiCommandParsing
         return false;
     }
 
+    // Picks which clipboard action was asked for and extracts its text. More specific phrases (history, restore) are tested before the plain "clipboard" so they are not swallowed by it.
     public static bool TryParseClipboardCommand(string input, out string action, out string payload)
     {
         action = string.Empty;
@@ -349,6 +369,7 @@ internal static partial class UiCommandParsing
         return false;
     }
 
+    // Splits "<name words> <number> <number>": the last two words must parse as whole numbers (invariant culture, so no locale surprises), the rest is the name.
     private static bool TryParseTargetAndTrailingIntegers(string remainder, out string target, out int first, out int second)
     {
         target = string.Empty;
@@ -377,6 +398,7 @@ internal static partial class UiCommandParsing
         return !string.IsNullOrWhiteSpace(target);
     }
 
+    // Cleans up a snap position: lower-case, single spaces, and turns "top left" into "top-left" etc. Returns false for anything that is not one of the 9 known positions.
     private static bool TryNormalizeSnapPosition(string value, out string position)
     {
         position = string.Join(

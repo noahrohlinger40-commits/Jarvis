@@ -1,3 +1,6 @@
+// JarvisMainForm.Runtime.cs: everything that happens while the window runs: refresh and reminders, prompts, audio pickers,
+// saving settings, voice turns, approvals and status display. Sections are marked with "-----" lines. UI-thread rule:
+// background callbacks (voice, assistant, speaker, tutor) must BeginInvoke to touch controls; clicks and timer ticks can use them directly.
 using System.Drawing;
 using System.Media;
 using System.Text;
@@ -11,6 +14,10 @@ namespace Jarvis.App;
 
 internal sealed partial class JarvisMainForm
 {
+    // ----- Periodic refresh and reminders -----
+    // Fires every 1.4 s (refresh timer). Re-reads assistant state to update the screen, then announces due reminders.
+    // The _isRefreshingUiState flag stops a slow refresh from overlapping the next tick. async void is required for an event handler,
+    // so every exception is swallowed inside rather than crashing the app.
     private async void OnRefreshTimerTick(object? sender, EventArgs eventArgs)
     {
         if (_isRefreshingUiState || _cancellationTokenSource.IsCancellationRequested)
@@ -48,6 +55,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Speaks and shows any reminder whose time has arrived, then marks it completed.
     private async Task AnnounceDueRemindersAsync()
     {
         // Waits for a quiet moment so a reminder never talks over a reply.
@@ -85,6 +93,7 @@ internal sealed partial class JarvisMainForm
         _ = TrySpeakAsync(message, token);
     }
 
+    // Pulls fresh data from the assistant for each part of the screen.
     private async Task RefreshRuntimeStateAsync()
     {
         await RefreshPendingApprovalUiAsync();
@@ -94,12 +103,14 @@ internal sealed partial class JarvisMainForm
         await RefreshMissionBriefAsync();
     }
 
+    // Shows or hides the Approve/Deny card depending on whether an approval is pending.
     private async Task RefreshPendingApprovalUiAsync()
     {
         var pendingApproval = await _context.Assistant.GetPendingApprovalAsync(_cancellationTokenSource.Token);
         UpdateApprovalUi(pendingApproval);
     }
 
+    // If Jarvis asked a follow-up question, shows it in the response box and logs it once (the snapshot key avoids logging the same question on every tick).
     private async Task RefreshClarificationUiAsync()
     {
         var session = await _context.Assistant.GetPendingClarificationSessionAsync(_cancellationTokenSource.Token);
@@ -160,6 +171,7 @@ internal sealed partial class JarvisMainForm
             Color.FromArgb(255, 210, 132));
     }
 
+    // Updates the "Plan and result" box for the active session.
     private async Task RefreshSessionSnapshotAsync()
     {
         if (string.IsNullOrWhiteSpace(_activeSessionId))
@@ -180,6 +192,7 @@ internal sealed partial class JarvisMainForm
         _sessionBox.Text = BuildSessionSummary(session);
     }
 
+    // Shows up to three queued background sessions in the activity card.
     private async Task RefreshBackgroundSummaryAsync()
     {
         var backgroundSessions = await _context.Assistant.GetBackgroundSessionsAsync(_cancellationTokenSource.Token);
@@ -197,6 +210,7 @@ internal sealed partial class JarvisMainForm
                 .Select(session => $"{TrimForSingleLine(session.OriginalRequest, 34)} [{session.Status}]"));
     }
 
+    // Rebuilds the mission strip text from a snapshot of the desktop (active window, time). Falls back to a generic strip if that fails.
     private async Task RefreshMissionBriefAsync()
     {
         string nextText;
@@ -223,14 +237,19 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // ----- Prompt processing (typed or spoken text becomes an assistant turn) -----
+    // Called by the Send button and Enter key; empty promptOverride means "use the text box".
     private async Task SubmitPromptAsync(string? promptOverride = null)
     {
         var input = promptOverride ?? _inputBox.Text.Trim();
         await ProcessPromptAsync(input, "YOU", promptOverride is null);
     }
 
+    // The single path every request goes through (typed, quick buttons, voice, approvals).
+    // source labels who sent it (YOU, VOICE, SURFACE, APPROVAL...). clearInput empties the text box; displayedInput is what to show in chat if different from the real text.
     private async Task ProcessPromptAsync(string input, string source, bool clearInput, string? displayedInput = null)
     {
+        // Ignore new input while one is already being processed or the app is closing.
         if (_cancellationTokenSource.IsCancellationRequested || _isSubmitting)
         {
             return;
@@ -241,16 +260,19 @@ internal sealed partial class JarvisMainForm
             return;
         }
 
+        // A pending low-confidence voice command may consume this text as its confirmation.
         if (await TryResolvePendingVoiceClarificationAsync(input, source, clearInput))
         {
             return;
         }
 
+        // "No, I said..." style corrections to the previous voice command are handled first.
         if (await TryHandleVoiceCorrectionDirectiveAsync(input, source, clearInput))
         {
             return;
         }
 
+        // Mark busy and reset the follow-up state before the model call.
         _isSubmitting = true;
         _isAwaitingFollowUpInput = false;
         _awaitingFollowUpDetail = string.Empty;
@@ -263,6 +285,7 @@ internal sealed partial class JarvisMainForm
         SetBusyState(true);
         SetAssistantStateOverride(SurfaceState.Thinking, "Analyzing the directive and preparing the next response.");
 
+        // Show the request on screen, optionally say a short acknowledgement (voice only), then ask the assistant to handle it.
         try
         {
             if (clearInput)
@@ -283,12 +306,21 @@ internal sealed partial class JarvisMainForm
                 await TrySpeakAsync(BuildVoiceAcknowledgement(input), _cancellationTokenSource.Token);
             }
 
+            // The assistant does the real work here: plans, calls tools, may pause for approval.
             var turn = await _context.Assistant.HandleAsync(input, _cancellationTokenSource.Token);
             _activeSessionId = turn.SessionId;
             _currentMissionObjective = BuildPostTurnObjective(turn, _pendingApproval);
             await RefreshRuntimeStateAsync();
 
+            // Show the answer: speech and the typed reveal run at the same time.
             var renderedResponse = BuildDisplayResponse(turn, _pendingApproval);
+            // The reply may need a spoken form different from the written one.
+            // Speech starts with the typed reveal, not after it: waiting added 0.25-1.7 s per turn.
+            var speechTask = _pendingApproval is not null
+                ? TrySpeakAsync("I need your approval before I continue. It's on screen.", _cancellationTokenSource.Token)
+                : SpokenReply.Build(renderedResponse, turn.SpeakInFull) is { Length: > 0 } spoken
+                    ? TrySpeakAsync(spoken, _cancellationTokenSource.Token)
+                    : Task.CompletedTask;
             await StreamLiveResponseAsync(renderedResponse, _cancellationTokenSource.Token);
             ApplyTurnSummary(turn, _pendingApproval, renderedResponse);
             _isAwaitingFollowUpInput = turn.IsFollowUpQuestion;
@@ -301,24 +333,20 @@ internal sealed partial class JarvisMainForm
                 await RefreshClarificationUiAsync();
             }
 
-            if (_pendingApproval is not null)
-            {
-                await TrySpeakAsync("I need your approval before I continue. It's on screen.", _cancellationTokenSource.Token);
-            }
-            else if (SpokenReply.Build(renderedResponse, turn.SpeakInFull) is { Length: > 0 } spoken)
-            {
-                await TrySpeakAsync(spoken, _cancellationTokenSource.Token);
-            }
+            // Wait for speech to finish before the turn counts as done.
+            await speechTask;
 
             if (turn.ShouldExit)
             {
                 ExitApplication();
             }
         }
+        // Cancelled (app closing or user stop): just close the stream cleanly.
         catch (OperationCanceledException)
         {
             CompleteAssistantMessageStream();
         }
+        // Any other failure is shown in the chat, timeline and status instead of crashing.
         catch (Exception exception)
         {
             CompleteAssistantMessageStream();
@@ -333,6 +361,7 @@ internal sealed partial class JarvisMainForm
             _currentMissionObjective = "Recovering from a runtime fault.";
             UpdateSurfaceState(SurfaceState.Error, TrimForSingleLine(exception.Message, 120));
         }
+        // Always runs: unlock the UI, restore idle text, and handle voice follow-ups and queued commands.
         finally
         {
             _isSubmitting = false;
@@ -359,6 +388,7 @@ internal sealed partial class JarvisMainForm
                 _followUpAnswerDeadlineUtc = DateTimeOffset.UtcNow.AddSeconds(30);
             }
 
+            // If the user spoke while this turn was running, run that queued command now. BeginInvoke lets this method finish first.
             var queuedVoiceDirective = _queuedVoiceDirective;
             _queuedVoiceDirective = null;
 
@@ -377,6 +407,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Approve/Deny buttons simply send the word "approve" or "deny" through the normal prompt path.
     private async Task HandleApprovalDecisionAsync(bool approved)
     {
         if (_pendingApproval is null || _isSubmitting)
@@ -393,6 +424,7 @@ internal sealed partial class JarvisMainForm
                 : "Denied the pending major action from the live control surface.");
     }
 
+    // Opens the memory editor dialog, then refreshes.
     private async Task OpenMemoryWorkbenchAsync()
     {
         using var form = new MemoryWorkbenchForm(_context.Assistant);
@@ -400,6 +432,7 @@ internal sealed partial class JarvisMainForm
         await RefreshRuntimeStateAsync();
     }
 
+    // Opens the presence settings dialog and applies the chosen options if the user pressed OK.
     private async Task OpenPresenceWorkbenchAsync()
     {
         using var form = new PresenceWorkbenchForm(_currentOptions);
@@ -412,6 +445,8 @@ internal sealed partial class JarvisMainForm
         await ApplyPresenceSettingsAsync(form.SelectedOptions);
     }
 
+    // Types the reply into the response box and chat history in small chunks so it looks like live typing.
+    // A new stream cancels the previous one first.
     private async Task StreamLiveResponseAsync(string message, CancellationToken cancellationToken)
     {
         _liveResponseCts?.Cancel();
@@ -429,8 +464,7 @@ internal sealed partial class JarvisMainForm
 
         try
         {
-            // Speech waits for this display to finish, and word-by-word animation of a whole article would
-            // take about a minute, so long replies appear at once.
+            // Word-by-word animation of a whole article would take about a minute, so long replies appear at once.
             var chunks = message.Length <= 600 ? EnumerateResponseChunks(message) : [message];
 
             foreach (var chunk in chunks)
@@ -461,6 +495,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // After a turn: updates the summary box, timeline (response, each tool result, citations) and activity cards.
     private void ApplyTurnSummary(AssistantTurn turn, PendingApprovalAction? pendingApproval, string renderedResponse)
     {
         _lastSessionSummary = BuildTurnSummary(turn, pendingApproval, renderedResponse);
@@ -495,6 +530,9 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // ----- Audio device, wake word and DSP pickers -----
+    // Fills the microphone drop-down from the Windows input devices and selects the preferred one.
+    // The handler is detached while filling so setting the selection does not trigger a settings save.
     private void RefreshAudioDevices()
     {
         _deviceComboBox.Items.Clear();
@@ -524,6 +562,7 @@ internal sealed partial class JarvisMainForm
         UpdateCalibrationUi();
     }
 
+    // Fills the beamforming (multi-microphone) profile picker; the same detach-then-reattach pattern avoids saving while filling.
     private void RefreshBeamformingProfiles()
     {
         _beamformingProfileComboBox.SelectedIndexChanged -= BeamformingProfileComboBoxOnSelectedIndexChanged;
@@ -547,6 +586,7 @@ internal sealed partial class JarvisMainForm
         UpdateCalibrationUi();
     }
 
+    // Fills the wake word model picker from files found on disk.
     private void RefreshWakeWordAssets()
     {
         _availableWakeWordAssets = WakeWordAssetCatalog.Discover(_context.WorkspaceRoot, _currentOptions);
@@ -572,6 +612,7 @@ internal sealed partial class JarvisMainForm
         UpdateCalibrationUi();
     }
 
+    // Fills the wake word engine picker.
     private void RefreshWakeEngines()
     {
         _availableWakeWordEngines = WakeWordEngineCatalog.Discover(_context.WorkspaceRoot, _currentOptions);
@@ -597,6 +638,7 @@ internal sealed partial class JarvisMainForm
         UpdateCalibrationUi();
     }
 
+    // Fills the hardware DSP (microphone processing) profile picker.
     private void RefreshHardwareDspProfiles()
     {
         _hardwareDspProfileComboBox.SelectedIndexChanged -= HardwareDspProfileComboBoxOnSelectedIndexChanged;
@@ -620,31 +662,7 @@ internal sealed partial class JarvisMainForm
         UpdateCalibrationUi();
     }
 
-    private void RefreshVendorDspProfiles()
-    {
-        _availableVendorDspProfiles = VendorDspProfileCatalog.Discover(_context.WorkspaceRoot, _currentOptions);
-        _vendorDspProfileComboBox.SelectedIndexChanged -= VendorDspProfileComboBoxOnSelectedIndexChanged;
-        _vendorDspProfileComboBox.Items.Clear();
-
-        foreach (var profile in _availableVendorDspProfiles)
-        {
-            _vendorDspProfileComboBox.Items.Add(profile.BuildShortLabel());
-        }
-
-        var configuredPath = VendorDspProfileCatalog.NormalizeStoredPath(_currentOptions.SpeechRecognitionVendorDspProfilePath);
-        var selectedIndex = _availableVendorDspProfiles
-            .Select((profile, index) => new { profile.Path, index })
-            .FirstOrDefault(item => string.Equals(
-                VendorDspProfileCatalog.NormalizeStoredPath(item.Path),
-                configuredPath,
-                StringComparison.OrdinalIgnoreCase))
-            ?.index ?? 0;
-
-        _vendorDspProfileComboBox.SelectedIndex = selectedIndex;
-        _vendorDspProfileComboBox.SelectedIndexChanged += VendorDspProfileComboBoxOnSelectedIndexChanged;
-        UpdateCalibrationUi();
-    }
-
+    // Updates the calibration and validation status text and enables the buttons only if a microphone exists.
     private void UpdateCalibrationUi()
     {
         var resolved = MicrophoneProcessingProfileResolver.Resolve(_currentOptions);
@@ -661,6 +679,8 @@ internal sealed partial class JarvisMainForm
         _validateMicButton.Enabled = hasAvailableDevice;
     }
 
+    // Handles a new microphone choice. JarvisOptions is an immutable record, so "with { ... }" below makes a changed copy
+    // that replaces _currentOptions; the change is then saved to jarvis.settings.json and the voice runtime is rebuilt to use it.
     private async Task OnDeviceSelectionChangedAsync()
     {
         var deviceName = ResolveSelectedInputDeviceName();
@@ -681,6 +701,8 @@ internal sealed partial class JarvisMainForm
         await ReloadVoiceRuntimeAsync(_currentOptions);
     }
 
+    // Event handler for the microphone drop-down. The same pattern repeats for the beam, wake word, wake engine and DSP pickers:
+    // a thin async void wrapper that catches errors and shows them in chat, around an async method that does the work.
     private async void DeviceComboBoxOnSelectedIndexChanged(object? sender, EventArgs e)
     {
         try
@@ -693,12 +715,14 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Name of the microphone chosen in the drop-down, or the saved one if nothing is selected.
     private string ResolveSelectedInputDeviceName()
     {
         return _deviceComboBox.SelectedItem as string
             ?? _currentOptions.SpeechRecognitionDeviceName;
     }
 
+    // Copies the drop-down choice into the current settings without saving (used right before calibration).
     private void SyncSelectedInputDeviceIntoCurrentOptions()
     {
         var deviceName = ResolveSelectedInputDeviceName();
@@ -715,6 +739,7 @@ internal sealed partial class JarvisMainForm
         };
     }
 
+    // The user picked a beamforming profile; "off" turns beamforming off entirely.
     private async Task OnBeamformingProfileSelectionChangedAsync()
     {
         if (_beamformingProfileComboBox.SelectedIndex < 0
@@ -753,6 +778,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // The user picked a different wake word model file.
     private async Task OnWakeWordAssetSelectionChangedAsync()
     {
         if (_wakeWordAssetComboBox.SelectedIndex < 0
@@ -792,6 +818,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // The user picked a different wake word engine.
     private async Task OnWakeEngineSelectionChangedAsync()
     {
         if (_wakeEngineComboBox.SelectedIndex < 0
@@ -831,6 +858,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // The user picked a different hardware DSP profile.
     private async Task OnHardwareDspProfileSelectionChangedAsync()
     {
         if (_hardwareDspProfileComboBox.SelectedIndex < 0
@@ -868,45 +896,8 @@ internal sealed partial class JarvisMainForm
         }
     }
 
-    private async Task OnVendorDspProfileSelectionChangedAsync()
-    {
-        if (_vendorDspProfileComboBox.SelectedIndex < 0
-            || _vendorDspProfileComboBox.SelectedIndex >= _availableVendorDspProfiles.Count)
-        {
-            return;
-        }
-
-        var selectedProfile = _availableVendorDspProfiles[_vendorDspProfileComboBox.SelectedIndex];
-        var selectedPath = VendorDspProfileCatalog.NormalizeStoredPath(selectedProfile.Path);
-        var currentPath = VendorDspProfileCatalog.NormalizeStoredPath(_currentOptions.SpeechRecognitionVendorDspProfilePath);
-
-        if (string.Equals(selectedPath, currentPath, StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        _currentOptions = _currentOptions with
-        {
-            SpeechRecognitionVendorDspProfilePath = selectedProfile.Path
-        };
-
-        UpdateCalibrationUi();
-        await PersistCurrentOptionsAsync();
-        await ReloadVoiceRuntimeAsync(_currentOptions);
-    }
-
-    private async void VendorDspProfileComboBoxOnSelectedIndexChanged(object? sender, EventArgs e)
-    {
-        try
-        {
-            await OnVendorDspProfileSelectionChangedAsync();
-        }
-        catch (Exception exception)
-        {
-            AppendSystemMessage($"Vendor DSP update failed: {exception.Message}");
-        }
-    }
-
+    // Guided microphone calibration (button click): stops listening, records room noise then a spoken sample,
+    // derives a noise gate and gain cap from them, saves the profile and restarts the voice runtime.
     private async Task CalibrateMicrophoneAsync()
     {
         if (_isSubmitting)
@@ -921,6 +912,7 @@ internal sealed partial class JarvisMainForm
             return;
         }
 
+        // Remember whether the mic was listening so it can be turned back on afterwards (in finally).
         SyncSelectedInputDeviceIntoCurrentOptions();
 
         var wasListening = _currentVoiceRuntime.CurrentStatus.IsListening;
@@ -934,6 +926,7 @@ internal sealed partial class JarvisMainForm
                 await _currentVoiceRuntime.StopAsync(_cancellationTokenSource.Token);
             }
 
+            // Modal message boxes pause the flow so the user knows when to be quiet and when to speak.
             MessageBox.Show(
                 this,
                 "Microphone calibration starts now.\n\n1. Keep the room quiet for the first capture.\n2. After that prompt, speak naturally toward the selected microphone for a few seconds.",
@@ -942,6 +935,7 @@ internal sealed partial class JarvisMainForm
                 MessageBoxIcon.Information);
 
             AppendRuntimeMessage("Calibration: capturing room noise.");
+            // The numbers (2200, 3200) are how many milliseconds of audio to record.
             var ambientSample = await _microphoneCalibrationService.CaptureSampleAsync(_currentOptions, 2200, _cancellationTokenSource.Token);
 
             MessageBox.Show(
@@ -959,9 +953,8 @@ internal sealed partial class JarvisMainForm
                 ambientSample,
                 speechSample,
                 resolvedProcessing.EffectiveBeamformingProfileName,
-                resolvedProcessing.EffectiveHardwareDspProfileName,
-                ResolveEffectiveVendorDspLabel(),
-                resolvedProcessing.EffectiveVendorDspProfilePath);
+                resolvedProcessing.EffectiveHardwareDspProfileName);
+            // Replace any older profile for the same device and settings, keeping the rest, sorted for a stable file.
             var profiles = _currentOptions.SpeechRecognitionCalibrationProfiles
                 .Where(profile =>
                     !IsSameCalibrationConfiguration(profile, calibration))
@@ -982,7 +975,7 @@ internal sealed partial class JarvisMainForm
             AppendTimelineEntry(
                 "AUDIO",
                 "Microphone calibration saved.",
-                $"Gate {calibration.RecommendedVoiceActivityThreshold:P1}, gain cap {calibration.RecommendedInputGainCap:F1}x, beam {calibration.PreferredBeamformingProfile}, DSP {calibration.HardwareDspProfileName}, vendor {ResolveEffectiveVendorDspLabel()}.",
+                $"Gate {calibration.RecommendedVoiceActivityThreshold:P1}, gain cap {calibration.RecommendedInputGainCap:F1}x, beam {calibration.PreferredBeamformingProfile}, DSP {calibration.HardwareDspProfileName}.",
                 Color.FromArgb(106, 220, 197));
         }
         catch (OperationCanceledException)
@@ -993,6 +986,7 @@ internal sealed partial class JarvisMainForm
             AppendSystemMessage($"Calibration failed: {exception.Message}");
             AppendTimelineEntry("AUDIO", "Microphone calibration failed.", exception.Message, Color.FromArgb(255, 138, 101));
         }
+        // Always re-enable the button and restart listening if it was on before (and push-to-talk is not in use).
         finally
         {
             _calibrateMicButton.Enabled = true;
@@ -1013,6 +1007,8 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Guided validation (button click): records room noise, the wake phrase, a command, and plays a tone to measure how much
+    // speaker sound leaks into the microphone ("full-duplex" means listening while talking), then saves scores.
     private async Task ValidateMicrophoneAsync()
     {
         if (_isSubmitting)
@@ -1091,9 +1087,7 @@ internal sealed partial class JarvisMainForm
                 ResolveEffectiveWakeEngineLabel(),
                 resolvedProcessing.EffectiveWakeEnginePath,
                 resolvedProcessing.EffectiveBeamformingProfileName,
-                resolvedProcessing.EffectiveHardwareDspProfileName,
-                ResolveEffectiveVendorDspLabel(),
-                resolvedProcessing.EffectiveVendorDspProfilePath);
+                resolvedProcessing.EffectiveHardwareDspProfileName);
             var profiles = _currentOptions.SpeechRecognitionValidationProfiles
                 .Where(profile =>
                     !IsSameValidationConfiguration(profile, validation))
@@ -1115,7 +1109,8 @@ internal sealed partial class JarvisMainForm
             AppendTimelineEntry(
                 "AUDIO",
                 "Voice stack validation saved.",
-                $"Wake {validation.WakeWordReadinessScore:P0}, duplex {validation.FullDuplexReadinessScore:P0}, engine {validation.WakeEngineName}, beam {validation.BeamformingProfileName}, DSP {validation.HardwareDspProfileName}, vendor {ResolveEffectiveVendorDspLabel()}, recommended mode {validation.RecommendedConversationMode}.",
+                $"Wake {validation.WakeWordReadinessScore:P0}, duplex {validation.FullDuplexReadinessScore:P0}, engine {validation.WakeEngineName}, beam {validation.BeamformingProfileName}, DSP {validation.HardwareDspProfileName}, recommended mode {validation.RecommendedConversationMode}.",
+                // A duplex readiness score of 0.58 or higher shows in teal, lower in amber.
                 validation.FullDuplexReadinessScore >= 0.58
                     ? Color.FromArgb(106, 220, 197)
                     : Color.FromArgb(255, 191, 105));
@@ -1148,43 +1143,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
-    private string ResolveSelectedBeamformingProfileName()
-    {
-        if (_beamformingProfileComboBox.SelectedIndex < 0
-            || _beamformingProfileComboBox.SelectedIndex >= BeamformingProfileCatalog.All.Count)
-        {
-            return string.IsNullOrWhiteSpace(_currentOptions.SpeechRecognitionBeamformingProfile)
-                ? "auto"
-                : _currentOptions.SpeechRecognitionBeamformingProfile;
-        }
-
-        return BeamformingProfileCatalog.All[_beamformingProfileComboBox.SelectedIndex].Name;
-    }
-
-    private string ResolveSelectedHardwareDspProfileName()
-    {
-        if (_hardwareDspProfileComboBox.SelectedIndex < 0
-            || _hardwareDspProfileComboBox.SelectedIndex >= HardwareDspProfileCatalog.All.Count)
-        {
-            return string.IsNullOrWhiteSpace(_currentOptions.SpeechRecognitionHardwareDspProfile)
-                ? "auto"
-                : _currentOptions.SpeechRecognitionHardwareDspProfile;
-        }
-
-        return HardwareDspProfileCatalog.All[_hardwareDspProfileComboBox.SelectedIndex].Name;
-    }
-
-    private string ResolveSelectedWakeWordAssetLabel()
-    {
-        if (_wakeWordAssetComboBox.SelectedIndex < 0
-            || _wakeWordAssetComboBox.SelectedIndex >= _availableWakeWordAssets.Count)
-        {
-            return WakeWordAssetCatalog.ResolveSelectionDescriptor(_currentOptions).BuildShortLabel();
-        }
-
-        return _availableWakeWordAssets[_wakeWordAssetComboBox.SelectedIndex].BuildShortLabel();
-    }
-
+    // Label of the wake word model actually in use according to settings.
     private string ResolveEffectiveWakeWordAssetLabel()
     {
         return WakeWordAssetCatalog.ResolveConfiguredAsset(_currentOptions)?.BuildShortLabel()
@@ -1201,21 +1160,13 @@ internal sealed partial class JarvisMainForm
         return descriptor.BuildShortLabel();
     }
 
-    private string ResolveEffectiveVendorDspLabel()
-    {
-        var resolved = ResolveActiveProcessingProfile();
-        var descriptor = VendorDspProfileCatalog.ResolveDescriptorByPath(
-            _context.WorkspaceRoot,
-            _currentOptions,
-            resolved.EffectiveVendorDspProfilePath);
-        return descriptor.IsNone ? string.Empty : descriptor.BuildShortLabel();
-    }
-
+    // Works out which beam, DSP and wake settings are really in effect (including "auto" choices).
     private ResolvedMicrophoneProcessingProfile ResolveActiveProcessingProfile()
     {
         return MicrophoneProcessingProfileResolver.Resolve(_currentOptions);
     }
 
+    // Two calibration profiles count as the same if device, beam profile and DSP profile match; used to replace instead of duplicate.
     private static bool IsSameCalibrationConfiguration(
         SpeechRecognitionCalibrationProfile existing,
         SpeechRecognitionCalibrationProfile candidate)
@@ -1228,14 +1179,10 @@ internal sealed partial class JarvisMainForm
             && string.Equals(
                 NormalizeProfileNameForStorage(existing.HardwareDspProfileName),
                 NormalizeProfileNameForStorage(candidate.HardwareDspProfileName),
-                StringComparison.OrdinalIgnoreCase)
-            && VendorDspProfilePathsMatch(existing.VendorDspProfilePath, candidate.VendorDspProfilePath)
-            && string.Equals(
-                NormalizeVendorLabelForStorage(existing.VendorDspProfileName),
-                NormalizeVendorLabelForStorage(candidate.VendorDspProfileName),
                 StringComparison.OrdinalIgnoreCase);
     }
 
+    // Same idea for validation profiles, which also compare the wake word model and engine (by path, or by name when no path).
     private static bool IsSameValidationConfiguration(
         SpeechRecognitionValidationProfile existing,
         SpeechRecognitionValidationProfile candidate)
@@ -1263,14 +1210,10 @@ internal sealed partial class JarvisMainForm
             && string.Equals(
                 NormalizeProfileNameForStorage(existing.HardwareDspProfileName),
                 NormalizeProfileNameForStorage(candidate.HardwareDspProfileName),
-                StringComparison.OrdinalIgnoreCase)
-            && VendorDspProfilePathsMatch(existing.VendorDspProfilePath, candidate.VendorDspProfilePath)
-            && string.Equals(
-                NormalizeVendorLabelForStorage(existing.VendorDspProfileName),
-                NormalizeVendorLabelForStorage(candidate.VendorDspProfileName),
                 StringComparison.OrdinalIgnoreCase);
     }
 
+    // Treats an empty profile name as "auto" and ignores case so comparisons are reliable.
     private static string NormalizeProfileNameForStorage(string? profileName)
     {
         return string.IsNullOrWhiteSpace(profileName)
@@ -1278,20 +1221,8 @@ internal sealed partial class JarvisMainForm
             : profileName.Trim().ToLowerInvariant();
     }
 
-    private static string NormalizeVendorLabelForStorage(string? value)
-    {
-        return string.IsNullOrWhiteSpace(value)
-            ? string.Empty
-            : value.Trim().ToLowerInvariant();
-    }
-
-    private static bool VendorDspProfilePathsMatch(string? left, string? right)
-    {
-        return VendorDspProfileCatalog.StoredPathsMatch(left, right)
-            || (string.IsNullOrWhiteSpace(VendorDspProfileCatalog.NormalizeStoredPath(left))
-                && string.IsNullOrWhiteSpace(VendorDspProfileCatalog.NormalizeStoredPath(right)));
-    }
-
+    // ----- Saving settings and rebuilding services -----
+    // Writes the current settings to jarvis.settings.json. The semaphore makes concurrent saves queue up instead of overlapping.
     private async Task PersistCurrentOptionsAsync()
     {
         await _optionsPersistenceGate.WaitAsync(_cancellationTokenSource.Token);
@@ -1307,6 +1238,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Builds a new assistant from new settings (same startup code as launch) and swaps it in, moving the Activity event over.
     private async Task ReplaceAssistantAsync(JarvisOptions options)
     {
         var assistant = await AppBootstrapper.CreateAssistantAsync(
@@ -1321,6 +1253,8 @@ internal sealed partial class JarvisMainForm
         _context.Assistant.Activity += OnAssistantActivity;
     }
 
+    // Applies changed audio settings: rebuild the assistant, stop and dispose the old voice runtime, create a new one,
+    // re-attach the event handlers, refresh the pickers, and start listening again. Start errors are ignored here.
     private async Task ReloadVoiceRuntimeAsync(JarvisOptions options)
     {
         _currentOptions = options;
@@ -1337,7 +1271,6 @@ internal sealed partial class JarvisMainForm
         _currentVoiceRuntime.StatusChanged -= OnVoiceStatusChanged;
         _currentVoiceRuntime.SignalLevelChanged -= OnVoiceSignalChanged;
         _currentVoiceRuntime.CommandRecognized -= OnVoiceCommandRecognized;
-        _currentVoiceRuntime.ActivationRequested -= OnVoiceActivationRequested;
         _currentVoiceRuntime.BargeInRequested -= OnVoiceBargeInRequested;
         _currentVoiceRuntime.Dispose();
 
@@ -1347,14 +1280,12 @@ internal sealed partial class JarvisMainForm
         _currentVoiceRuntime.StatusChanged += OnVoiceStatusChanged;
         _currentVoiceRuntime.SignalLevelChanged += OnVoiceSignalChanged;
         _currentVoiceRuntime.CommandRecognized += OnVoiceCommandRecognized;
-        _currentVoiceRuntime.ActivationRequested += OnVoiceActivationRequested;
         _currentVoiceRuntime.BargeInRequested += OnVoiceBargeInRequested;
         _currentVoiceRuntime.SetPlaybackState(_context.Speaker.CurrentStatus.IsSpeaking);
         RefreshWakeWordAssets();
         RefreshWakeEngines();
         RefreshBeamformingProfiles();
         RefreshHardwareDspProfiles();
-        RefreshVendorDspProfiles();
         UpdateCalibrationUi();
         UpdateVoiceUi(_currentVoiceRuntime.CurrentStatus, appendToFeed: false);
         UpdateSignalUi(_currentVoiceRuntime.CurrentSignal);
@@ -1368,6 +1299,8 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Saves persona and style changes from the presence dialog (tone, nickname, pronunciation hints) and rebuilds the
+    // assistant and speaker so they take effect; does nothing if nothing actually changed.
     private async Task ApplyPresenceSettingsAsync(JarvisOptions options)
     {
         var normalizedOptions = options with
@@ -1401,6 +1334,8 @@ internal sealed partial class JarvisMainForm
         AddActivityCard("Presence", "Profile updated", summary, Color.FromArgb(106, 220, 197));
     }
 
+    // ----- Microphone, volume and whisper-mode controls -----
+    // Mute Mic / Start Mic button: stops listening if on, otherwise starts.
     private async Task ToggleMicrophoneAsync()
     {
         if (_currentVoiceRuntime.CurrentStatus.IsListening)
@@ -1412,6 +1347,7 @@ internal sealed partial class JarvisMainForm
         await _currentVoiceRuntime.StartAsync(_cancellationTokenSource.Token);
     }
 
+    // Push-to-Talk button: with push-to-talk enabled in settings it starts/stops live capture and logs it; otherwise it acts like the mic toggle.
     private async Task TogglePushToTalkAsync()
     {
         if (!_currentOptions.SpeechRecognitionPushToTalkEnabled)
@@ -1433,6 +1369,7 @@ internal sealed partial class JarvisMainForm
         AppendTimelineEntry("VOICE", "Push-to-talk active.", "Operator armed the microphone.", Color.FromArgb(106, 220, 197));
     }
 
+    // Volume slider changed: clamps to 10%-200%, rebuilds the speaker with the new volume and saves it. Ignores changes under 0.1%.
     private async Task UpdateSpeakerVolumeAsync(double volumeMultiplier)
     {
         var normalized = Math.Clamp(volumeMultiplier, 0.10, 2.0);
@@ -1451,6 +1388,7 @@ internal sealed partial class JarvisMainForm
         await PersistCurrentOptionsAsync();
     }
 
+    // "Whisper" checkbox: switches Jarvis to a quieter speaking mode, rebuilds the speaker and saves.
     private async Task UpdateWhisperModeAsync(bool whisperEnabled)
     {
         if (_currentOptions.WhisperModeEnabled == whisperEnabled)
@@ -1467,6 +1405,10 @@ internal sealed partial class JarvisMainForm
         await PersistCurrentOptionsAsync();
     }
 
+    // ----- Voice turn handling -----
+    // Events from the voice runtime, speaker and assistant arrive on background threads. Each handler below follows one pattern:
+    // bail out if the window is closing; if not on the UI thread (InvokeRequired), BeginInvoke the same work onto it; otherwise do it directly.
+    // The voice runtime reports a status change (listening, muted, error...).
     private void OnVoiceStatusChanged(object? sender, VoiceStatusChangedEventArgs eventArgs)
     {
         if (!CanUseUi())
@@ -1489,6 +1431,7 @@ internal sealed partial class JarvisMainForm
         UpdateVoiceUi(eventArgs.Status, appendToFeed: true);
     }
 
+    // The voice runtime reports a new microphone level reading (fires many times per second).
     private void OnVoiceSignalChanged(object? sender, VoiceSignalChangedEventArgs eventArgs)
     {
         if (!CanUseUi())
@@ -1511,6 +1454,7 @@ internal sealed partial class JarvisMainForm
         UpdateSignalUi(eventArgs.Signal);
     }
 
+    // The speaker started or stopped talking. The voice runtime is told first (it must ignore Jarvis's own voice) before touching the UI.
     private void OnSpeakerStatusChanged(object? sender, SpeakerStatusChangedEventArgs eventArgs)
     {
         _currentVoiceRuntime.SetPlaybackState(eventArgs.Status.IsSpeaking);
@@ -1535,6 +1479,7 @@ internal sealed partial class JarvisMainForm
         UpdateSpeakerUi(eventArgs.Status);
     }
 
+    // The assistant reports what it is doing (planning, running a tool, error...); the screen is updated on the UI thread.
     private void OnAssistantActivity(object? sender, AssistantActivityEventArgs eventArgs)
     {
         if (!CanUseUi())
@@ -1557,6 +1502,7 @@ internal sealed partial class JarvisMainForm
         UpdateAssistantRuntimeUi(eventArgs.Activity);
     }
 
+    // The voice runtime heard a command (after wake word / speech recognition); hands it to HandleVoiceCommandAsync on the UI thread.
     private void OnVoiceCommandRecognized(object? sender, VoiceCommandRecognizedEventArgs eventArgs)
     {
         if (!CanUseUi())
@@ -1579,6 +1525,8 @@ internal sealed partial class JarvisMainForm
         _ = HandleVoiceCommandAsync(eventArgs);
     }
 
+    // Decides what to do with a heard voice command, in this order: lecture recording filter, talking over Jarvis,
+    // busy with another request, low-confidence confirmation, and finally normal processing.
     private async Task HandleVoiceCommandAsync(VoiceCommandRecognizedEventArgs eventArgs)
     {
         // While a lecture records, whatever the wake gate lets through is most likely the lecture, so only the
@@ -1601,6 +1549,7 @@ internal sealed partial class JarvisMainForm
 
         if (speaker.IsSpeaking)
         {
+            // IsEcho checks whether the heard words are just Jarvis's own reply picked up by the microphone; echoes are ignored.
             if (!SpokenReply.IsEcho(eventArgs.RawText, speaker.Message))
             {
                 _context.Speaker.Interrupt();
@@ -1611,6 +1560,7 @@ internal sealed partial class JarvisMainForm
             return;
         }
 
+        // Busy: if the user had just interrupted Jarvis (within 4 seconds), keep this command and run it after the interrupted turn cleans up; otherwise reject it.
         if (_isSubmitting)
         {
             if (DateTimeOffset.UtcNow - _lastBargeInUtc < TimeSpan.FromSeconds(4))
@@ -1641,6 +1591,7 @@ internal sealed partial class JarvisMainForm
             return;
         }
 
+        // Low-confidence recognition: ask the user to confirm instead of acting.
         if (eventArgs.RequiresClarification)
         {
             await PromptForVoiceClarificationAsync(eventArgs);
@@ -1652,28 +1603,7 @@ internal sealed partial class JarvisMainForm
         await ProcessPromptAsync(isAnswer ? eventArgs.RawText : eventArgs.Text, "VOICE", clearInput: false);
     }
 
-    private void OnVoiceActivationRequested(object? sender, VoiceActivationRequestedEventArgs eventArgs)
-    {
-        if (!CanUseUi())
-        {
-            return;
-        }
-
-        if (InvokeRequired)
-        {
-            BeginInvoke(new Action(() =>
-            {
-                if (CanUseUi())
-                {
-                    BringAssistantToFront(eventArgs.Reason);
-                }
-            }));
-            return;
-        }
-
-        BringAssistantToFront(eventArgs.Reason);
-    }
-
+    // The voice runtime detected the user speaking over Jarvis: stop the speech at once and note the time (used by the 4 second rule above).
     private void OnVoiceBargeInRequested(object? sender, VoiceBargeInEventArgs eventArgs)
     {
         _context.Speaker.Interrupt();
@@ -1699,6 +1629,7 @@ internal sealed partial class JarvisMainForm
         AddBargeInTimelineEntry(eventArgs.Reason);
     }
 
+    // Logs that the user interrupted Jarvis, and why (hotkey, wake word...).
     private void AddBargeInTimelineEntry(string reason)
     {
         AppendRuntimeMessage("Barge-in detected. Voice output interrupted.");
@@ -1709,6 +1640,8 @@ internal sealed partial class JarvisMainForm
             Color.FromArgb(255, 191, 105));
     }
 
+    // ----- Showing status on screen -----
+    // Updates the voice labels (LISTEN HOT/READY, WAKE...), the push-to-talk and mic buttons and the tray tooltip. Adds a feed line only when the text actually changed.
     private void UpdateVoiceUi(VoiceStatusSnapshot status, bool appendToFeed)
     {
         _trayIcon.Text = BuildTrayText(status.StatusText);
@@ -1755,6 +1688,7 @@ internal sealed partial class JarvisMainForm
         RecomputeSurfaceState();
     }
 
+    // Stores the newest microphone reading and feeds the RMS/peak labels and the waveform.
     private void UpdateSignalUi(VoiceSignalSnapshot signal)
     {
         _latestSignal = signal;
@@ -1767,12 +1701,14 @@ internal sealed partial class JarvisMainForm
         RecomputeSurfaceState();
     }
 
+    // Tells the waveform whether Jarvis is speaking (it changes how the waveform looks).
     private void UpdateSpeakerUi(SpeakerStatusSnapshot status)
     {
         _waveformControl.SetSpeaking(status.IsSpeaking);
         RecomputeSurfaceState();
     }
 
+    // Shows an assistant activity event: status line, activity card, timeline entry and surface state. Transient events (brief progress ticks) are not added to the chat.
     private void UpdateAssistantRuntimeUi(AssistantActivityEvent activity)
     {
         _assistantStatusLabel.Text = activity.Message;
@@ -1830,6 +1766,7 @@ internal sealed partial class JarvisMainForm
         RecomputeSurfaceState();
     }
 
+    // Briefly flashes the on-screen action cue when the assistant starts a tool that visibly controls the desktop (a fixed list of tool names).
     private void MaybeShowActionCue(AssistantActivityEvent activity)
     {
         var toolName = activity.Message.Replace("Running ", string.Empty, StringComparison.OrdinalIgnoreCase).Trim().TrimEnd('.');
@@ -1859,6 +1796,8 @@ internal sealed partial class JarvisMainForm
         _actionCueOverlay.ShowCue(Screen.FromControl(this), headline, detail, GetActivityAccent(activity.Kind));
     }
 
+    // Maps what the assistant is doing to the header state: running a tool is ACT, planning and other steps are THINK, an error clears the override.
+    // Does nothing while the reply is being typed out or when no request is in progress.
     private void SyncAssistantSurfaceState(AssistantActivityEvent activity)
     {
         if (_isAssistantResponseStreaming || !_isSubmitting)
@@ -1889,6 +1828,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Which activity events deserve a card in the Activity list.
     private bool ShouldCreateActivityCard(AssistantActivityEvent activity)
     {
         if (activity.Kind is AssistantActivityKind.ToolStart
@@ -1906,6 +1846,7 @@ internal sealed partial class JarvisMainForm
         return !activity.IsTransient;
     }
 
+    // "Override" means a state forced by what the assistant is doing, taking priority over the microphone-based state in RecomputeSurfaceState.
     private void SetAssistantStateOverride(SurfaceState state, string detail)
     {
         _assistantStateOverride = state;
@@ -1931,6 +1872,7 @@ internal sealed partial class JarvisMainForm
             : activity.Message.Trim();
     }
 
+    // Splits text into words (cut after each space or punctuation mark) so the reply can be revealed piece by piece.
     private static IEnumerable<string> EnumerateResponseChunks(string message)
     {
         if (string.IsNullOrEmpty(message))
@@ -1957,6 +1899,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Milliseconds to pause after each chunk: longer after sentence ends (56), shorter after commas (34), and a bit by word length otherwise.
     private static int GetResponseChunkDelay(string chunk)
     {
         if (string.IsNullOrEmpty(chunk))
@@ -1980,6 +1923,9 @@ internal sealed partial class JarvisMainForm
         };
     }
 
+    // ----- Surface state (the big IDLE / LISTENING / THINKING label) -----
+    // Picks the single state to show. Highest priority first: waiting for approval, voice confirmation pending, error,
+    // Jarvis speaking, a forced assistant state, waiting for the user's answer, microphone listening, otherwise idle.
     private void RecomputeSurfaceState()
     {
         var speakerStatus = _context.Speaker.CurrentStatus;
@@ -2039,6 +1985,7 @@ internal sealed partial class JarvisMainForm
         UpdateSurfaceState(SurfaceState.Idle, "Stand by for voice, operator, or background automation.");
     }
 
+    // Applies a state to the header (label, color, waveform accent, stage chips) and, when it really changed, logs it and plays a sound cue.
     private void UpdateSurfaceState(SurfaceState state, string detail, bool playCue = true)
     {
         if (_surfaceState == state && string.Equals(_surfaceDetailLabel.Text, detail, StringComparison.Ordinal))
@@ -2066,6 +2013,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Highlights the header stage chip (LISTEN / THINK / ACT / SPEAK) that matches the current state; the others are dimmed.
     private void UpdateStageLabels()
     {
         foreach (var pair in _stageLabels)
@@ -2077,6 +2025,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Plays a short Windows system sound for attention-worthy states (approval, acting, speaking, error). Sound failures are ignored.
     private void PlayStateCue(SurfaceState state)
     {
         try
@@ -2105,6 +2054,8 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // ----- Approvals, activity cards and the chat/timeline feeds -----
+    // Remembers the pending approval and shows or hides the approval card (132 pixels tall when shown, 0 when hidden).
     private void UpdateApprovalUi(PendingApprovalAction? pendingApproval)
     {
         _pendingApproval = pendingApproval;
@@ -2122,6 +2073,8 @@ internal sealed partial class JarvisMainForm
         RecomputeSurfaceState();
     }
 
+    // Adds one card to the Activity list. Newest goes right after the pinned summary card; the list keeps at most 11 entries
+    // and disposes the oldest ones so controls do not pile up.
     private void AddActivityCard(string title, string subtitle, string detail, Color accent)
     {
         var card = new GlassPanel
@@ -2165,7 +2118,7 @@ internal sealed partial class JarvisMainForm
         card.Controls.Add(detailLabel);
         card.Controls.Add(subtitleLabel);
         card.Controls.Add(titleLabel);
-        titleLabel.BringToFront();
+        detailLabel.BringToFront();
 
         _activityFlow.Controls.Add(card);
         _activityFlow.Controls.SetChildIndex(_sessionSummaryCard, 0);
@@ -2186,6 +2139,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Makes every card as wide as the list (minimum 250 px), leaving room for the scroll bar.
     private void UpdateActivityCardWidths()
     {
         var width = Math.Max(250, _activityFlow.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 14);
@@ -2197,6 +2151,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Adds a line from the user (voice, typed, approval) to the chat with a color depending on where it came from.
     private void AppendOperatorMessage(string source, string message)
     {
         var accent = source.Equals("VOICE", StringComparison.OrdinalIgnoreCase)
@@ -2208,6 +2163,9 @@ internal sealed partial class JarvisMainForm
         AppendMessage(source, message, accent);
     }
 
+    // The three Assistant message stream methods let a reply be added to the chat history piece by piece:
+    // Begin writes the name and time header, Append adds text, Complete ends the message with a blank line.
+    // The flag _isAssistantHistoryStreamActive keeps any other message from landing in the middle of a streaming reply.
     private void BeginAssistantMessageStream()
     {
         if (!CanUseUi() || _isAssistantHistoryStreamActive)
@@ -2263,16 +2221,19 @@ internal sealed partial class JarvisMainForm
         _isAssistantHistoryStreamActive = false;
     }
 
+    // Adds a red-orange "SYSTEM" line (problems and notices) to the chat history.
     private void AppendSystemMessage(string message)
     {
         AppendMessage("SYSTEM", message, Color.FromArgb(255, 138, 101));
     }
 
+    // Adds a blue "RUNTIME" line (status information) to the chat history.
     private void AppendRuntimeMessage(string message)
     {
         AppendMessage("RUNTIME", message, Color.FromArgb(132, 196, 255));
     }
 
+    // Adds a timestamped, colored entry to the chat history. Safe to call once the window exists; it is skipped while closing.
     private void AppendMessage(string source, string message, Color accent)
     {
         if (!CanUseUi())
@@ -2299,6 +2260,7 @@ internal sealed partial class JarvisMainForm
         _historyBox.ScrollToCaret();
     }
 
+    // Adds an entry to the Timeline box: category and time, the detail, and a dimmer "why:" line.
     private void AppendTimelineEntry(string category, string detail, string justification, Color accent)
     {
         if (!CanUseUi())
@@ -2329,6 +2291,7 @@ internal sealed partial class JarvisMainForm
         _timelineBox.ScrollToCaret();
     }
 
+    // Key press in the input box: Enter sends, Shift+Enter inserts a new line.
     private async void InputBoxOnKeyDown(object? sender, KeyEventArgs e)
     {
         if (e.KeyCode != Keys.Enter || e.Shift)
@@ -2340,6 +2303,7 @@ internal sealed partial class JarvisMainForm
         await SubmitPromptAsync();
     }
 
+    // Disables the buttons and input box and shows the wait cursor while a request is being processed.
     private void SetBusyState(bool isBusy)
     {
         _sendButton.Enabled = !isBusy;
@@ -2353,6 +2317,8 @@ internal sealed partial class JarvisMainForm
         Cursor = isBusy ? Cursors.WaitCursor : Cursors.Default;
     }
 
+    // Speaks a message without ever throwing (speech problems must not break a turn); cancellation is passed on.
+    // In "half-duplex" mode the microphone is turned off while Jarvis talks (so it does not hear itself) and turned on again afterwards.
     private async Task TrySpeakAsync(string message, CancellationToken cancellationToken)
     {
         var shouldPauseMicrophone = string.Equals(
@@ -2394,6 +2360,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Short voice acknowledgements are spoken only when Jarvis is hidden (tray, minimized), because otherwise the user can see the screen.
     private bool ShouldSpeakVoiceAcknowledgement(string source)
     {
         return _currentOptions.VoiceEnabled
@@ -2413,6 +2380,7 @@ internal sealed partial class JarvisMainForm
         return BuildImmediateAcknowledgement(input);
     }
 
+    // Text shown in the response box while a request is being processed, before the real answer arrives.
     private string BuildProcessingConsoleText(string source, string renderedInput, string input)
     {
         return string.Join(
@@ -2424,6 +2392,7 @@ internal sealed partial class JarvisMainForm
             "[STATUS] THINKING | Analyzing the directive and preparing the response stream.");
     }
 
+    // Picks a short canned acknowledgement ("Checking the forecast.") from the first words of the request. No model call is involved.
     private string BuildImmediateAcknowledgement(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -2443,7 +2412,7 @@ internal sealed partial class JarvisMainForm
             return "Pulling intelligence.";
         }
 
-        if (StartsWithDirective(normalized, "screen", "analyze image", "analyze document", "ambient"))
+        if (StartsWithDirective(normalized, "screen", "analyze image", "analyze document"))
         {
             return "Scanning the visual feed.";
         }
@@ -2496,6 +2465,7 @@ internal sealed partial class JarvisMainForm
         return "On it.";
     }
 
+    // Builds the one-line strip: local time, active application, and what Jarvis is currently doing.
     private string BuildMissionBrief(DesktopContextSnapshot? snapshot)
     {
         var timestamp = snapshot?.LocalTime.ToLocalTime() ?? DateTimeOffset.Now;
@@ -2515,6 +2485,7 @@ internal sealed partial class JarvisMainForm
             $"OBJECTIVE {TrimForSingleLine(objective, 68)}");
     }
 
+    // What the "OBJECTIVE" part of the strip says, using the same priority as the main state.
     private string ResolveMissionObjective()
     {
         if (_pendingApproval is not null)
@@ -2556,6 +2527,7 @@ internal sealed partial class JarvisMainForm
         return "Stand by for the next directive.";
     }
 
+    // Short "Execute: ..." description of a new request.
     private static string DescribeMissionObjective(string input)
     {
         if (string.IsNullOrWhiteSpace(input))
@@ -2567,6 +2539,7 @@ internal sealed partial class JarvisMainForm
         return $"Execute: {trimmed}";
     }
 
+    // What the objective should say once a turn finishes.
     private static string BuildPostTurnObjective(AssistantTurn turn, PendingApprovalAction? pendingApproval)
     {
         if (pendingApproval is not null)
@@ -2587,6 +2560,7 @@ internal sealed partial class JarvisMainForm
         return "Stand by for the next directive.";
     }
 
+    // One-line summary of the presence settings after they change.
     private static string BuildPresenceUpdateSummary(JarvisOptions options)
     {
         var nickname = string.IsNullOrWhiteSpace(options.AssistantUserNickname)
@@ -2603,6 +2577,7 @@ internal sealed partial class JarvisMainForm
             $"Pronunciation hints {pronunciationCount}");
     }
 
+    // True when the input is exactly the directive word or starts with it followed by a space (so "run" matches "run ls" but not "runway").
     private static bool StartsWithDirective(string input, params string[] directives)
     {
         foreach (var directive in directives)
@@ -2617,6 +2592,7 @@ internal sealed partial class JarvisMainForm
         return false;
     }
 
+    // Chooses the text shown for a turn; when approval is pending it adds the approval details (see below).
     private string BuildDisplayResponse(AssistantTurn turn, PendingApprovalAction? pendingApproval)
     {
         if (pendingApproval is null)
@@ -2631,6 +2607,8 @@ internal sealed partial class JarvisMainForm
             "Use the approval card to approve or deny the action directly in the UI.");
     }
 
+    // ----- Text builders for the summary boxes -----
+    // Builds the "Plan and result" text after a turn: intent, session, tool results with their verification status, follow-up question, citations.
     private string BuildTurnSummary(AssistantTurn turn, PendingApprovalAction? pendingApproval, string renderedResponse)
     {
         var lines = new List<string>
@@ -2673,6 +2651,7 @@ internal sealed partial class JarvisMainForm
         return string.Join(Environment.NewLine, lines);
     }
 
+    // Same kind of summary, built from a saved session (used by the periodic refresh).
     private static string BuildSessionSummary(PersistedAgentSession session)
     {
         var lines = new List<string>
@@ -2734,6 +2713,7 @@ internal sealed partial class JarvisMainForm
         return string.Join(Environment.NewLine, lines);
     }
 
+    // A string that changes when the question or the session changes; the refresh loop compares it to avoid logging the same follow-up repeatedly.
     private static string BuildClarificationSnapshotKey(PersistedAgentSession session) =>
         string.Join(
             "|",
@@ -2741,6 +2721,7 @@ internal sealed partial class JarvisMainForm
             session.UpdatedAtUtc.UtcTicks.ToString(),
             session.FollowUpQuestion);
 
+    // Response box text while Jarvis waits for the user's answer to a follow-up question.
     private static string BuildClarificationConsoleText(PersistedAgentSession session)
     {
         var lines = new List<string>
@@ -2774,6 +2755,7 @@ internal sealed partial class JarvisMainForm
         return string.Join(Environment.NewLine, lines);
     }
 
+    // The "why:" line for the timeline entry about a follow-up question.
     private static string BuildClarificationWhy(PersistedAgentSession session)
     {
         var parts = new List<string>
@@ -2796,6 +2778,11 @@ internal sealed partial class JarvisMainForm
         return string.Join(" ", parts);
     }
 
+    // ----- Voice clarification and learned corrections -----
+    // When a voice command was recognised with low confidence, Jarvis asks "did you say ...?" and parks the command in
+    // _pendingVoiceClarification. The next input is checked here, in this order: yes (run it), no (cancel and remember the
+    // bad transcript), an explicit correction, a retry that looks like a correction (remember it), or anything else
+    // (forget the question and treat it as a fresh command). Returns true if it consumed the input.
     private async Task<bool> TryResolvePendingVoiceClarificationAsync(string input, string source, bool clearInput)
     {
         var pending = _pendingVoiceClarification;
@@ -2895,6 +2882,7 @@ internal sealed partial class JarvisMainForm
         return false;
     }
 
+    // Shows and speaks the "did you mean" question and stores the command until the user answers.
     private async Task PromptForVoiceClarificationAsync(VoiceCommandRecognizedEventArgs eventArgs)
     {
         var prompt = string.IsNullOrWhiteSpace(eventArgs.ClarificationPrompt)
@@ -2925,6 +2913,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Runs a command that was queued while Jarvis was busy; low-confidence ones still ask for confirmation first.
     private Task RouteQueuedVoiceDirectiveAsync(QueuedVoiceDirective directive)
     {
         var eventArgs = directive.ToEventArgs();
@@ -2933,6 +2922,8 @@ internal sealed partial class JarvisMainForm
             : ProcessPromptAsync(eventArgs.Text, "VOICE", clearInput: false);
     }
 
+    // Handles spoken or typed commands about corrections themselves: "review corrections" shows what was learned, and
+    // "X means Y" style directives store a correction. Returns true if the input was one of these.
     private async Task<bool> TryHandleVoiceCorrectionDirectiveAsync(string input, string source, bool clearInput)
     {
         if (VoiceCorrectionLearning.IsReviewCommand(input))
@@ -2980,6 +2971,7 @@ internal sealed partial class JarvisMainForm
         return true;
     }
 
+    // Stores a (heard -> meant) pair in the settings and reloads the voice runtime so future recognition favors it.
     private async Task LearnVoiceCorrectionAsync(string heardText, string correctedText, double? confidence, string source)
     {
         var updatedOptions = VoiceCorrectionLearning.RecordCorrection(_currentOptions, heardText, correctedText, confidence);
@@ -3001,6 +2993,7 @@ internal sealed partial class JarvisMainForm
         }
     }
 
+    // Remembers a transcript the user rejected so it can be avoided later.
     private async Task RecordRejectedVoiceTranscriptAsync(string heardText, double? confidence)
     {
         var updatedOptions = VoiceCorrectionLearning.RecordRejectedPhrase(_currentOptions, heardText, confidence);
@@ -3015,6 +3008,7 @@ internal sealed partial class JarvisMainForm
         await PersistCurrentOptionsAsync();
     }
 
+    // Explains in plain words what was heard, how confident recognition was, and what Jarvis would have done.
     private static string BuildVoiceClarificationWhy(string text, string rawText, double? confidence)
     {
         var confidenceText = confidence is double value ? $"{value:P0}" : "unknown";
@@ -3028,6 +3022,8 @@ internal sealed partial class JarvisMainForm
         return $"Jarvis heard \"{TrimForSingleLine(heardText, 72)}\" with {confidenceText} confidence. The routed directive would be \"{TrimForSingleLine(text, 72)}\" unless you confirm or correct it.";
     }
 
+    // ----- Small formatting helpers -----
+    // Color for each kind of assistant activity in the timeline and activity cards.
     private static Color GetActivityAccent(AssistantActivityKind kind) =>
         kind switch
         {
@@ -3042,6 +3038,7 @@ internal sealed partial class JarvisMainForm
             _ => Color.FromArgb(173, 216, 230)
         };
 
+    // One word describing a tool's result: its verification status if it has one, otherwise "observed" or "failed".
     private static string FormatToolOutcome(AssistantToolExecution tool)
     {
         var status = string.IsNullOrWhiteSpace(tool.VerificationStatus)
@@ -3050,6 +3047,7 @@ internal sealed partial class JarvisMainForm
         return status;
     }
 
+    // Best available one-line description of a tool result: verification summary, else summary, else verification text.
     private static string BuildToolSummary(AssistantToolExecution tool)
     {
         if (!string.IsNullOrWhiteSpace(tool.VerificationSummary))
@@ -3065,6 +3063,7 @@ internal sealed partial class JarvisMainForm
         return tool.VerificationText;
     }
 
+    // Counts tool results by outcome, for example "2 verified | 1 failed", in a fixed order with unknown statuses last.
     private static string BuildVerificationOverview(IReadOnlyList<AssistantToolExecution> toolResults)
     {
         if (toolResults.Count == 0)
@@ -3103,6 +3102,7 @@ internal sealed partial class JarvisMainForm
         return parts.Count == 0 ? "no tool evidence" : string.Join(" | ", parts);
     }
 
+    // Header text for each state.
     private static string GetSurfaceStateLabel(SurfaceState state) =>
         state switch
         {
@@ -3115,6 +3115,7 @@ internal sealed partial class JarvisMainForm
             _ => "IDLE"
         };
 
+    // Header color for each state.
     private static Color GetStateAccent(SurfaceState state) =>
         state switch
         {
@@ -3127,6 +3128,7 @@ internal sealed partial class JarvisMainForm
             _ => Color.FromArgb(170, 191, 214)
         };
 
+    // Flattens line breaks and cuts text to maxLength characters, adding "..." so it fits one line.
     private static string TrimForSingleLine(string value, int maxLength)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -3138,6 +3140,7 @@ internal sealed partial class JarvisMainForm
         return flattened.Length <= maxLength ? flattened : flattened[..maxLength] + "...";
     }
 
+    // First 8 characters of a session id, or "n/a" when empty.
     private static string ShortId(string sessionId)
     {
         return string.IsNullOrWhiteSpace(sessionId)

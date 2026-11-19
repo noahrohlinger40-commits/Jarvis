@@ -1,3 +1,7 @@
+// MemoryWorkbenchForm.cs: a window for browsing and editing what Jarvis remembers. It lists the active memory
+// notes in a grid (left) with an editor for the selected note (right): content, kind, tags, importance,
+// retention, expiry and reminder. Opened from the main window (JarvisMainForm.Runtime.cs). All reading and
+// writing goes through JarvisAssistant (Jarvis.Core), which owns the real memory store.
 using System.Drawing;
 using System.Windows.Forms;
 using Jarvis.Core;
@@ -6,13 +10,19 @@ namespace Jarvis.App;
 
 internal sealed class MemoryWorkbenchForm : Form
 {
+    // The assistant that owns the memory store; this form only calls GetMemoriesAsync, UpdateMemoryAsync and ForgetMemoryAsync.
     private readonly JarvisAssistant _assistant;
+    // Cancelled when the window closes, so pending loads and saves stop quietly.
     private readonly CancellationTokenSource _cancellationTokenSource = new();
+    // Feeds the grid with MemoryRow items.
     private readonly BindingSource _gridBinding = new();
 
+    // The notes currently loaded; the grid shows a summary of each, the editor shows the full note.
     private List<MemoryNote> _memories = [];
+    // True while the editor fields are being filled in code, so that does not count as the user changing the selection.
     private bool _isLoadingSelection;
 
+    // Grid and editor controls, created in InitializeUi / BuildEditorPanel.
     private DataGridView _grid = null!;
     private Label _statusLabel = null!;
     private Button _refreshButton = null!;
@@ -37,9 +47,11 @@ internal sealed class MemoryWorkbenchForm : Form
     {
         _assistant = assistant;
         InitializeUi();
+        // Load the notes as soon as the window is first shown.
         Shown += async (_, _) => await RefreshMemoriesAsync();
     }
 
+    // Stop any in-flight work and release resources when the window is disposed.
     protected override void Dispose(bool disposing)
     {
         if (disposing)
@@ -52,6 +64,7 @@ internal sealed class MemoryWorkbenchForm : Form
         base.Dispose(disposing);
     }
 
+    // Build the window: a toolbar (Refresh, Save, Forget, status text) above a split view with the grid on the left and the editor on the right.
     private void InitializeUi()
     {
         Text = "Memory Workbench";
@@ -90,6 +103,7 @@ internal sealed class MemoryWorkbenchForm : Form
             Text = "Loading memories..."
         };
 
+        // Buttons are async: they await the work so the window stays responsive.
         _refreshButton.Click += async (_, _) => await RefreshMemoriesAsync();
         _saveButton.Click += async (_, _) => await SaveSelectedMemoryAsync();
         _forgetButton.Click += async (_, _) => await ForgetSelectedMemoryAsync();
@@ -106,6 +120,7 @@ internal sealed class MemoryWorkbenchForm : Form
             BackColor = Color.FromArgb(11, 18, 28)
         };
 
+        // Left grid: read-only, one row per memory note, whole-row selection. Columns are filled in by hand (AutoGenerateColumns is off) and bound to MemoryRow properties by name.
         _grid = new DataGridView
         {
             Dock = DockStyle.Fill,
@@ -142,6 +157,7 @@ internal sealed class MemoryWorkbenchForm : Form
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(MemoryRow.Due), HeaderText = "Due", Width = 120 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(MemoryRow.Retention), HeaderText = "Retention", Width = 96 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(MemoryRow.Content), HeaderText = "Content", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
+        // Show the selected note in the editor.
         _grid.SelectionChanged += (_, _) => OnGridSelectionChanged();
 
         split.Panel1.Controls.Add(_grid);
@@ -152,6 +168,7 @@ internal sealed class MemoryWorkbenchForm : Form
         Controls.Add(root);
     }
 
+    // Right panel: a two-column form (label, field) with 11 rows.
     private Control BuildEditorPanel()
     {
         var panel = new Panel
@@ -170,6 +187,7 @@ internal sealed class MemoryWorkbenchForm : Form
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 124));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
 
+        // Row 2 (Content) takes all spare height; the rest are a fixed 44 pixels.
         for (var index = 0; index < 11; index++)
         {
             layout.RowStyles.Add(new RowStyle(index == 2 ? SizeType.Percent : SizeType.Absolute, index == 2 ? 100 : 44));
@@ -182,9 +200,11 @@ internal sealed class MemoryWorkbenchForm : Form
         _categoryBox = CreateTextBox();
         _tagsBox = CreateTextBox();
         _reminderTextBox = CreateTextBox();
+        // Allowed values for the drop-downs. They must match what the memory store understands.
         _kindComboBox = CreateComboBox(["note", "preference", "entity", "relationship", "episodic", "summary", "reminder"]);
         _retentionComboBox = CreateComboBox(["standard", "short", "episodic", "rolling", "long", "forever", "until-complete"]);
         _privacyComboBox = CreateComboBox(["persistent", "private"]);
+        // Importance is stored as 0 to 1 but edited as 5 to 100 in steps of 5 (see PopulateEditor and SaveSelectedMemoryAsync).
         _importanceUpDown = new NumericUpDown
         {
             Dock = DockStyle.Left,
@@ -221,6 +241,7 @@ internal sealed class MemoryWorkbenchForm : Form
         return panel;
     }
 
+    // Group the reminder text, reminder time, privacy and approval checkbox into one cell.
     private Control BuildReminderPanel()
     {
         var panel = new TableLayoutPanel
@@ -242,6 +263,7 @@ internal sealed class MemoryWorkbenchForm : Form
         return panel;
     }
 
+    // Reload every active note from the assistant and refill the grid, selecting the first row.
     private async Task RefreshMemoriesAsync()
     {
         SetBusy(true);
@@ -249,6 +271,7 @@ internal sealed class MemoryWorkbenchForm : Form
         try
         {
             _memories = (await _assistant.GetMemoriesAsync(_cancellationTokenSource.Token)).ToList();
+            // Show the reminder text instead of the content for notes that are reminders; Due is the reminder time in local time.
             _gridBinding.DataSource = _memories.Select(note => new MemoryRow(
                 ShortId(note.Id),
                 note.Id,
@@ -269,6 +292,7 @@ internal sealed class MemoryWorkbenchForm : Form
                 PopulateEditor(null);
             }
         }
+        // Window closed mid-load: ignore.
         catch (OperationCanceledException)
         {
         }
@@ -283,6 +307,7 @@ internal sealed class MemoryWorkbenchForm : Form
         }
     }
 
+    // When the user picks a row, find the full note it came from and show it in the editor.
     private void OnGridSelectionChanged()
     {
         if (_isLoadingSelection || _grid.CurrentRow?.DataBoundItem is not MemoryRow row)
@@ -294,8 +319,10 @@ internal sealed class MemoryWorkbenchForm : Form
         PopulateEditor(note);
     }
 
+    // Fill the editor from a note, or reset it to blanks when there is none.
     private void PopulateEditor(MemoryNote? note)
     {
+        // Block OnGridSelectionChanged from reacting to our own changes.
         _isLoadingSelection = true;
 
         try
@@ -331,8 +358,10 @@ internal sealed class MemoryWorkbenchForm : Form
             SelectComboValue(_kindComboBox, note.Kind, "note");
             SelectComboValue(_retentionComboBox, note.RetentionPolicy, "standard");
             SelectComboValue(_privacyComboBox, note.Privacy, "persistent");
+            // Importance 0.0 to 1.0 becomes 5 to 100, kept inside the box's limits.
             _importanceUpDown.Value = Math.Clamp((decimal)Math.Round(note.ImportanceScore * 100d), 5, 100);
             _expiryPicker.Checked = note.ExpiresAtUtc is not null;
+            // Date pickers need a value even when unchecked; unchecked means "no expiry/reminder".
             _expiryPicker.Value = (note.ExpiresAtUtc ?? DateTimeOffset.Now).ToLocalTime().DateTime;
             _reminderPicker.Checked = note.ReminderAtUtc is not null;
             _reminderPicker.Value = (note.ReminderAtUtc ?? DateTimeOffset.Now).ToLocalTime().DateTime;
@@ -344,8 +373,10 @@ internal sealed class MemoryWorkbenchForm : Form
         }
     }
 
+    // Save the editor's contents back to the selected note.
     private async Task SaveSelectedMemoryAsync()
     {
+        // Nothing selected: nothing to save.
         if (string.IsNullOrWhiteSpace(_idLabel.Text) || _idLabel.Text == "No selection")
         {
             return;
@@ -355,6 +386,7 @@ internal sealed class MemoryWorkbenchForm : Form
 
         try
         {
+            // Collect all fields into an update request. A reminder is marked "pending" when it has a time, so it will fire.
             var request = new MemoryUpdateRequest(
                 _idLabel.Text,
                 _contentBox.Text.Trim(),
@@ -372,6 +404,7 @@ internal sealed class MemoryWorkbenchForm : Form
 
             var updated = await _assistant.UpdateMemoryAsync(request, _cancellationTokenSource.Token);
 
+            // The note was deleted elsewhere in the meantime.
             if (updated is null)
             {
                 _statusLabel.Text = "Selected memory no longer exists.";
@@ -394,6 +427,7 @@ internal sealed class MemoryWorkbenchForm : Form
         }
     }
 
+    // "Forget" removes the note from active recall (after asking the user to confirm).
     private async Task ForgetSelectedMemoryAsync()
     {
         if (string.IsNullOrWhiteSpace(_idLabel.Text) || _idLabel.Text == "No selection")
@@ -434,6 +468,7 @@ internal sealed class MemoryWorkbenchForm : Form
         }
     }
 
+    // Disable the buttons and show the wait cursor during a load, save or forget.
     private void SetBusy(bool isBusy)
     {
         _refreshButton.Enabled = !isBusy;
@@ -442,6 +477,7 @@ internal sealed class MemoryWorkbenchForm : Form
         Cursor = isBusy ? Cursors.WaitCursor : Cursors.Default;
     }
 
+    // Add a label (left) and its control (right) to one editor row.
     private static void AddEditorRow(TableLayoutPanel layout, int row, string label, Control control)
     {
         var header = new Label
@@ -458,6 +494,7 @@ internal sealed class MemoryWorkbenchForm : Form
         layout.Controls.Add(control, 1, row);
     }
 
+    // The remaining helpers create the dark-themed controls with a shared look.
     private static Button CreateButton(string text)
     {
         return new Button
@@ -525,6 +562,7 @@ internal sealed class MemoryWorkbenchForm : Form
         };
     }
 
+    // "a, b, A" becomes ["a", "b"]: split on commas, trim, drop empties, and drop duplicates ignoring case.
     private static string[] ParseTags(string value)
     {
         return value
@@ -533,6 +571,7 @@ internal sealed class MemoryWorkbenchForm : Form
             .ToArray();
     }
 
+    // Pick the combo item matching the value (ignoring case), otherwise the first item.
     private static void SelectComboValue(ComboBox comboBox, string? value, string fallback)
     {
         var target = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
@@ -543,11 +582,13 @@ internal sealed class MemoryWorkbenchForm : Form
         comboBox.SelectedIndex = index;
     }
 
+    // First 8 characters of an id, for display.
     private static string ShortId(string id)
     {
         return string.IsNullOrWhiteSpace(id) ? "n/a" : id.Length <= 8 ? id : id[..8];
     }
 
+    // One grid row: Id (short), FullId (used to look the note up again), and the shown columns. FullId has no column.
     private sealed record MemoryRow(
         string Id,
         string FullId,

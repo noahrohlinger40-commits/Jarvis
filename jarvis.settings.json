@@ -1,11 +1,4 @@
 {
-  "localAiOnly": true,
-  "modelMaxConcurrentRequests": 1,
-  "plannerMaxConcurrentBackgroundTasks": 2,
-  "plannerLocalCpuThreads": 2,
-  "brainContextEnabled": true,
-  "brainWorkspacePath": "C:\\Users\\NoahR\\Desktop\\Brain",
-  "brainContextMaxCharacters": 2400,
   "assistantName": "Jarvis",
   "assistantPersona": "Fun, upbeat",
   "assistantPresencePreset": "baseline",
@@ -44,7 +37,16 @@
     "spottify": "spotify:",
     "spot if i": "spotify:"
   },
+  "siteAliases": {},
+  "fileSearchRoots": [],
   "speechRecognitionCorrections": [
+    {
+      "heardText": "Jervis, open Spotify",
+      "correctedText": "open app Spotify",
+      "correctionCount": 1,
+      "lastUpdatedUtc": "2026-11-09T21:45:48.8137144+00:00",
+      "lastConfidence": 0.48190899009020244
+    },
     {
       "heardText": "Trustee here are also",
       "correctedText": "open path studio and",
@@ -54,6 +56,12 @@
     }
   ],
   "speechRecognitionRejectedPhrases": [
+    {
+      "heardText": "Jervis, open Spotify",
+      "rejectionCount": 1,
+      "lastRejectedUtc": "2026-11-09T21:45:48.8153495+00:00",
+      "lastConfidence": 0.48190899009020244
+    },
     {
       "heardText": "Trustee here are also",
       "rejectionCount": 1,
@@ -68,7 +76,7 @@
     "java\u0027s"
   ],
   "speechRecognitionWakeWordAssetPath": "data\\wake-word-assets\\jarvis-desktop.json",
-  "speechRecognitionWakeEnginePath": "",
+  "speechRecognitionWakeEnginePath": "data\\wake-engines\\openwakeword-hey-jarvis.json",
   "speechRecognitionWakeDetectionEnabled": true,
   "speechRecognitionWakeDetectionSensitivity": 0.62,
   "voiceCommandTimeoutSeconds": 8,
@@ -78,7 +86,7 @@
   "speechRecognitionSilenceDurationMilliseconds": 850,
   "speechRecognitionPreRollMilliseconds": 450,
   "speechRecognitionMinimumUtteranceMilliseconds": 180,
-  "speechRecognitionDeviceName": "Microphone Array (Intel\u00AE Smart ",
+  "speechRecognitionDeviceName": "Microphone (Jabra SPEAK 510 USB",
   "speechRecognitionPushToTalkEnabled": false,
   "speechRecognitionHotkeyEnabled": true,
   "speechRecognitionHotkey": "Control\u002BSpace",
@@ -86,9 +94,8 @@
   "speechRecognitionEchoCancellationEnabled": true,
   "speechRecognitionBargeInEnabled": false,
   "speechRecognitionBeamformingEnabled": true,
-  "speechRecognitionBeamformingProfile": "desktop",
+  "speechRecognitionBeamformingProfile": "far-field-array",
   "speechRecognitionHardwareDspProfile": "auto",
-  "speechRecognitionVendorDspProfilePath": "auto",
   "speechRecognitionCalibrationProfiles": [
     {
       "deviceName": "Headset (JLab GO Pop\u002B)",
@@ -101,8 +108,6 @@
       "recommendedTargetPeakLevel": 0.3,
       "preferredBeamformingProfile": "headset",
       "hardwareDspProfileName": "auto",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "notes": "ambient 0.2%, speech 27.2%, peak 91.1%"
     },
     {
@@ -116,24 +121,33 @@
       "recommendedTargetPeakLevel": 0.3,
       "preferredBeamformingProfile": "desktop",
       "hardwareDspProfileName": "auto",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "notes": "ambient 7.7%, speech 28.2%, peak 92.2%"
     },
     {
       "deviceName": "Microphone (Blue Snowball )",
-      "capturedUtc": "2026-09-30T14:16:14.8602802+00:00",
-      "ambientRmsLevel": 0.015651474784535893,
-      "speechRmsLevel": 0.18439665021789128,
-      "speechPeakLevel": 0.8891162109375,
+      "capturedUtc": "2026-10-23T06:22:00.0224206+00:00",
+      "ambientRmsLevel": 0.01581455556935576,
+      "speechRmsLevel": 0.13453554203234508,
+      "speechPeakLevel": 0.45421630859375,
       "recommendedVoiceActivityThreshold": 0.04,
       "recommendedInputGainCap": 1.25,
       "recommendedTargetPeakLevel": 0.3,
       "preferredBeamformingProfile": "desktop",
       "hardwareDspProfileName": "system-aec",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
-      "notes": "ambient 1.6%, speech 18.4%, peak 88.9%"
+      "notes": "ambient 1.6%, speech 13.5%, peak 45.4%"
+    },
+    {
+      "deviceName": "Microphone (Blue Snowball )",
+      "capturedUtc": "2026-11-06T06:40:49.4842375+00:00",
+      "ambientRmsLevel": 0.0015,
+      "speechRmsLevel": 0.03423493984547928,
+      "speechPeakLevel": 0.121513671875,
+      "recommendedVoiceActivityThreshold": 0.010270481953643785,
+      "recommendedInputGainCap": 3.1272201237643653,
+      "recommendedTargetPeakLevel": 0.38,
+      "preferredBeamformingProfile": "far-field-array",
+      "hardwareDspProfileName": "system-aec",
+      "notes": "ambient 0.1%, speech 3.4%, peak 12.2%"
     },
     {
       "deviceName": "Microphone (Jabra SPEAK 510 USB",
@@ -146,9 +160,20 @@
       "recommendedTargetPeakLevel": 0.3,
       "preferredBeamformingProfile": "desktop",
       "hardwareDspProfileName": "voice-processing",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "notes": "ambient 0.1%, speech 39.1%, peak 96.7%"
+    },
+    {
+      "deviceName": "Microphone (Jabra SPEAK 510 USB",
+      "capturedUtc": "2026-11-09T23:53:45.6856034+00:00",
+      "ambientRmsLevel": 0.009139429263653218,
+      "speechRmsLevel": 0.15352436279794265,
+      "speechPeakLevel": 0.7211083984375001,
+      "recommendedVoiceActivityThreshold": 0.04,
+      "recommendedInputGainCap": 1.25,
+      "recommendedTargetPeakLevel": 0.3,
+      "preferredBeamformingProfile": "far-field-array",
+      "hardwareDspProfileName": "voice-processing",
+      "notes": "ambient 0.9%, speech 15.4%, peak 72.1%"
     },
     {
       "deviceName": "Microphone (NexiGo N60 FHD Webc",
@@ -161,8 +186,6 @@
       "recommendedTargetPeakLevel": 0.3,
       "preferredBeamformingProfile": "desktop",
       "hardwareDspProfileName": "auto",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "notes": "ambient 0.1%, speech 32.3%, peak 91.2%"
     },
     {
@@ -176,8 +199,6 @@
       "recommendedTargetPeakLevel": 0.42,
       "preferredBeamformingProfile": "desktop",
       "hardwareDspProfileName": "voice-processing",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "notes": "ambient 0.1%, speech 0.1%, peak 1.3%"
     },
     {
@@ -191,9 +212,20 @@
       "recommendedTargetPeakLevel": 0.3,
       "preferredBeamformingProfile": "desktop",
       "hardwareDspProfileName": "voice-processing",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "notes": "ambient 0.1%, speech 15.4%, peak 71.0%"
+    },
+    {
+      "deviceName": "Microphone Array (Intel\u00AE Smart",
+      "capturedUtc": "2026-11-09T21:44:50.8313801+00:00",
+      "ambientRmsLevel": 0.1,
+      "speechRmsLevel": 0.2997045250494899,
+      "speechPeakLevel": 0.856292724609375,
+      "recommendedVoiceActivityThreshold": 0.04,
+      "recommendedInputGainCap": 1.25,
+      "recommendedTargetPeakLevel": 0.3,
+      "preferredBeamformingProfile": "far-field-array",
+      "hardwareDspProfileName": "voice-processing",
+      "notes": "ambient 26.6%, speech 30.0%, peak 85.6%"
     }
   ],
   "speechRecognitionValidationProfiles": [
@@ -206,8 +238,6 @@
       "wakeEnginePath": "",
       "beamformingProfileName": "desktop",
       "hardwareDspProfileName": "system-aec",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "ambientRmsLevel": 0.0070006516598003785,
       "wakePhraseRmsLevel": 0.05989105379277146,
       "commandSpeechRmsLevel": 0.08668438185548896,
@@ -226,8 +256,6 @@
       "wakeEnginePath": "",
       "beamformingProfileName": "desktop",
       "hardwareDspProfileName": "system-aec",
-      "vendorDspProfileName": "",
-      "vendorDspProfilePath": "",
       "ambientRmsLevel": 0.0015,
       "wakePhraseRmsLevel": 0.023036447687372487,
       "commandSpeechRmsLevel": 0.021567358928931257,
@@ -240,16 +268,18 @@
   ],
   "speechRecognitionMode": "full-duplex",
   "speechRecognitionPunctuationRestorationEnabled": true,
-  "clapShortcutEnabled": false,
-  "clapShortcutRequiredClapCount": 2,
-  "clapShortcutMinimumIntervalMilliseconds": 120,
-  "clapShortcutMaximumIntervalMilliseconds": 900,
-  "clapShortcutCooldownMilliseconds": 2500,
-  "clapShortcutThreshold": 0.4,
   "keepRunningInTrayOnClose": true,
   "shellExecutionEnabled": true,
   "safetyRequireApprovalForMajorActions": true,
   "safetyBlockProtectedSystemPaths": true,
+  "brainContextEnabled": true,
+  "brainWorkspacePath": "C:\\Users\\NoahR\\Desktop\\Brain",
+  "brainContextMaxCharacters": 2400,
+  "localAiOnly": true,
+  "modelMaxConcurrentRequests": 1,
+  "plannerMaxConcurrentBackgroundTasks": 2,
+  "plannerLocalCpuThreads": 2,
+  "plannerRecordLocalCalls": true,
   "plannerEnabled": true,
   "plannerProvider": "local",
   "plannerBaseUrl": "http://127.0.0.1:1234",
@@ -257,11 +287,7 @@
   "plannerFastModel": "qwen/qwen3-4b-2507",
   "plannerReasoningModel": "qwen/qwen3-4b-2507",
   "plannerVisionModel": "",
-  "plannerFastReasoningEffort": "",
-  "plannerReasoningEffort": "",
-  "plannerVisionReasoningEffort": "",
-  "plannerFallbackModels": [],
-  "plannerFallbackProviders": [],
+  "plannerDeepModel": "openai/gpt-oss-20b",
   "plannerApiKey": "",
   "plannerApiKeyCredentialTarget": "",
   "plannerApiKeyEnvironmentVariable": "",
@@ -272,7 +298,6 @@
   "plannerRecentToolResultCount": 4,
   "plannerMaxIterations": 3,
   "plannerRetryCount": 1,
-  "plannerReflectionEnabled": false,
   "plannerBackgroundTasksEnabled": true,
   "plannerWebResearchEnabled": true,
   "plannerWebResearchMaxResults": 5,
@@ -280,27 +305,11 @@
   "lectureNotesFolder": "%USERPROFILE%\\Lecture Notes",
   "visualCaptureDirectory": "data\\captures",
   "visualCaptureRetentionCount": 24,
-  "ambientContextEnabled": false,
-  "ambientWebcamFramePath": "",
-  "ambientWebcamFreshnessSeconds": 90,
-  "ambientRoomSensorSnapshotPath": "",
-  "ambientPresenceDetectionEnabled": false,
-  "ambientGestureDetectionEnabled": false,
-  "ambientFaceRecognitionEnabled": false,
-  "ambientFaceRecognitionConsentGranted": false,
-  "ambientFaceProfilesPath": "",
-  "spatialAudioCuesEnabled": false,
-  "farFieldListeningEnabled": false,
   "defaultWeatherLocation": "Tallahassee, Florida",
   "memoryFilePath": "data/memory.json",
   "transcriptFilePath": "data/transcript.jsonl",
   "agentStateFilePath": "data/agent-state.json",
   "pendingApprovalFilePath": "data/pending-approval.json",
-  "userStateFilePath": "data/user-state.json",
   "whisperModeEnabled": true,
-  "speakerVolumeMultiplier": 0.95,
-  "roomVolumeAwarenessEnabled": true,
-  "ambientNoiseSampleIntervalSeconds": 10,
-  "roomQuietThresholdRms": 0.006,
-  "roomLoudThresholdRms": 0.025
+  "speakerVolumeMultiplier": 0.95
 }

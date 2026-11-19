@@ -1,7 +1,16 @@
+// Ranks memory notes against a search query. Called only by JsonMemoryStore.SearchAsync.
+// Despite the file name this is not a neural 'semantic' search and not BM25: it is classic TF-IDF (term frequency times
+// inverse document frequency) with cosine similarity, plus hand-weighted bonus points. Steps: (1) split the text of every note
+// and the query into normalized words (lower-case, synonym-merged, lightly stemmed, stop words dropped); (2) weight each word
+// by how rare it is across all notes; (3) compare query and note as vectors; (4) add bonuses for phrase matches, similar
+// situation, importance, recency and due reminders; (5) keep notes above a small minimum score. Everything is rebuilt on every
+// search (no index is cached), which is fine for a few thousand notes.
 namespace Jarvis.Core;
 
+// Static search helpers. All weights in this file are hand-tuned guesses, not trained values.
 internal static class MemorySemanticSearch
 {
+    // Very common words ignored in matching ('the', 'my', 'what'...), because they say nothing about meaning.
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "a",
@@ -56,6 +65,7 @@ internal static class MemorySemanticSearch
         "your"
     };
 
+    // Synonym table (word -> group's first word) built once at startup; see BuildCanonicalTerms.
     private static readonly Dictionary<string, string> CanonicalTerms = BuildCanonicalTerms();
 
     public static IReadOnlyList<MemoryNote> Search(
@@ -63,6 +73,7 @@ internal static class MemorySemanticSearch
         string query,
         int maxResults)
     {
+        // Same search with the query itself as the only context.
         return Search(notes, query, maxResults, new MemoryQueryContext(query));
     }
 
@@ -72,6 +83,7 @@ internal static class MemorySemanticSearch
         int maxResults,
         MemoryQueryContext queryContext)
     {
+        // Nothing to search, or nothing asked: return no results.
         if (notes.Count == 0
             || maxResults <= 0
             || string.IsNullOrWhiteSpace(query))
@@ -79,17 +91,22 @@ internal static class MemorySemanticSearch
             return Array.Empty<MemoryNote>();
         }
 
+        // Turn the query (plus the current context words such as the active app) into normalized words.
         var queryDocument = SearchDocument.Create(BuildQueryText(query, queryContext));
 
+        // The query was only stop words or punctuation, so there is nothing to match.
         if (queryDocument.TermCounts.Count == 0 && queryDocument.Bigrams.Count == 0)
         {
             return Array.Empty<MemoryNote>();
         }
 
+        // Turn every note into the same kind of word bag.
         var documents = notes
             .Select(note => new ScoredDocument(note, SearchDocument.Create(BuildDocumentText(note))))
             .ToArray();
+        // Count in how many notes each word appears; rare words will count for more.
         var documentFrequency = BuildDocumentFrequency(documents.Select(item => item.Document));
+        // Weighted word vector for the query; its length (norm) is needed for cosine similarity.
         var queryVector = BuildVector(queryDocument, documentFrequency, documents.Length);
         var queryVectorNorm = ComputeVectorNorm(queryVector);
 
@@ -98,9 +115,11 @@ internal static class MemorySemanticSearch
             return Array.Empty<MemoryNote>();
         }
 
+        // Notes scoring below this are dropped, so unrelated notes do not come back as results.
         var minimumScore = GetMinimumScore(queryDocument);
         var now = DateTimeOffset.UtcNow;
 
+        // Score every note, drop the weak ones, best first (newer first on ties), keep the top maxResults.
         return documents
             .Select(item => new
             {
@@ -125,6 +144,7 @@ internal static class MemorySemanticSearch
             .ToArray();
     }
 
+    // For each word or word pair, the number of notes containing it at least once.
     private static Dictionary<string, int> BuildDocumentFrequency(IEnumerable<SearchDocument> documents)
     {
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -145,6 +165,9 @@ internal static class MemorySemanticSearch
         return counts;
     }
 
+    // Weight of each word = (1 + ln(count in this text)) * IDF, so repeating a word helps only a little and rare words count more.
+    // Words containing digits get +10% (numbers, dates and codes are specific). Word pairs get weight 1.35 * IDF, so matching a pair
+    // in order counts more than two loose words.
     private static Dictionary<string, double> BuildVector(
         SearchDocument document,
         IReadOnlyDictionary<string, int> documentFrequency,
@@ -173,6 +196,8 @@ internal static class MemorySemanticSearch
         return vector;
     }
 
+    // Final score for one note. The first part is the cosine similarity between query and note vectors (0 to 1, how much their weighted
+    // words overlap). Then bonus points are added, listed below with their maximum sizes.
     private static double Score(
         SearchDocument document,
         SearchDocument query,
@@ -185,6 +210,7 @@ internal static class MemorySemanticSearch
         MemoryNote note,
         MemoryQueryContext queryContext)
     {
+        // Same weighting for the note, so both vectors are comparable.
         var documentVector = BuildVector(document, documentFrequency, totalDocuments);
         var documentVectorNorm = ComputeVectorNorm(documentVector);
 
@@ -193,13 +219,18 @@ internal static class MemorySemanticSearch
             return 0;
         }
 
+        // Cosine similarity = dot product / (length of query vector * length of note vector).
         var cosineSimilarity = ComputeDotProduct(queryVector, documentVector) / (queryVectorNorm * documentVectorNorm);
+        // How many distinct query words / word pairs appear in the note.
         var matchedTerms = query.TermCounts.Keys.Count(document.TermCounts.ContainsKey);
         var matchedBigrams = query.Bigrams.Count(document.Bigrams.Contains);
+        // True if the whole normalized query appears as one run of words inside the note.
         var phraseMatch = !string.IsNullOrWhiteSpace(query.SearchText)
             && document.SearchText.Contains(query.SearchText, StringComparison.Ordinal);
+        // Fuzzy spelling similarity: shared 3-letter chunks, so 'calender' still resembles 'calendar'.
         var trigramDice = ComputeDiceCoefficient(query.CharacterTrigrams, document.CharacterTrigrams);
 
+        // Early exit: no word, pair, phrase or fuzzy overlap at all, so score 0 so unrelated notes do not collect the importance and recency bonuses.
         if (cosineSimilarity <= 0
             && matchedTerms == 0
             && matchedBigrams == 0
@@ -209,24 +240,34 @@ internal static class MemorySemanticSearch
             return 0;
         }
 
+        // Up to +0.24 for the share of query words found in the note.
         var termCoverageBonus = query.TermCounts.Count == 0
             ? 0
             : 0.24d * matchedTerms / query.TermCounts.Count;
+        // Up to +0.18 for the share of query word pairs found in the note.
         var bigramBonus = query.Bigrams.Count == 0
             ? 0
             : 0.18d * matchedBigrams / query.Bigrams.Count;
+        // +0.35 if the whole query appears as a phrase.
         var phraseBonus = phraseMatch ? 0.35d : 0;
+        // Up to +0.16 from the fuzzy trigram similarity.
         var fuzzyBonus = 0.16d * trigramDice;
+        // Recency: +0.08 for a brand-new note, halving at 30 days old and shrinking from there (0.08 / (1 + days/30)).
         var ageInDays = Math.Max(0, (now - createdAtUtc).TotalDays);
         var recencyBonus = 0.08d / (1d + ageInDays / 30d);
+        // Bonus for notes learned in a similar situation (same app, place, time of day...).
         var contextBonus = ComputeContextBonus(note.Context, queryContext);
+        // Small bonus for relationships, entities, reminders, and for preferences whose category is named in the query.
         var categoryBonus = ComputeCategoryBonus(note, queryContext);
+        // Up to +0.22 from the note's importance score.
         var importanceBonus = 0.22d * Math.Clamp(note.ImportanceScore, 0d, 1d);
+        // Bonus for reminders that are due soon or overdue.
         var reminderBonus = ComputeReminderBonus(note, now, query);
 
         return cosineSimilarity + termCoverageBonus + bigramBonus + phraseBonus + fuzzyBonus + recencyBonus + contextBonus + categoryBonus + importanceBonus + reminderBonus;
     }
 
+    // Sum of weight products over words both vectors share. Loops over the smaller vector for speed.
     private static double ComputeDotProduct(
         IReadOnlyDictionary<string, double> left,
         IReadOnlyDictionary<string, double> right)
@@ -249,12 +290,15 @@ internal static class MemorySemanticSearch
         return sum;
     }
 
+    // Length of a vector: square root of the sum of squared weights.
     private static double ComputeVectorNorm(IReadOnlyDictionary<string, double> vector)
     {
         var sum = vector.Values.Sum(weight => weight * weight);
         return Math.Sqrt(sum);
     }
 
+    // How rare a word is: ln(1 + (N + 1) / (df + 0.5)) + 1, where N = number of notes and df = notes containing the word.
+    // The value never drops below 1, and a word that appears in no note gets the highest value.
     private static double ComputeInverseDocumentFrequency(
         IReadOnlyDictionary<string, int> documentFrequency,
         string term,
@@ -264,6 +308,7 @@ internal static class MemorySemanticSearch
         return Math.Log(1d + (totalDocuments + 1d) / (frequency + 0.5d)) + 1d;
     }
 
+    // Dice similarity of two sets: 2 * shared / (size A + size B). 1 = identical, 0 = nothing in common.
     private static double ComputeDiceCoefficient(
         IReadOnlySet<string> left,
         IReadOnlySet<string> right)
@@ -280,6 +325,7 @@ internal static class MemorySemanticSearch
         return 2d * intersection / (left.Count + right.Count);
     }
 
+    // Cut-off score: shorter queries (fewer words and pairs) need a slightly higher score, because one word alone is weaker evidence.
     private static double GetMinimumScore(SearchDocument query)
     {
         var signalCount = query.TermCounts.Count + query.Bigrams.Count;
@@ -292,15 +338,18 @@ internal static class MemorySemanticSearch
         };
     }
 
+    // Adds 1 to a counter in a dictionary, starting at 1.
     private static void Increment(IDictionary<string, int> counts, string key)
     {
         counts[key] = counts.TryGetValue(key, out var value) ? value + 1 : 1;
     }
 
+    // Prefix that keeps word-pair keys from colliding with single-word keys in the same dictionary.
     private static string BigramKey(string value) => "bigram:" + value;
 
     private static bool ContainsDigit(string value) => value.Any(char.IsDigit);
 
+    // Gathers everything searchable about a note into one string: its text, kind, category, tags, context, entity details and reminder text.
     private static string BuildDocumentText(MemoryNote note)
     {
         var parts = new List<string>
@@ -345,6 +394,7 @@ internal static class MemorySemanticSearch
         return string.Join(' ', parts);
     }
 
+    // The query plus the current context words (time of day, place, app, window, recent activity).
     private static string BuildQueryText(string query, MemoryQueryContext context)
     {
         var parts = new List<string>
@@ -361,6 +411,7 @@ internal static class MemorySemanticSearch
         return string.Join(' ', parts);
     }
 
+    // Adds a trimmed value unless it is blank.
     private static void AddIfPresent(ICollection<string> parts, string? value)
     {
         if (!string.IsNullOrWhiteSpace(value))
@@ -369,6 +420,7 @@ internal static class MemorySemanticSearch
         }
     }
 
+    // Adds each non-blank value from a possibly-null list.
     private static void AddRange(ICollection<string> parts, IEnumerable<string>? values)
     {
         if (values is null)
@@ -382,6 +434,8 @@ internal static class MemorySemanticSearch
         }
     }
 
+    // Compares where/when the note was learned with the current situation: exact matches give time of day +0.08, location +0.12,
+    // active app +0.14, window +0.08 (about half that for a partial match), plus up to +0.12 for shared recent activities.
     private static double ComputeContextBonus(InteractionContextSnapshot? noteContext, MemoryQueryContext queryContext)
     {
         if (noteContext is null)
@@ -407,6 +461,7 @@ internal static class MemorySemanticSearch
         return bonus;
     }
 
+    // Notes of kind relationship/entity/reminder get +0.08/+0.06/+0.05; preferences get +0.08 if the query mentions their category, otherwise +0.03.
     private static double ComputeCategoryBonus(MemoryNote note, MemoryQueryContext queryContext)
     {
         if (!string.Equals(note.Kind, "preference", StringComparison.OrdinalIgnoreCase))
@@ -430,6 +485,7 @@ internal static class MemorySemanticSearch
         return query.Contains(note.Category, StringComparison.OrdinalIgnoreCase) ? 0.08d : 0.03d;
     }
 
+    // Pending reminders: +0.08 if due within 24 hours, +0.08 more if already overdue, +0.06 if the query asks about today, tomorrow, reminders or due dates.
     private static double ComputeReminderBonus(MemoryNote note, DateTimeOffset now, SearchDocument query)
     {
         if (note.ReminderAtUtc is not DateTimeOffset reminderAtUtc
@@ -462,6 +518,7 @@ internal static class MemorySemanticSearch
         return bonus;
     }
 
+    // Returns the exact bonus when two texts match after normalization, the smaller partial bonus when one contains the other, else 0.
     private static double ComputeStringMatchBonus(string left, string right, double exactBonus, double partialBonus)
     {
         if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
@@ -482,11 +539,13 @@ internal static class MemorySemanticSearch
             : 0;
     }
 
+    // Equal after lower-casing and stripping punctuation.
     private static bool IsLooseMatch(string left, string right)
     {
         return string.Equals(NormalizeLooseText(left), NormalizeLooseText(right), StringComparison.Ordinal);
     }
 
+    // Lower-case, punctuation to spaces, collapse repeated spaces.
     private static string NormalizeLooseText(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -503,12 +562,13 @@ internal static class MemorySemanticSearch
         return string.Join(' ', new string(characters).Split(' ', StringSplitOptions.RemoveEmptyEntries));
     }
 
+    // Builds the synonym table. Each group below maps all its words to the group's FIRST word, so a query for 'doctor appointment'
+    // can find a note saying 'physician visit'. A word must sit in only one group, or the later group wins and splits the two.
     private static Dictionary<string, string> BuildCanonicalTerms()
     {
         var groups = new[]
         {
-            new[] { "appointment", "meeting", "session", "consultation", "visit" },
-            new[] { "meeting", "sync", "standup", "checkin", "1on1", "oneonone" },
+            new[] { "appointment", "meeting", "session", "consultation", "visit", "sync", "standup", "checkin", "1on1", "oneonone" },
             new[] { "todo", "task", "chore", "errand", "assignment", "homework" },
             new[] { "buy", "purchase", "order", "pickup", "pick", "grab" },
             new[] { "fix", "repair", "resolve", "patch" },
@@ -547,8 +607,10 @@ internal static class MemorySemanticSearch
         return map;
     }
 
+    // A piece of text prepared for matching: word counts, word pairs, 3-letter chunks and the normalized text.
     private sealed class SearchDocument
     {
+        // Private: build instances with Create.
         private SearchDocument(
             Dictionary<string, int> termCounts,
             HashSet<string> bigrams,
@@ -561,14 +623,19 @@ internal static class MemorySemanticSearch
             SearchText = searchText;
         }
 
+        // How many times each normalized word occurs.
         public Dictionary<string, int> TermCounts { get; }
 
+        // Neighboring word pairs in order, written as 'first|second'.
         public HashSet<string> Bigrams { get; }
 
+        // Every 3-letter chunk of the text with spaces removed, used for fuzzy matching.
         public HashSet<string> CharacterTrigrams { get; }
 
+        // The normalized words joined by single spaces, used for whole-phrase matching.
         public string SearchText { get; }
 
+        // Normalizes the text into words and builds all the views above.
         public static SearchDocument Create(string text)
         {
             var tokens = ExtractTokens(text);
@@ -585,6 +652,7 @@ internal static class MemorySemanticSearch
             return new SearchDocument(termCounts, bigrams, characterTrigrams, searchText);
         }
 
+        // Splits text into runs of letters and digits (anything else separates words) and normalizes each run.
         private static List<string> ExtractTokens(string text)
         {
             var tokens = new List<string>();
@@ -605,6 +673,7 @@ internal static class MemorySemanticSearch
             FlushBuffer();
             return tokens;
 
+            // Finishes the word collected so far, normalizes it, and keeps it unless it was dropped.
             void FlushBuffer()
             {
                 if (length == 0)
@@ -623,6 +692,7 @@ internal static class MemorySemanticSearch
             }
         }
 
+        // Synonym-map, stem, synonym-map again; then drop stop words and one-letter words (words with digits are always kept).
         private static string NormalizeToken(string token)
         {
             if (string.IsNullOrWhiteSpace(token))
@@ -652,6 +722,7 @@ internal static class MemorySemanticSearch
             return value;
         }
 
+        // Replaces a word by its synonym group's first word if it has one.
         private static string Canonicalize(string token)
         {
             return CanonicalTerms.TryGetValue(token, out var canonical)
@@ -659,6 +730,9 @@ internal static class MemorySemanticSearch
                 : token;
         }
 
+        // A very small home-made stemmer that strips common endings so 'reminders', 'reminded' and 'reminding' match. It is cruder than a
+        // real stemmer (for example 'organization' becomes 'organize', 'information' becomes 'informate'), but since the query and the notes are
+        // both stemmed the same way, the results still line up.
         private static string Stem(string token)
         {
             if (token.Length <= 3)
@@ -736,6 +810,7 @@ internal static class MemorySemanticSearch
             return token;
         }
 
+        // After removing '-ing'/'-ed', undoes a doubled consonant ('running' -> 'runn' -> 'run').
         private static string TrimDoubleEnding(string token)
         {
             if (token.Length >= 2
@@ -748,6 +823,7 @@ internal static class MemorySemanticSearch
             return token;
         }
 
+        // Pairs of neighboring words, in order.
         private static HashSet<string> BuildBigrams(IReadOnlyList<string> tokens)
         {
             var bigrams = new HashSet<string>(StringComparer.Ordinal);
@@ -760,6 +836,7 @@ internal static class MemorySemanticSearch
             return bigrams;
         }
 
+        // All overlapping 3-character slices, ignoring whitespace.
         private static HashSet<string> BuildCharacterTrigrams(string text)
         {
             var source = string.Concat(text.Where(character => !char.IsWhiteSpace(character)));
@@ -779,5 +856,6 @@ internal static class MemorySemanticSearch
         }
     }
 
+    // A note paired with its prepared word data.
     private sealed record ScoredDocument(MemoryNote Note, SearchDocument Document);
 }

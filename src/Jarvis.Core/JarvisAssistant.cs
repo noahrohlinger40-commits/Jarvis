@@ -1,36 +1,71 @@
+// JarvisAssistant is the front door of Jarvis.Core: the app's UI or voice code hands it one line of text and gets back
+// one AssistantTurn (the reply plus bookkeeping). This is where to start reading.
+// Path of one request, in order:
+// 1. HandleAsync (below) cleans the input: finishes a pending follow-up, removes "hey Jarvis", works out privacy
+// (MemoryAutomation) and maps wording to a command name (JarvisCommandCatalog.NormalizeToCommand).
+// 2. A pending approval ("yes" / "no" to a risky action asked about earlier) is handled first.
+// 3. If a built-in tool recognises the text (tool.CanHandle, the list built in the constructor), that tool runs directly.
+// Every tool call goes through ExecuteToolWithSafetyAsync, which asks ToolSafetyService to allow, block or require approval.
+// 4. Otherwise a small social reply ("good morning") may be answered, or the text goes to the planner
+// (HandleWithPlannerAsync -> AssistantPlanner.cs). The planner may classify the request (AssistantPlanner.Intents.cs),
+// build prompts (AssistantPlanner.Formatting.cs), call the language model, a local server such as Jarvis's own llama-server or LM Studio (AssistantPlanner.ModelCalls.cs),
+// and run the tools the model picks by calling back into ExecutePlannerToolAsync here (tool-call parsing is in
+// AssistantPlanner.ToolCalling.cs, multi-part requests in AssistantPlanner.Checklist.cs). ActionClaimGuard.cs catches replies
+// that claim an action no tool performed.
+// 5. The reply is styled (AssistantPresenceStyle), saved to short-term state (ConversationState.cs), the transcript and
+// long-term memory (unless the turn was private), and returned as an AssistantTurn (AssistantTurn.cs). SpokenReply decides
+// what part is read aloud. Progress messages go out through the Activity event during all of this.
 namespace Jarvis.Core;
 
+// The assistant object: owns the tool list, the planner, memory and transcript stores, and the approval and safety services.
 public sealed class JarvisAssistant
 {
     private readonly ToolContext _toolContext;
-    private readonly IMemoryStore _memoryStore;
-    private readonly ITranscriptStore _transcriptStore;
+    private readonly JsonMemoryStore _memoryStore;
+    private readonly JsonLineTranscriptStore _transcriptStore;
     private readonly IAgentStateStore _agentStateStore;
     private readonly IReadOnlyList<IAssistantTool> _tools;
     private readonly IAssistantPlanner _planner;
     private readonly IPendingApprovalStore _pendingApprovalStore;
     private readonly ToolSafetyService _toolSafety;
-    private readonly IUserStateProvider _userStateProvider;
     private readonly ShortTermConversationState _conversationState = new();
+    // How long (30 seconds) a "what should I write down?" style question stays open; after that the next input is treated as a new request.
     private static readonly TimeSpan FollowUpCommandLifetime = TimeSpan.FromSeconds(30);
+    // Answers that cancel a pending follow-up question instead of completing it.
     private static readonly HashSet<string> FollowUpCancelPhrases = new(StringComparer.OrdinalIgnoreCase)
     {
         "cancel", "never mind", "nevermind", "forget it", "no", "stop"
     };
+    // The command waiting for the user's answer, and when it was asked.
     private (string Command, DateTimeOffset AskedUtc)? _pendingFollowUpCommand;
+
+    // Prompt-injection guard: has this turn's planner read outside content (see ToolSafetyService.ReadsOutsideContent)?
+    // Turns run concurrently, so HandleAsync gives each its own box. A box is needed because a value set in a child
+    // async method does not flow back to its caller; tools set the flag on the shared box instead. Background
+    // workflows queued by a turn run on a copy of its context, so they share its box and start with its mark.
+    // Shared flag for one turn: set once any tool has read outside content (a web page, mail...). Afterwards actions that
+    // change things ask for approval, so text from a page cannot silently make Jarvis act. volatile because tools and the turn may run on different threads.
+    private sealed class OutsideReadMark { public volatile bool Read; }
+    // Holds the current turn's mark; AsyncLocal gives each concurrent turn its own value.
+    private readonly AsyncLocal<OutsideReadMark?> _outsideRead = new();
     private readonly ILectureRecorder? _lectureRecorder;
 
+    // True while a lecture recording is in progress.
     public bool IsRecordingLecture => _lectureRecorder?.IsRecording == true;
 
+    // Optional tutor service, exposed for the UI.
+    public ITutorService? Tutor { get; }
+
+    // Wires everything together and registers every tool. The order of the tool list matters: HandleAsync uses the first tool whose
+    // CanHandle accepts the text, so earlier tools take priority over later ones.
     public JarvisAssistant(
         JarvisOptions options,
-        IMemoryStore memoryStore,
+        JsonMemoryStore memoryStore,
         IDesktopAutomationService desktopAutomation,
         IWeatherService weatherService,
-        IUserStateProvider userStateProvider,
         IWebResearchService webResearchService,
         IVisualContextService visualContextService,
-        ITranscriptStore transcriptStore,
+        JsonLineTranscriptStore transcriptStore,
         IAgentStateStore agentStateStore,
         IAssistantPlanner planner,
         IPendingApprovalStore pendingApprovalStore,
@@ -38,8 +73,10 @@ public sealed class JarvisAssistant
         string workspaceRoot,
         IModelGateway? modelGateway = null,
         IBrowserPageReader? browserPageReader = null,
-        ILectureRecorder? lectureRecorder = null)
+        ILectureRecorder? lectureRecorder = null,
+        ITutorService? tutor = null)
     {
+        Tutor = tutor;
         Options = options;
         _lectureRecorder = lectureRecorder;
         _agentStateStore = agentStateStore;
@@ -47,24 +84,29 @@ public sealed class JarvisAssistant
         _memoryStore = memoryStore;
         _pendingApprovalStore = pendingApprovalStore;
         _toolSafety = toolSafety;
-        _userStateProvider = userStateProvider;
+        // The shared context object every tool receives when it runs.
         _toolContext = new ToolContext(
             options,
             memoryStore,
             transcriptStore,
             desktopAutomation,
             weatherService,
-            userStateProvider,
             webResearchService,
             visualContextService,
             workspaceRoot,
             planner.IsAvailable,
-            planner.Status,
-            ExecuteAutomationCommandFromContextAsync);
+            planner.Status)
+        {
+            // A note is saved outside Jarvis, so off-the-record and sensitive turns stay out of it.
+            RecentTurns = count => _conversationState.GetSnapshot(count).Entries.Where(entry => !entry.IsPrivate).ToArray()
+        };
         _transcriptStore = transcriptStore;
 
+        // Register the built-in tools. The help tool receives a function that returns the list so it can describe all of them.
         var tools = new List<IAssistantTool>();
         tools.Add(new HelpTool(() => tools));
+        // Early on purpose: while a lesson runs, `next` is the tutor's, not the media tool's.
+        tools.Add(new TeachTool(tutor));
         tools.Add(new BrainTool(modelGateway));
         tools.Add(new StatusTool());
         tools.Add(new TimeTool());
@@ -76,10 +118,6 @@ public sealed class JarvisAssistant
         tools.Add(new MemoryProfileTool());
         tools.Add(new MemoryTool());
         tools.Add(new PrivacyTool());
-        tools.Add(new ExportMemoriesTool());
-        tools.Add(new ImportMemoriesTool());
-        tools.Add(new ExportTranscriptsTool());
-        tools.Add(new ImportTranscriptsTool());
         tools.Add(new WeatherTool());
         tools.Add(new WriteDownTool(modelGateway));
         tools.Add(new CalendarTool());
@@ -127,13 +165,9 @@ public sealed class JarvisAssistant
         tools.Add(new MediaTool());
         tools.Add(new ClipboardTool());
         tools.Add(new NotifyTool());
-        tools.Add(new MacroTool());
         tools.Add(new WaitTool());
-        tools.Add(new EmailTool());
-        tools.Add(new TasksTool());
         tools.Add(new ResearchTool());
         tools.Add(new ScreenTool());
-        tools.Add(new AmbientTool());
         tools.Add(new AnalyzeImageTool());
         tools.Add(new AnalyzeDocumentTool());
         tools.Add(new ShellTool());
@@ -141,10 +175,13 @@ public sealed class JarvisAssistant
         _tools = tools;
     }
 
+    // The settings this assistant was built with.
     public JarvisOptions Options { get; }
 
+    // Raised with progress messages ("Running browse", warnings, errors) for the UI to show, while a request is being handled.
     public event EventHandler<AssistantActivityEventArgs>? Activity;
 
+    // Thin pass-throughs that let the UI read memory, sessions and approvals without touching the stores directly.
     public Task<PendingApprovalAction?> GetPendingApprovalAsync(CancellationToken cancellationToken) =>
         _pendingApprovalStore.GetAsync(cancellationToken);
 
@@ -163,15 +200,13 @@ public sealed class JarvisAssistant
     public Task<IReadOnlyList<MemoryNote>> GetPendingRemindersAsync(CancellationToken cancellationToken) =>
         _memoryStore.GetPendingRemindersAsync(32, cancellationToken);
 
-    public Task<MemoryNote?> GetMemoryByIdAsync(string id, CancellationToken cancellationToken) =>
-        _memoryStore.GetByIdAsync(id, cancellationToken);
-
     public Task<MemoryNote?> UpdateMemoryAsync(MemoryUpdateRequest request, CancellationToken cancellationToken) =>
         _memoryStore.UpdateAsync(request, cancellationToken);
 
     public Task<bool> ForgetMemoryAsync(string id, string reason, CancellationToken cancellationToken) =>
         _memoryStore.ForgetAsync(id, reason, cancellationToken);
 
+    // Called once at startup; lets the planner announce unfinished workflows. Does nothing when the planner is disabled.
     public Task InitializeAsync(CancellationToken cancellationToken)
     {
         if (!_planner.IsAvailable)
@@ -182,10 +217,16 @@ public sealed class JarvisAssistant
         return _planner.InitializeAsync(ExecutePlannerToolAsync, CreateActivityProgress(), cancellationToken);
     }
 
+    // Handles one user input from start to finish and returns the finished turn. See the header for the overall route.
     public async Task<AssistantTurn> HandleAsync(string input, CancellationToken cancellationToken)
     {
+        // Fresh prompt-injection flag for this turn.
+        _outsideRead.Value = new OutsideReadMark();
+        // If the previous reply asked for the rest of a command, this input is the answer.
         input = CompletePendingFollowUpCommand(input, out var cancelledFollowUp);
+        // Works out what the turn should be saved as: the effective text and whether it is private ("off the record").
         var persistencePlan = MemoryAutomation.PrepareTurn(input);
+        // Removes the wake phrase and maps loose wording to a command name.
         var normalizedInput = NormalizeInput(persistencePlan.EffectiveInput);
         ToolResult result;
         AgentIntentKind intent = AgentIntentKind.DirectTool;
@@ -195,6 +236,8 @@ public sealed class JarvisAssistant
         AssistantCitation[] citations = [];
         MemoryProfileSnapshot? memoryProfile = null;
 
+        // Choose who produces the reply: an empty input, a cancelled follow-up, a private "remember" command, a pending approval,
+        // a directly matched tool, a social reply, or the planner.
         if (string.IsNullOrWhiteSpace(normalizedInput))
         {
             result = new ToolResult($"{Options.AssistantName} online. Use `help` to inspect the current command surface.");
@@ -203,6 +246,7 @@ public sealed class JarvisAssistant
         {
             result = new ToolResult("Okay, never mind.");
         }
+        // A "remember ..." command in an off-the-record turn is acknowledged but not saved.
         else if (!persistencePlan.PersistAutomaticMemory && LooksLikeRememberCommand(normalizedInput))
         {
             result = new ToolResult(
@@ -212,6 +256,7 @@ public sealed class JarvisAssistant
         }
         else
         {
+            // A waiting "may I do this?" question takes priority: the user's yes or no answers it.
             var pendingApprovalOutcome = await TryHandlePendingApprovalAsync(normalizedInput, cancellationToken);
 
             if (pendingApprovalOutcome is not null)
@@ -225,9 +270,11 @@ public sealed class JarvisAssistant
             }
             else
             {
+                // First tool that claims the input handles it directly, with no model involved.
                 var tool = _tools.FirstOrDefault(candidate => candidate.CanHandle(normalizedInput));
                 if (tool is null)
                 {
+                    // No tool matched: try a built-in social reply, otherwise ask the planner.
                     memoryProfile = await _memoryStore.GetProfileAsync(cancellationToken);
                     var preferredUserAddress = AssistantPersonaConfiguration.ResolvePreferredUserAddress(Options, memoryProfile);
 
@@ -257,6 +304,7 @@ public sealed class JarvisAssistant
                 }
                 else
                 {
+                    // A tool matched: run it through the safety check.
                     var toolInput = ToolInputHelper.GetCommandTail(normalizedInput, tool.Name);
 
                     EmitActivity(new AssistantActivityEvent(
@@ -271,6 +319,7 @@ public sealed class JarvisAssistant
 
                     result = await ExecuteToolWithSafetyAsync(tool, normalizedInput, input, cancellationToken);
 
+                    // The tool asked a question and needs the next input as its answer; remember the command for CompletePendingFollowUpCommand.
                     if (!string.IsNullOrWhiteSpace(result.FollowUpCommand))
                     {
                         _pendingFollowUpCommand = (result.FollowUpCommand, DateTimeOffset.UtcNow);
@@ -287,10 +336,32 @@ public sealed class JarvisAssistant
                             $"{tool.Name}: {toolResults[0].Summary}",
                             Detail: toolResults[0].VerificationText));
                     }
+
+                    // Cheap-route fallback: a word match picked this tool ("open the test site for me" ->
+                    // open app "test site for me"; "wait why are you adding..." -> wait) and the tool reported an error, so the
+                    // guess was wrong: the user's own words (not the rewritten command) go to the planner, which has every tool plus
+                    // the honesty gate. Voice input arrives already rewritten, so this only changes typed input. One planner turn, only on a miss.
+                    // Safety stops and follow-up questions are not misses and stay as they are.
+                    if ((!result.Succeeded || InferToolError(result.ResponseText))
+                        && !LooksLikeSafetyIntervention(result)
+                        && string.IsNullOrWhiteSpace(result.FollowUpCommand)
+                        // SkipReplan: a failed sticky note keeps its own error; the planner's chat steps wrote no note and hid the failure.
+                        && !result.SkipReplan)
+                    {
+                        memoryProfile ??= await _memoryStore.GetProfileAsync(cancellationToken);
+                        var replanned = await HandleWithPlannerAsync(StripWakeAddressing(persistencePlan.EffectiveInput.Trim()), memoryProfile, cancellationToken);
+                        result = replanned.Result;
+                        intent = replanned.Intent;
+                        sessionId = replanned.SessionId;
+                        isFollowUpQuestion = replanned.IsFollowUpQuestion;
+                        toolResults = replanned.ToolResults;
+                        citations = replanned.Citations;
+                    }
                 }
             }
         }
 
+        // Apply the configured persona to the reply text (tone, how the user is addressed).
         if (!string.IsNullOrWhiteSpace(result.ResponseText))
         {
             memoryProfile ??= await _memoryStore.GetProfileAsync(cancellationToken);
@@ -309,11 +380,13 @@ public sealed class JarvisAssistant
             }
         }
 
+        // Snapshot of the desktop at this moment, stored with the turn.
         var interactionContext = await CaptureInteractionContextAsync(
             persistencePlan.EffectiveInput,
             toolResults,
             cancellationToken);
 
+        // Build the finished turn record.
         var turn = new AssistantTurn(
             DateTimeOffset.UtcNow,
             input,
@@ -328,13 +401,16 @@ public sealed class JarvisAssistant
             interactionContext,
             result.SpeakInFull);
 
+        // Remember it for the next few follow-up questions in this session.
         _conversationState.AddTurn(turn);
 
+        // Saved to disk unless the turn was private.
         if (persistencePlan.PersistTranscript)
         {
             await _transcriptStore.AppendAsync(turn, cancellationToken);
         }
 
+        // Learn preferences and notes from the turn, and sometimes write a conversation summary note, unless private.
         if (persistencePlan.PersistAutomaticMemory)
         {
             await LearnFromTurnAsync(persistencePlan.EffectiveInput, toolResults, interactionContext, cancellationToken);
@@ -353,6 +429,8 @@ public sealed class JarvisAssistant
     /// the answer, so it is appended to that command. Expires so an answer never given cannot swallow a
     /// later, unrelated request.
     /// </summary>
+    // Continues a command when the previous reply asked a question. Returns the original input if nothing is pending, the
+    // question expired, or the user cancelled.
     private string CompletePendingFollowUpCommand(string input, out bool cancelled)
     {
         cancelled = false;
@@ -374,12 +452,14 @@ public sealed class JarvisAssistant
         return cancelled ? input : $"{pending.Command} {answer}";
     }
 
+    // Strips wake words and maps the text to a command name.
     private string NormalizeInput(string input)
     {
         var value = StripWakeAddressing(input.Trim());
         return JarvisCommandCatalog.NormalizeToCommand(value);
     }
 
+    // Removes the assistant's name or wake phrase from the start ("Jarvis, open Chrome" becomes "open Chrome").
     private string StripWakeAddressing(string value)
     {
         var current = value;
@@ -390,6 +470,7 @@ public sealed class JarvisAssistant
         return current;
     }
 
+    // Removes "hey/hi/hello <name>" from the start. If nothing else is said, only the greeting is kept so it is still answered.
     private static string StripGreetingAddressPrefix(string value, string name)
     {
         if (string.IsNullOrWhiteSpace(name))
@@ -422,6 +503,8 @@ public sealed class JarvisAssistant
         return current;
     }
 
+    // Packages the request for the planner (recent turns, relevant memories, desktop state, tool list), runs it, and converts its
+    // result back into the shape HandleAsync uses. Errors become a visible message instead of an exception.
     private async Task<PlanningOutcome> HandleWithPlannerAsync(
         string originalInput,
         MemoryProfileSnapshot? memoryProfile,
@@ -438,10 +521,10 @@ public sealed class JarvisAssistant
                 []);
         }
 
+        // Context gathering: recent turns, memory profile, recent tool results, and the live desktop state.
         var recentTurns = await _transcriptStore.GetRecentAsync(
             Math.Max(0, Options.PlannerRecentTurnCount),
             cancellationToken);
-        var userState = await _userStateProvider.GetSnapshotAsync(cancellationToken);
         memoryProfile ??= await _memoryStore.GetProfileAsync(cancellationToken);
         var recentToolResults = recentTurns
             .SelectMany(turn => turn.ToolResults ?? Array.Empty<AssistantToolExecution>())
@@ -451,6 +534,7 @@ public sealed class JarvisAssistant
         string computerContext;
         DesktopContextSnapshot desktopContext;
 
+        // Desktop information can fail (a window closing mid-read); the turn goes on without it.
         try
         {
             desktopContext = await _toolContext.DesktopAutomation.GetContextSnapshotAsync(cancellationToken);
@@ -462,6 +546,7 @@ public sealed class JarvisAssistant
             computerContext = $"Computer context unavailable: {TrimErrorMessage(exception.Message)}";
         }
 
+        // Pick memories related to this request, then pad with the newest ones if there are too few.
         var memoryQueryContext = BuildMemoryQueryContext(originalInput, desktopContext);
         var relevantMemories = await _memoryStore.SearchAsync(
             originalInput,
@@ -480,6 +565,10 @@ public sealed class JarvisAssistant
                 .ToArray();
         }
 
+        // ponytail: this automatic context is not tainted-tracked but can carry outside text into a turn that never read
+        // any: window titles and app names (page titles), email/task titles and details, recent assistant replies and tool
+        // summaries (which may quote a page), and stored memories. It is short and trimmed, not whole pages. Fence it
+        // like BrainWorkspace.Fence, or start every turn marked, if that proves to be a way around the guard.
         var request = new AssistantPlanningRequest(
             Options.AssistantName,
             originalInput,
@@ -491,7 +580,6 @@ public sealed class JarvisAssistant
             recentTurns,
             recentToolResults,
             _conversationState.GetSnapshot(Math.Max(4, Options.PlannerRecentTurnCount)),
-            userState,
             memoryProfile,
             BrainWorkspace.BuildContext(Options, originalInput));
 
@@ -507,6 +595,7 @@ public sealed class JarvisAssistant
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            Console.Error.WriteLine(exception); // the reply only carries the message; the stack goes to stderr for whoever is watching
             return new PlanningOutcome(
                 new ToolResult(BuildPlannerErrorResponse(exception), Succeeded: false),
                 AgentIntentKind.Planner,
@@ -516,6 +605,7 @@ public sealed class JarvisAssistant
                 []);
         }
 
+        // Three outcomes: the planner wrote a reply; it only ran tools, so the last tool's output is the reply; it produced nothing, so a standard "could not complete" message is used.
         if (!string.IsNullOrWhiteSpace(plan.Response))
         {
             return new PlanningOutcome(
@@ -553,6 +643,8 @@ public sealed class JarvisAssistant
             plan.Citations);
     }
 
+    // If the app is waiting for a yes/no about a risky action, applies the user's answer: "no" clears it, "yes" runs the saved
+    // command with approval already given, anything else is ignored (and the request goes on normally). Returns null when nothing was pending.
     private async Task<PlanningOutcome?> TryHandlePendingApprovalAsync(
         string normalizedInput,
         CancellationToken cancellationToken)
@@ -633,6 +725,7 @@ public sealed class JarvisAssistant
             []);
     }
 
+    // Removes a leading name from the text, plus any separating punctuation.
     private static string StripPrefix(string value, string prefix)
     {
         if (string.IsNullOrWhiteSpace(prefix) || !value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
@@ -644,6 +737,7 @@ public sealed class JarvisAssistant
         return stripped.TrimStart(' ', ',', ':', ';', '-');
     }
 
+    // Standard reply when no useful answer was produced; lists what the assistant can do.
     private string BuildFallbackResponse()
     {
         if (_planner.IsAvailable)
@@ -652,7 +746,7 @@ public sealed class JarvisAssistant
                 Environment.NewLine,
                 "Agent runtime is active, but I could not confidently complete that request.",
                 "Try rephrasing it naturally or use `help` to inspect the current command surface.",
-                "I currently handle memory, memory diagnostics and maintenance, live computer context, app discovery and launch, app adapters for Spotify, VS Code, Chrome, Explorer, Discord, and Slack, window management, clipboard history and media controls, Win32 UI automation, file create/edit/move/copy/delete actions, browser, form, and selector-aware Chrome DOM workflows, notifications, macros, web research, user-state context, visual analysis for screens and documents, system state, and optional shell execution.");
+                "I currently handle memory, live computer context, app discovery and launch, app adapters for Spotify, VS Code, Chrome, Explorer, Discord, and Slack, window management, clipboard history and media controls, Win32 UI automation, file create/edit/move/copy/delete actions, browser, form, and selector-aware Chrome DOM workflows, notifications, web research, user-state context, visual analysis for screens and documents, system state, and optional shell execution.");
         }
 
         return string.Join(
@@ -663,6 +757,7 @@ public sealed class JarvisAssistant
             "The next major layers are planner access, stronger voice handling, deeper app-specific automation, and a richer HUD.");
     }
 
+    // Reply used when the planner throws, such as a missing API key or unreachable model.
     private string BuildPlannerErrorResponse(Exception exception)
     {
         return string.Join(
@@ -671,6 +766,8 @@ public sealed class JarvisAssistant
             "Check the planner settings, model, and API key, or use `help` to fall back to direct commands.");
     }
 
+    // Callback the planner uses to run a tool the model picked. Looks the tool up by name, runs it with the safety check, remembers
+    // whether outside content was read, and converts the result into the planner's format.
     private async Task<PlannerToolResult> ExecutePlannerToolAsync(PlannerToolCall toolCall, CancellationToken cancellationToken)
     {
         var tool = _tools.FirstOrDefault(candidate => string.Equals(candidate.Name, toolCall.ApiName, StringComparison.OrdinalIgnoreCase));
@@ -684,9 +781,7 @@ public sealed class JarvisAssistant
                 $"Unsupported internal tool: {toolCall.ApiName}",
                 IsError: true,
                 Verification: "The requested tool was not registered in the current runtime.",
-                Summary: $"Unsupported tool `{toolCall.ApiName}`.",
-                Purpose: toolCall.Purpose,
-                ExpectedEvidence: toolCall.ExpectedEvidence);
+                Summary: $"Unsupported tool `{toolCall.ApiName}`.");
         }
 
         var commandText = string.IsNullOrWhiteSpace(toolCall.Input)
@@ -694,7 +789,15 @@ public sealed class JarvisAssistant
             : $"{tool.Name} {toolCall.Input}";
 
         var normalizedCommand = NormalizeInput(commandText);
-        var toolResult = await ExecuteToolWithSafetyAsync(tool, normalizedCommand, commandText, cancellationToken);
+        // While the turn has read outside content, any non-read-only action will ask for approval first.
+        var mark = _outsideRead.Value;
+        var toolResult = await ExecuteToolWithSafetyAsync(tool, normalizedCommand, commandText, cancellationToken, askBeforeActing: mark?.Read == true);
+
+        if (mark is not null && toolResult.Succeeded && ToolSafetyService.ReadsOutsideContent(tool.Name, normalizedCommand))
+        {
+            mark.Read = true;
+        }
+
         var isError = !toolResult.Succeeded || InferToolError(toolResult.ResponseText);
         var summary = string.IsNullOrWhiteSpace(toolResult.SummaryText)
             ? TrimForSummary(toolResult.ResponseText)
@@ -711,54 +814,28 @@ public sealed class JarvisAssistant
             isError,
             toolResult.ShouldExit,
             verification,
-            summary,
-            toolCall.Purpose,
-            toolCall.ExpectedEvidence);
+            summary);
     }
 
-    private async Task<ToolResult> ExecuteAutomationCommandFromContextAsync(
-        string command,
-        bool bypassApproval,
-        CancellationToken cancellationToken)
-    {
-        var normalizedCommand = NormalizeInput(command);
-
-        if (string.IsNullOrWhiteSpace(normalizedCommand))
-        {
-            return new ToolResult(
-                "Automation command was empty.",
-                Succeeded: false,
-                VerificationText: "A workflow step resolved to an empty command.",
-                SummaryText: "Workflow step was empty.");
-        }
-
-        var tool = _tools.FirstOrDefault(candidate => candidate.CanHandle(normalizedCommand));
-
-        if (tool is null)
-        {
-            return new ToolResult(
-                $"Unsupported automation command: {command}",
-                Succeeded: false,
-                VerificationText: "The workflow step did not match a registered tool.",
-                SummaryText: "Unsupported workflow step.");
-        }
-
-        return await ExecuteToolWithSafetyAsync(
-            tool,
-            normalizedCommand,
-            command,
-            cancellationToken,
-            bypassApproval);
-    }
-
+    // The one place where tools are actually run. Safety check first: Block returns a refusal, RequireApproval saves the action
+    // and asks the user, Allow runs it. bypassApproval is true when the user has just said yes. Exceptions from a tool become a failure result.
     private async Task<ToolResult> ExecuteToolWithSafetyAsync(
         IAssistantTool tool,
         string normalizedCommand,
         string originalInput,
         CancellationToken cancellationToken,
-        bool bypassApproval = false)
+        bool bypassApproval = false,
+        bool askBeforeActing = false)
     {
         var safetyDecision = _toolSafety.Assess(tool.Name, normalizedCommand);
+
+        // Block and RequireApproval stand. An Allow becomes an approval when the turn read outside content and this call acts.
+        if (askBeforeActing
+            && safetyDecision.Kind == SafetyDecisionKind.Allow
+            && !ToolSafetyService.IsReadOnlyCall(tool.Name, normalizedCommand))
+        {
+            safetyDecision = ToolSafetyService.RequireApprovalAfterOutsideRead(tool.Name, normalizedCommand);
+        }
 
         if (safetyDecision.Kind == SafetyDecisionKind.Block)
         {
@@ -812,16 +889,19 @@ public sealed class JarvisAssistant
         }
     }
 
+    // Raises the Activity event for the UI.
     private void EmitActivity(AssistantActivityEvent activity)
     {
         Activity?.Invoke(this, new AssistantActivityEventArgs(activity));
     }
 
+    // Progress object the planner uses to report activity; it forwards to EmitActivity.
     private IProgress<AssistantActivityEvent> CreateActivityProgress()
     {
         return new Progress<AssistantActivityEvent>(EmitActivity);
     }
 
+    // Converts a tool result to the record kept in the turn, with a summary and a verification note.
     private static AssistantToolExecution BuildToolExecution(string toolName, string input, ToolResult result, string fallbackText)
     {
         var failed = !result.Succeeded || InferToolError(result.ResponseText);
@@ -831,7 +911,7 @@ public sealed class JarvisAssistant
         var verification = string.IsNullOrWhiteSpace(result.VerificationText)
             ? BuildVerificationText(toolName, input, result.ResponseText, failed)
             : result.VerificationText.Trim();
-        var verificationStatus = BuildVerificationStatus(result.ResponseText, summary, verification, failed);
+        var verificationStatus = BuildVerificationStatus(summary, failed);
         var verificationSummary = BuildVerificationSummary(summary, verification, verificationStatus);
 
         return new AssistantToolExecution(
@@ -845,13 +925,14 @@ public sealed class JarvisAssistant
             verificationSummary);
     }
 
+    // Same conversion, starting from the planner's result type.
     private static AssistantToolExecution ToToolExecution(PlannerToolResult result)
     {
         var verification = string.IsNullOrWhiteSpace(result.Verification)
             ? BuildVerificationText(result.Command, result.Input, result.Output, result.IsError)
             : result.Verification.Trim();
         var verificationStatus = string.IsNullOrWhiteSpace(result.VerificationStatus)
-            ? BuildVerificationStatus(result.Output, result.Summary, verification, result.IsError)
+            ? BuildVerificationStatus(result.Summary, result.IsError)
             : result.VerificationStatus.Trim();
         var verificationSummary = string.IsNullOrWhiteSpace(result.VerificationSummary)
             ? BuildVerificationSummary(result.Summary, verification, verificationStatus)
@@ -868,6 +949,8 @@ public sealed class JarvisAssistant
             verificationSummary);
     }
 
+    // Heuristic: does this tool reply look like a failure? Empty text, or starts with a known error phrase ("usage:", "path not found",
+    // "window matching '...' was not found"...). Used because tools return plain text rather than an error flag.
     private static bool InferToolError(string responseText)
     {
         if (string.IsNullOrWhiteSpace(responseText))
@@ -879,20 +962,20 @@ public sealed class JarvisAssistant
         {
             "usage:",
             "unable ",
-            "path not found",
-            "file not found",
-            "directory not found",
             "no matching",
+            "no files or folders",
             "shell execution is disabled",
             "command failed",
             "speech recognition unavailable",
             "microphone startup failed"
         };
 
-        return errorPrefixes.Any(prefix => responseText.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            || responseText.Contains("not found", StringComparison.OrdinalIgnoreCase);
+        // Only the start counts: a reply that reads text back (a clipboard saying "command not found") is not a failure.
+        return errorPrefixes.Concat(UiCommandParsing.NotFoundPrefixes).Any(prefix => responseText.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
     }
 
+    // Default wording for the verification note when the tool gave none. It only says the tool reported success or failure;
+    // it does not prove the effect happened.
     private static string BuildVerificationText(string toolName, string input, string responseText, bool isError)
     {
         if (isError)
@@ -903,9 +986,10 @@ public sealed class JarvisAssistant
         return $"The `{toolName}` tool returned a success-shaped response for input `{input}`.";
     }
 
-    private static string BuildVerificationStatus(string responseText, string summary, string verificationText, bool isError)
+    // "awaiting_approval" if the tool stopped at the approval gate, otherwise "failed" or "observed".
+    private static string BuildVerificationStatus(string summary, bool isError)
     {
-        if (LooksLikeApprovalGate(responseText, summary, verificationText))
+        if (isError && summary.StartsWith("Approval required", StringComparison.OrdinalIgnoreCase))
         {
             return "awaiting_approval";
         }
@@ -913,6 +997,7 @@ public sealed class JarvisAssistant
         return isError ? "failed" : "observed";
     }
 
+    // Chooses the one-line verification summary shown for a tool result.
     private static string BuildVerificationSummary(string summary, string verificationText, string verificationStatus)
     {
         if (string.Equals(verificationStatus, "awaiting_approval", StringComparison.OrdinalIgnoreCase))
@@ -928,25 +1013,10 @@ public sealed class JarvisAssistant
         return string.IsNullOrWhiteSpace(summary) ? string.Empty : summary.Trim();
     }
 
-    private static bool LooksLikeApprovalGate(string responseText, string summary, string verificationText)
-    {
-        return responseText.StartsWith("Approval required", StringComparison.OrdinalIgnoreCase)
-            || summary.Contains("approval required", StringComparison.OrdinalIgnoreCase)
-            || verificationText.Contains("approval", StringComparison.OrdinalIgnoreCase);
-    }
+    // Short 160-character version for summaries.
+    private static string TrimForSummary(string text) => text.Clip(160);
 
-    private static string TrimForSummary(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return string.Empty;
-        }
-
-        const int maxLength = 160;
-        var flattened = text.ReplaceLineEndings(" ").Trim();
-        return flattened.Length <= maxLength ? flattened : flattened[..maxLength] + "...";
-    }
-
+    // Shortens an error message to 320 characters.
     private static string TrimErrorMessage(string message)
     {
         const int maxLength = 320;
@@ -954,6 +1024,7 @@ public sealed class JarvisAssistant
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
+    // True if the tool stopped for safety (blocked, or approval needed) rather than failing, so it is not retried through the planner.
     private static bool LooksLikeSafetyIntervention(ToolResult result)
     {
         return result.SummaryText.Contains("approval required", StringComparison.OrdinalIgnoreCase)
@@ -962,6 +1033,7 @@ public sealed class JarvisAssistant
             || result.ResponseText.StartsWith("Blocked for safety", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Snapshot of the active app, window, location and recent activity for this turn. Falls back to a smaller record if desktop info fails.
     private async Task<InteractionContextSnapshot> CaptureInteractionContextAsync(
         string effectiveInput,
         IReadOnlyList<AssistantToolExecution> toolResults,
@@ -988,6 +1060,7 @@ public sealed class JarvisAssistant
         }
     }
 
+    // Saves what this turn teaches: learned preferences, and an "episodic" note about what happened.
     private async Task LearnFromTurnAsync(
         string effectiveInput,
         IReadOnlyList<AssistantToolExecution> toolResults,
@@ -1007,6 +1080,7 @@ public sealed class JarvisAssistant
         }
     }
 
+    // Occasionally writes a summary note of the conversation (the memory automation decides when).
     private async Task TryCreateConversationSummaryAsync(CancellationToken cancellationToken)
     {
         var turns = await _transcriptStore.GetAllAsync(cancellationToken);
@@ -1019,6 +1093,7 @@ public sealed class JarvisAssistant
         }
     }
 
+    // Context used to rank memories: query text, time of day, location, active app and window.
     private MemoryQueryContext BuildMemoryQueryContext(string query, DesktopContextSnapshot desktopContext)
     {
         var interactionContext = MemoryAutomation.BuildInteractionContext(
@@ -1035,6 +1110,7 @@ public sealed class JarvisAssistant
             interactionContext.SafeRecentActivity);
     }
 
+    // Short list of what just happened (the request and up to 3 successful tool summaries).
     private IEnumerable<string> BuildRecentActivity(string userInput, IReadOnlyList<AssistantToolExecution> toolResults)
     {
         if (!string.IsNullOrWhiteSpace(userInput))
@@ -1048,6 +1124,7 @@ public sealed class JarvisAssistant
         }
     }
 
+    // The default weather location doubles as the user's location context.
     private string ResolveLocationContext()
     {
         return string.IsNullOrWhiteSpace(Options.DefaultWeatherLocation)
@@ -1055,12 +1132,15 @@ public sealed class JarvisAssistant
             : Options.DefaultWeatherLocation.Trim();
     }
 
+    // "remember ..." or "note ..." commands.
     private static bool LooksLikeRememberCommand(string normalizedInput)
     {
         return normalizedInput.StartsWith("remember ", StringComparison.OrdinalIgnoreCase)
             || normalizedInput.StartsWith("note ", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Describes a tool to the model: its name, what it does and what to put in its input. Written by hand because the model sees
+    // only these sentences when choosing a tool. Tools not listed fall back to their own description.
     private static PlannerToolDefinition BuildPlannerToolDefinition(IAssistantTool tool)
     {
         return tool.Name switch
@@ -1069,363 +1149,247 @@ public sealed class JarvisAssistant
                 tool.Name,
                 tool.Name,
                 "Read live desktop context including the active window, visible apps, workspace entries, and system state. This is read-only.",
-                "Leave empty.",
-                "Inspect the current desktop state before answering a question about what the user is doing or what is open.",
-                "Current active window, visible apps, workspace entries, or a clear context-unavailable result."),
-            "email" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Read-only email snapshot from the local user-state data. Use this for inbox summaries and planning context. It does not send, draft, or reply to email.",
-                "Leave empty.",
-                "Inspect the current inbox snapshot before answering an email-related question.",
-                "A list of email items or a clear no-email-context result."),
-            "tasks" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Read-only task snapshot from the local user-state data. Use this for task summaries and planning context. It does not create or complete tasks in an external service.",
-                "Leave empty.",
-                "Inspect the current task snapshot before answering a task-related question.",
-                "A list of task items or a clear no-task-context result."),
+                "Leave empty."),
             "research" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Collect cited public-web sources for open-domain questions. Prefer this over browser search when the user needs sourced information.",
-                "Open-domain research query only.",
-                "Gather public web evidence with citations before answering a research question.",
-                "One or more citations with titles, URLs, and snippets, or a clear no-sources result."),
+                "Open-domain research query only."),
             "screen" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Analyze the current screen, capture a screenshot, extract screen text, or detect UI elements.",
-                "Optional target or question. Examples: `capture`, `ocr browser`, `ui settings`, or a question about the visible screen.",
-                "Inspect the visible screen to answer a question about on-screen content or UI state.",
-                "Screen analysis, extracted text, detected UI elements, or a fresh capture path."),
+                "Optional target or question. Examples: `capture`, `ocr browser`, `ui settings`, or a question about the visible screen."),
             "analyze image" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Analyze an image file. This is for existing local image files.",
-                "Format: `<path>` or `<path> :: <question>`.",
-                "Inspect a specific image file before answering a question about it.",
-                "An image-grounded summary or answer tied to the provided file."),
+                "Format: `<path>` or `<path> :: <question>`."),
             "analyze document" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Analyze a text, PDF, or image-based document file.",
-                "Format: `<path>` or `<path> :: <question>`.",
-                "Inspect a specific document before answering a question about its contents.",
-                "A document-grounded summary, extracted text, or answer tied to the provided file."),
+                "Analyze a text or image-based document file.",
+                "Format: `<path>` or `<path> :: <question>`."),
             "open app" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Focus a running app or launch a discovered application.",
-                "Application name only.",
-                "Open or focus the target application.",
-                "Confirmation that the app was focused or launched, or a clear failure to resolve it."),
+                "Focus a running app or launch an application. If nothing is installed by that name but a file is, the file opens (several matches are listed).",
+                "Application name, or the file name the user asked to open."),
             "open path" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Open a file or folder path.",
-                "File or folder path only.",
-                "Open the target file or folder for the user.",
-                "Confirmation that the path opened, or a clear not-found result."),
+                "File or folder path only."),
             "list files" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "List files in a directory.",
-                "Directory path only.",
-                "Inspect the contents of a folder before choosing a file or next action.",
-                "A directory listing or a clear path-not-found result."),
+                "Directory path only."),
             "read file" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Preview a text file from disk.",
-                "File path only.",
-                "Read a local text file to answer a question about its contents.",
-                "A file preview or a clear read failure."),
+                "File path only."),
             "find files" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Search the workspace for matching files.",
-                "Filename fragment, wildcard, or search term only.",
-                "Find candidate files before opening or reading one.",
-                "A set of matching file paths or a clear no-match result."),
+                "Search the user's Desktop, OneDrive Desktop, Documents and Downloads by file or folder name, newest first.",
+                "Words from the file or folder name only, for example `report 4`."),
             "memory" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Inspect, tune, or maintain stored memories including routines, retention, importance, diagnostics, and manual merges.",
-                "Memory subcommand only.",
-                "Use this when the user explicitly wants to review or maintain memory quality, personalization, or retention behavior.",
-                "A memory review, diagnostics report, or a clear maintenance outcome."),
+                "Review a stored memory or change its retention or importance.",
+                "Memory subcommand only."),
             "write file" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Create or overwrite a text file on disk. Approval may be required.",
-                "Format: `<path> :: <content>`.",
-                "Create a new text file or replace the full contents of an existing text file when the user explicitly wants a file written.",
-                "Confirmation that the file was written, or a clear approval gate/block/failure."),
+                "Format: `<path> :: <content>`."),
             "append file" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Append text to an existing text file or create it if needed. Approval may be required.",
-                "Format: `<path> :: <content>`.",
-                "Add content to the end of a text file as part of a file workflow.",
-                "Confirmation that the file was appended, or a clear approval gate/block/failure."),
+                "Format: `<path> :: <content>`."),
             "replace in file" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Replace one text fragment with another inside a text file. Approval may be required.",
-                "Format: `<path> :: <find> :: <replace>`.",
-                "Edit a local text file without dropping into shell commands.",
-                "Confirmation that replacements were made, or a clear no-match/approval/block/failure result."),
+                "Format: `<path> :: <find> :: <replace>`."),
             "move path" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Move a file or folder. Approval may be required.",
-                "Format: `<source> :: <destination>`.",
-                "Relocate a file or folder during a desktop workflow.",
-                "Confirmation that the path moved, or a clear approval gate/block/failure."),
+                "Format: `<source> :: <destination>`."),
             "copy path" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Copy a file or folder. Approval may be required.",
-                "Format: `<source> :: <destination>`.",
-                "Duplicate a file or folder during a desktop workflow.",
-                "Confirmation that the path copied, or a clear approval gate/block/failure."),
+                "Format: `<source> :: <destination>`."),
             "delete path" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Delete a file or folder. Approval may be required.",
-                "Target path only.",
-                "Remove a file or folder only when the user explicitly asks for deletion.",
-                "Confirmation that the path was deleted, or a clear approval gate/block/failure."),
+                "Target path only."),
             "browse" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
-                "Open a site in the browser.",
-                "URL or site target only.",
-                "Navigate the browser to the requested site.",
-                "Confirmation that the target site or URL was opened."),
+                "Open a site in the user's browser. Site names work: teams, discord, linkedin, linkedin messages, notion, canvas, github, figma.",
+                "URL or site name only, for example `discord` or `linkedin messages`."),
             "search web" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Launch a browser search without collecting citations.",
-                "Search query only.",
-                "Open a quick browser search when the user wants navigation rather than sourced research.",
-                "Confirmation that the browser search was opened."),
+                "Search query only."),
             "spotify" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Spotify adapter for focus, media transport, and search.",
-                "Spotify action only.",
-                "Use Spotify-specific commands instead of only generic media keys when the task is clearly about Spotify.",
-                "Confirmation that Spotify was opened, controlled, or searched."),
+                "Spotify action only."),
             "code" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "VS Code adapter for opening files/folders, goto targets, and in-app search.",
-                "Code action only.",
-                "Open or search code workspaces without falling back to raw shell commands when the task is clearly about VS Code.",
-                "Confirmation that VS Code opened, focused, or received the requested action."),
+                "Code action only."),
             "chrome" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Chrome adapter for navigation, tabs, history/downloads/bookmarks, find-on-page, form/login workflows, and selector-aware DevTools-backed DOM automation specifically in Chrome.",
-                "Chrome action only.",
-                "Route browser navigation and real web-task automation into Chrome when the user asks for Chrome explicitly, including DOM reads, clicks, typing, waits, and verification.",
-                "Confirmation that Chrome opened, focused, navigated, searched, manipulated a DOM target, or verified the requested browser state."),
+                "Chrome action only."),
             "explorer" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Explorer adapter for opening folders and revealing files.",
-                "Explorer action only.",
-                "Use File Explorer-specific actions such as reveal and open-folder navigation.",
-                "Confirmation that Explorer opened, focused, or revealed the requested path."),
+                "Explorer action only."),
             "office" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Office adapter for Word, Excel, PowerPoint, and Outlook launch/status actions plus opening files directly in Office apps.",
-                "Office action only.",
-                "Use this when the user explicitly wants an Office app instead of a generic app launch.",
-                "Confirmation that an Office app was opened, focused, or given a file to open."),
+                "Office action only."),
             "discord" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Discord adapter for focus, status, quick-jump, and in-app search.",
-                "Discord action only.",
-                "Use this when the user explicitly wants Discord navigation instead of generic window control.",
-                "Confirmation that Discord was opened, focused, or routed to a search/jump target."),
+                "Discord action only."),
             "slack" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Slack adapter for focus, status, and quick-jump routing.",
-                "Slack action only.",
-                "Use this when the user explicitly wants Slack navigation instead of generic window control.",
-                "Confirmation that Slack was opened, focused, or routed to a jump target."),
+                "Slack action only."),
             "windows" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "List visible top-level desktop windows.",
-                "Optional filter only.",
-                "Inspect the currently open windows before focusing, resizing, snapping, or pasting into one.",
-                "A list of visible windows or a clear no-match result."),
+                "Optional filter only."),
             "app state" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Inspect richer state for a specific application, including visibility, process details, and launch metadata.",
-                "Application name only.",
-                "Use this before or after a workflow when the user wants more than a simple open/not-open answer.",
-                "A structured application-state summary or a clear no-match result."),
+                "Application name only."),
             "focus app" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Bring a running app window to the foreground.",
-                "Window target only.",
-                "Focus the requested desktop window before interacting with it.",
-                "Confirmation that the requested window was focused, or a clear not-found result."),
+                "Window target only."),
             "close app" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Send a close request to a running window.",
-                "Window target only.",
-                "Close the requested app window when the user explicitly asks for it.",
-                "Confirmation that a close request was sent, or a clear approval gate/not-found result."),
+                "Window target only."),
             "window state" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Minimize, maximize, or restore a window.",
-                "Target window plus state payload.",
-                "Change a window's visibility state without moving it.",
-                "Confirmation that the window state changed, or a clear failure."),
+                "Target window plus state payload."),
             "move window" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Move a visible window to explicit screen coordinates.",
-                "Target window and X/Y coordinates.",
-                "Reposition a window on screen as part of a desktop workflow.",
-                "Confirmation that the window moved, or a clear failure."),
+                "Target window and X/Y coordinates."),
             "resize window" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Resize a visible window to the requested dimensions.",
-                "Target window and width/height payload.",
-                "Resize a desktop window before reading, comparing, or arranging apps.",
-                "Confirmation that the window resized, or a clear failure."),
+                "Target window and width/height payload."),
             "snap window" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Snap a visible window into a desktop region such as left, right, or top-right.",
-                "Target window and snap position.",
-                "Arrange windows into common desktop layouts quickly.",
-                "Confirmation that the window snapped, or a clear failure."),
+                "Target window and snap position."),
             "send hotkey" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Send a keyboard shortcut to a target window. Approval may be required.",
-                "Target window and hotkey payload.",
-                "Use the app's own shortcuts when clicking or typing is not the right fit.",
-                "Confirmation that the hotkey was sent, or a clear approval gate/failure."),
+                "Target window and hotkey payload."),
             "click element" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Click a named or indexed UI element in the active app.",
-                "UI target only.",
-                "Activate a visible control in the active UI.",
-                "Confirmation that the target element was clicked, or a clear not-found result."),
+                "UI target only."),
             "type into" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Type text into an app window at its cursor, opening the app first if it is not running. Use this to write, note, or type anything into Notepad, Word, or another app.",
-                "Format: `<app> <text>`, e.g. `notepad Hello World`. Quote an app name with spaces: `\"sticky notes\" Buy milk`.",
-                "Enter the requested text into the right control.",
-                "Confirmation that text was entered, or a clear failure/approval gate."),
+                "Format: `<app> <text>`, e.g. `notepad Hello World`. Quote an app name with spaces: `\"sticky notes\" Buy milk`."),
             "calendar" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Read or add events in the user's Google Calendar. Use this for schedules, events, appointments, and what is on a given day.",
-                "To read a day: `today`, `tomorrow`, `friday`, or a date. To add: `add <title> :: <date> :: <time> :: <color>`, e.g. `add Dentist :: tomorrow :: 3pm :: red` (time and color optional; colors: red, orange, yellow, green, blue, purple, pink, teal, gray, lavender, sage).",
-                "Answer questions about the user's schedule or put an event on it.",
-                "The day's events, or confirmation of the added event with its date and time."),
+                "To read a day: `today`, `tomorrow`, `friday`, or a date. To add: `add <title> :: <date> :: <time> :: <color>`, e.g. `add Dentist :: tomorrow :: 3pm :: red` (time and color optional; colors: red, orange, yellow, green, blue, purple, pink, teal, gray, lavender, sage)."),
             "lecture notes" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Record a lecture, class, or meeting (microphone and computer audio) and turn it into notes with a summary, key points, due dates, and a clickable transcript.",
-                "`start <course or meeting name>` (name optional) or `stop`.",
-                "Capture a lecture or meeting and produce notes from it.",
-                "Confirmation that recording started, or the saved notes' summary."),
+                "`start <course or meeting name>` (name optional) or `stop`."),
             "vpn" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Turn the user's NordVPN on or off, or say whether it is on.",
-                "`on`, `off`, or `status`.",
-                "Connect, disconnect, or report the VPN.",
-                "Confirmation that the VPN is on or off."),
+                "`on`, `off`, or `status`."),
             "page" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Read aloud or summarize the web page open in the user's browser. Use this whenever the user refers to the page, article, site, or tab they are on.",
-                "`read` to read its main text aloud (article only, no menus or ads), `summarize` for a summary, or `summarize <focus>` such as `summarize the reviews`.",
-                "Let the user hear or understand the page they are looking at.",
-                "The page's main text or a short spoken summary of it."),
+                "`read` to read its main text aloud (article only, no menus or ads), `summarize` for a summary, or `summarize <focus>` such as `summarize the reviews`."),
             "get element text" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Read text from a named UI element.",
-                "UI target only.",
-                "Inspect a control's visible text before deciding the next step.",
-                "The requested element text or a clear not-found result."),
+                "UI target only."),
             "scroll" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Scroll the active window or target area.",
-                "Direction or target payload only.",
-                "Reveal more content in the active UI.",
-                "Confirmation that the UI was scrolled, or a clear failure."),
+                "Direction or target payload only."),
             "media" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Send system media controls such as play/pause, next track, or volume adjustments.",
-                "Media action only.",
-                "Control playback or system volume without switching apps first.",
-                "Confirmation that the media key command was sent, or a clear failure."),
+                "Media action only."),
             "clipboard" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Inspect or manipulate the clipboard, including history, restore, and paste into a target window.",
-                "Clipboard subcommand payload only.",
-                "Use the clipboard for lightweight copy/paste workflows and text handoff.",
-                "Clipboard contents, confirmation of an update, or a clear approval gate/failure."),
+                "Clipboard subcommand payload only."),
             "notify" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Send or inspect Jarvis-managed notifications and toast attempts.",
-                "Format: `<title> :: <message>`, `list`, or `clear`.",
-                "Use this for local notification history or best-effort toast delivery without dropping to shell.",
-                "Confirmation that the notification was recorded or shown, or a clear usage/failure result."),
-            "macro" => new PlannerToolDefinition(
-                tool.Name,
-                tool.Name,
-                "Store or run repeatable multi-step automation macros with optional rollback steps. Running a macro requires approval.",
-                "Macro action only.",
-                "Use this to save, inspect, or run a reusable desktop workflow instead of repeating the same manual sequence each time.",
-                "A saved macro definition, macro execution transcript, or a clear approval gate/failure result."),
+                "Format: `<title> :: <message>`, `list`, or `clear`."),
             "wait" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Pause briefly to let UI state settle.",
-                "Duration payload only when needed.",
-                "Wait for the UI or a process to finish before verifying the next step.",
-                "A completed wait interval."),
+                "Duration payload only when needed."),
             "run" => new PlannerToolDefinition(
                 tool.Name,
                 tool.Name,
                 "Run a PowerShell command when needed. Read-only commands run directly; major changes may require approval.",
-                "PowerShell command only.",
-                "Use shell execution only when no safer built-in tool fits the task.",
-                "Concrete command output, or a clear approval gate, block, or failure."),
+                "PowerShell command only."),
             _ => new PlannerToolDefinition(tool.Name, tool.Name, tool.Description)
         };
     }
 
+    // Internal bundle of what a handling route produced: the result, route, session id, whether the reply is a question, tool results and sources.
     private sealed record PlanningOutcome(
         ToolResult Result,
         AgentIntentKind Intent,

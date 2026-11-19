@@ -5,6 +5,10 @@ using NAudio.Wave.SampleProviders;
 
 namespace Jarvis.App;
 
+// LectureRecorder.cs: records a lecture or call. It mixes the microphone with whatever the computer is playing (loopback) into
+// one 16 kHz mono track, writes it to disk as it arrives, and transcribes it in 30 s pieces in the background so the text is almost ready
+// when recording stops. It does not use the wake word pipeline; it only borrows the microphone reader (MicrophonePcmStream)
+// and the whisper client from OpenAiCompatibleVoiceRuntime.cs. Primary constructor: "options" is available to all methods.
 /// <summary>
 /// Records the microphone and the computer's own audio (a Zoom call, a lecture video) as one 16 kHz mono
 /// track. The audio goes to a WAV file as it comes in, and every ~30 seconds the new part is transcribed by
@@ -13,10 +17,12 @@ namespace Jarvis.App;
 /// </summary>
 internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
 {
+    // 16,000 samples per second, 2 bytes per sample = 32,000 bytes of audio per second. A piece is 30 seconds (960,000 bytes).
     private const int SampleRate = MicrophonePcmStream.SampleRateHz;
     private const int BytesPerSecond = SampleRate * 2;
     private const int PieceBytes = 30 * BytesPerSecond;
 
+    // Whisper client with no vocabulary prompt (lectures are not commands).
     private readonly OpenAiCompatibleTranscriptionClient _whisper = new(
         options.SpeechRecognitionBaseUrl,
         options.SpeechRecognitionModel,
@@ -24,17 +30,25 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         options.SpeechRecognitionLanguage,
         prompt: string.Empty, localAiOnly: options.LocalAiOnly);
 
+    // Finished transcript lines, each at its time offset in the recording. Locked when accessed because transcription runs on other threads.
     private readonly List<TranscriptLine> _lines = [];
+    // Microphone source with the same gain used for voice commands.
     private MicrophonePcmStream? _microphone;
+    // Captures the sound the computer is playing (WASAPI loopback), e.g. the other side of a call.
     private WasapiLoopbackCapture? _computerAudio;
+    // Writes the raw mixed audio to a WAV file as it comes in.
     private WaveFileWriter? _wav;
+    // Background task that mixes audio and writes the file (see Pump).
     private Task _pump = Task.CompletedTask;
+    // Chain of transcription tasks, run one after another.
     private Task _transcription = Task.CompletedTask;
     private string _wavPath = string.Empty;
+    // Total audio bytes written, used for the recording's length.
     private long _bytesRecorded;
 
     public bool IsRecording => _microphone is not null;
 
+    // Opens the microphone and the computer-audio capture and starts a background loop that mixes and saves them.
     public void Start(string wavPath)
     {
         if (!AudioDeviceResolver.TryResolveMicrophoneDevice(options.SpeechRecognitionDeviceName, out var device))
@@ -48,7 +62,7 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         _lines.Clear();
         _transcription = Task.CompletedTask;
 
-        // The same gain the voice commands use, which lifts a lecturer across the room.
+        // Gain and target volume come from the same microphone profile as voice commands.
         var profile = MicrophoneProcessingProfileResolver.Resolve(options);
         _microphone = new MicrophonePcmStream(device, 100, profile.InputGainCap, profile.TargetPeakLevel);
         var computerAudio = StartComputerAudio();
@@ -56,6 +70,7 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         _pump = Task.Factory.StartNew(() => Pump(computerAudio), TaskCreationOptions.LongRunning);
     }
 
+    // Stops recording, waits for the last piece and any pending transcription, converts to MP3, and returns the transcript lines, the length and the audio path.
     public async Task<LectureRecording> StopAsync(CancellationToken cancellationToken)
     {
         _microphone!.StopCapture();
@@ -77,10 +92,12 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         _wav!.Dispose();
         _wav = null;
 
+        // MP3 conversion runs while the last transcription finishes.
         var saving = Task.Run(() => SaveAsMp3(_wavPath));
         await _transcription;
         var audioPath = await saving;
 
+        // Lines may arrive out of order from the background tasks; sort by time.
         lock (_lines)
         {
             return new LectureRecording(
@@ -110,6 +127,7 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
             _computerAudio.StartRecording();
 
             var samples = buffer.ToSampleProvider();
+            // Fold to mono: stereo is averaged; for surround only the front-left channel is used.
             var mono = samples.WaveFormat.Channels switch
             {
                 1 => samples,
@@ -126,9 +144,11 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         }
     }
 
+    // The recording loop: every 100 ms it takes microphone audio, adds the computer audio, writes it to the file, and collects 30 s pieces to transcribe.
     private void Pump(ISampleProvider? computerAudio)
     {
         var microphone = new byte[BytesPerSecond / 10]; // 100 ms
+        // Matching buffer of float samples (-1..1) for the computer audio.
         var computer = new float[microphone.Length / 2];
         var piece = new MemoryStream();
         var pieceStart = 0L;
@@ -136,6 +156,7 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         while (true)
         {
             // Blocks until the microphone has 100 ms; returns 0 once recording stops.
+            // "& ~1" clears the lowest bit so the byte count is even, i.e. a whole number of 2-byte samples.
             var read = _microphone!.Read(microphone, 0, microphone.Length) & ~1;
 
             if (read == 0)
@@ -143,8 +164,10 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
                 break;
             }
 
+            // Computer audio is read in the same amount as the microphone chunk so the two stay in step.
             computerAudio?.Read(computer, 0, read / 2);
 
+            // Mix: convert the computer sample from float (-1..1) to a 16-bit number and add the microphone sample; clamp so the sum cannot wrap around.
             for (var index = 0; index < read / 2; index++)
             {
                 var mixed = BitConverter.ToInt16(microphone, index * 2) + (computer[index] * short.MaxValue);
@@ -157,6 +180,7 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
             piece.Write(microphone, 0, read);
             _bytesRecorded += read;
 
+            // When a piece is long enough, cut it at a quiet moment, send the front part off for transcription, and keep the rest for the next piece.
             if (piece.Length >= PieceBytes)
             {
                 var audio = piece.ToArray();
@@ -168,13 +192,14 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
             }
         }
 
+        // At the end, transcribe what is left if it is longer than half a second.
         if (piece.Length > BytesPerSecond / 2)
         {
             Transcribe(piece.ToArray(), pieceStart);
         }
     }
 
-    /// <summary>Where the last 5 seconds are quietest, so no word is split between two transcriptions.</summary>
+    /// Middle of the quietest 50 ms frame in the last 5 seconds of the piece (smallest sum of squared samples), so no word is split between two transcriptions.
     private static int QuietestPoint(byte[] audio)
     {
         const int frame = BytesPerSecond / 20; // 50 ms
@@ -201,13 +226,15 @@ internal sealed class LectureRecorder(JarvisOptions options) : ILectureRecorder
         return best & ~1;
     }
 
-    /// <summary>Queued so pieces are transcribed one at a time, in order.</summary>
+    /// Queued after the previous piece so pieces are transcribed one at a time, in order; offset is where the piece starts in the recording.
     private void Transcribe(byte[] audio, long startByte)
     {
         var offset = TimeSpan.FromSeconds((double)startByte / BytesPerSecond);
         _transcription = _transcription.ContinueWith(_ => TranscribeAsync(audio, offset), TaskScheduler.Default).Unwrap();
     }
 
+    // Transcribes one piece with up to 3 attempts (waiting 2 s, then 4 s between tries). If it still fails, a placeholder line is added.
+    // Each line's time is shifted by the piece's start offset.
     private async Task TranscribeAsync(byte[] audio, TimeSpan offset)
     {
         for (var attempt = 1; ; attempt++)

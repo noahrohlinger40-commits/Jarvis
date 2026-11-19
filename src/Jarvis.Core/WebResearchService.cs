@@ -1,25 +1,36 @@
+// WebResearchService.cs: a simple web search for Jarvis. It fetches DuckDuckGo's plain-HTML results page and pulls
+// out titles, links and snippets with regular expressions (no search API key needed). The planner's web research
+// tool calls ResearchAsync and shows the results as citations. This is a normal internet request, so it is not
+// covered by the local-only AI setting. If DuckDuckGo changes its page layout, the regexes below will stop matching.
 using System.Net;
 using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
+// The outcome of a search: the cleaned query, the sources found, whether the web was unreachable (IsOffline) and a one-line summary.
 public sealed record WebResearchResult(
     string Query,
     AssistantCitation[] Citations,
     bool IsOffline,
     string SummaryText);
 
+// Lets the planner search the web without knowing which search site is behind it.
 public interface IWebResearchService
 {
     Task<WebResearchResult> ResearchAsync(string query, int maxResults, CancellationToken cancellationToken);
 }
 
+// Searches by scraping html.duckduckgo.com.
 public sealed class DuckDuckGoWebResearchService : IWebResearchService
 {
+    // Matches a result's title link, e.g. <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com">Example</a>.
+    // Captures "href" (the link) and "title" (the link text, which may still contain tags).
     private static readonly Regex ResultRegex = new(
         "<a[^>]*class=\"result__a\"[^>]*href=\"(?<href>[^\"]+)\"[^>]*>(?<title>.*?)</a>",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    // Matches the short description under a result; DuckDuckGo uses either an <a> or a <div> with class result__snippet,
+    // so there are two alternatives (captured as "snippet" and "snippet2").
     private static readonly Regex SnippetRegex = new(
         "<a[^>]*class=\"result__snippet\"[^>]*>(?<snippet>.*?)</a>|<div[^>]*class=\"result__snippet\"[^>]*>(?<snippet2>.*?)</div>",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -28,6 +39,7 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
 
     public DuckDuckGoWebResearchService()
     {
+        // 15-second timeout, and a User-Agent so the request identifies itself as Jarvis.
         _httpClient = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(15)
@@ -36,6 +48,8 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Jarvis/2.0 (+https://localhost)");
     }
 
+    // Runs the search and never throws for ordinary failures: network errors come back as IsOffline = true with a message.
+    // maxResults is limited to 1-8. Only a user cancellation is allowed to propagate.
     public async Task<WebResearchResult> ResearchAsync(string query, int maxResults, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(query))
@@ -72,6 +86,7 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
         }
     }
 
+    // Downloads the results page and pairs the Nth title match with the Nth snippet match to build each citation.
     private async Task<AssistantCitation[]> SearchDuckDuckGoAsync(
         string query,
         int maxResults,
@@ -87,7 +102,6 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
         }
 
         var titleMatches = ResultRegex.Matches(body);
-        var snippetMatches = SnippetRegex.Matches(body);
         var citations = new List<AssistantCitation>();
 
         for (var index = 0; index < titleMatches.Count && citations.Count < maxResults; index++)
@@ -108,14 +122,13 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
                 continue;
             }
 
-            var snippet = string.Empty;
-
-            if (index < snippetMatches.Count)
-            {
-                var snippetGroup = snippetMatches[index].Groups["snippet"];
-                var alternateGroup = snippetMatches[index].Groups["snippet2"];
-                snippet = StripHtml(HtmlDecode(snippetGroup.Success ? snippetGroup.Value : alternateGroup.Value));
-            }
+            // The snippet is the first one between this title and the next, so a result without one cannot shift the rest.
+            var from = match.Index + match.Length;
+            var to = index + 1 < titleMatches.Count ? titleMatches[index + 1].Index : body.Length;
+            var snippetMatch = SnippetRegex.Match(body, from, to - from);
+            var snippet = snippetMatch.Success
+                ? StripHtml(HtmlDecode(snippetMatch.Groups["snippet"].Success ? snippetMatch.Groups["snippet"].Value : snippetMatch.Groups["snippet2"].Value))
+                : string.Empty;
 
             citations.Add(new AssistantCitation(title, resolvedUrl, snippet));
         }
@@ -123,6 +136,8 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
         return citations.ToArray();
     }
 
+    // DuckDuckGo wraps result links as /l/?uddg=<encoded real address>. This returns the real address, or the link itself
+    // if it is already direct (not on duckduckgo.com) or has no uddg part.
     private static string ResolveDuckDuckGoRedirect(string rawUrl)
     {
         if (string.IsNullOrWhiteSpace(rawUrl))
@@ -159,8 +174,10 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
         return rawUrl;
     }
 
+    // Turns HTML entities such as &amp; back into normal characters.
     private static string HtmlDecode(string value) => WebUtility.HtmlDecode(value).Trim();
 
+    // Removes any <tags> from the text (the lazy pattern "<.*?>" stops at the first ">") and decodes entities.
     private static string StripHtml(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -172,6 +189,7 @@ public sealed class DuckDuckGoWebResearchService : IWebResearchService
         return WebUtility.HtmlDecode(noTags).Trim();
     }
 
+    // Shortens an error message to 240 characters for display.
     private static string TrimError(string text)
     {
         const int maxLength = 240;

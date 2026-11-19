@@ -1,3 +1,8 @@
+// AppBootstrapper.cs: startup wiring, called once from Program.cs before any window exists.
+// CreateAsync loads settings, makes sure the local model server is up (Jarvis's own llama-server, or LM Studio
+// as a fallback), starts the local speech server, and builds the JarvisAssistant with all of its services.
+// Everything here is "best effort" where it can be: speech and LM Studio CLI failures are logged, not fatal.
+// Only a planner model that never becomes ready aborts startup.
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -8,11 +13,13 @@ namespace Jarvis.App;
 
 internal static class AppBootstrapper
 {
+    // Used for the warm-up request body and model lists; case-insensitive because servers differ.
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
     };
 
+    // Builds the whole app context in order: settings, speech server, model server, desktop service, assistant, speaker, voice.
     public static async Task<JarvisDesktopContext> CreateAsync(CancellationToken cancellationToken)
     {
         var workspaceRoot = ResolveWorkspaceRoot();
@@ -20,7 +27,7 @@ internal static class AppBootstrapper
         // Started first and not awaited, so the speech model loads while the planner warms up.
         StartLocalSpeechServerInBackground(workspaceRoot, options);
         await EnsureLocalPlannerReadyAsync(options, cancellationToken);
-        var desktopService = new DesktopAutomationService(workspaceRoot, options.ApplicationAliases);
+        var desktopService = new DesktopAutomationService(workspaceRoot, options.ApplicationAliases, options.SiteAliases, options.FileSearchRoots);
         // Scan installed apps in the background so the first "open" command is instant.
         desktopService.WarmApplicationIndexInBackground();
         JarvisCommandCatalog.KnownApplicationNameCheck = desktopService.IsKnownApplicationName;
@@ -32,6 +39,8 @@ internal static class AppBootstrapper
         return new JarvisDesktopContext(workspaceRoot, options, desktopAutomation, assistant, speaker, voiceRuntime);
     }
 
+    // Constructs the JarvisAssistant and every service it depends on. Public because the main form calls it again
+    // when the user changes settings and the assistant has to be rebuilt.
     public static async Task<JarvisAssistant> CreateAssistantAsync(
         string workspaceRoot,
         JarvisOptions options,
@@ -40,13 +49,13 @@ internal static class AppBootstrapper
     {
         var memoryStore = new JsonMemoryStore(JarvisDataPaths.Resolve(options.MemoryFilePath));
         IWeatherService weatherService = new OpenMeteoWeatherService();
-        IUserStateProvider userStateProvider = new JsonUserStateProvider(JarvisDataPaths.Resolve(options.UserStateFilePath));
         IWebResearchService webResearchService = new DuckDuckGoWebResearchService();
         var transcriptStore = new JsonLineTranscriptStore(JarvisDataPaths.Resolve(options.TranscriptFilePath));
         IAgentStateStore agentStateStore = new JsonAgentStateStore(JarvisDataPaths.Resolve(options.AgentStateFilePath));
         IPendingApprovalStore pendingApprovalStore = new JsonPendingApprovalStore(JarvisDataPaths.Resolve(options.PendingApprovalFilePath));
         var modelGateway = ModelGatewayFactory.Create(workspaceRoot, options);
         IVisualContextService visualContextService = new WindowsVisualContextService(workspaceRoot, options, modelGateway);
+        var tutor = new TutorService(modelGateway, new WindowsTutorHost(), JarvisDataPaths.Resolve("data/automation/lessons.json"));
         var planner = AssistantPlannerFactory.Create(options, modelGateway, agentStateStore, webResearchService);
         var toolSafety = new ToolSafetyService(options);
         var assistant = new JarvisAssistant(
@@ -54,7 +63,6 @@ internal static class AppBootstrapper
             memoryStore,
             desktopAutomation,
             weatherService,
-            userStateProvider,
             webResearchService,
             visualContextService,
             transcriptStore,
@@ -65,11 +73,14 @@ internal static class AppBootstrapper
             workspaceRoot,
             modelGateway,
             new UiaBrowserPageReader(),
-            new LectureRecorder(options));
+            new LectureRecorder(options),
+            tutor);
         await assistant.InitializeAsync(cancellationToken);
         return assistant;
     }
 
+    // Finds the folder holding jarvis.settings.json by walking up from the exe folder (bin/Release/...) to the project root.
+    // Falls back to the current directory if no settings file exists anywhere above.
     private static string ResolveWorkspaceRoot()
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
@@ -89,6 +100,8 @@ internal static class AppBootstrapper
         return Directory.GetCurrentDirectory();
     }
 
+    // Makes sure the local language model server answers and the planner model is loaded and warm, or throws.
+    // Skipped entirely when the planner is disabled, is a cloud service, or local AI use is not allowed.
     private static async Task EnsureLocalPlannerReadyAsync(JarvisOptions options, CancellationToken cancellationToken)
     {
         if (!options.PlannerEnabled || !LooksLikeLocalPlanner(options)
@@ -104,17 +117,27 @@ internal static class AppBootstrapper
             return;
         }
 
-        // Prefer Jarvis's own engine when it is installed and nothing is serving yet; otherwise LM Studio as before.
+        // If something already serves on the planner port, leave it alone; otherwise try Jarvis's own engine first.
         var startedOwnEngine = !await IsLocalApiReachableAsync(options.PlannerBaseUrl, cancellationToken)
             && TryStartOwnLlmEngine(options, model);
 
         if (!startedOwnEngine)
         {
-            await EnsureLmStudioServerAndModelAsync(options, model, cancellationToken);
+            // The LM Studio CLI can hang ("Waking up LM Studio service...") even while the server answers.
+            // It only helps with starting the server and raising the context length, so a failure here is
+            // logged and the HTTP check below decides whether the planner is ready.
+            try
+            {
+                await EnsureLmStudioServerAndModelAsync(options, model, cancellationToken);
+            }
+            catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                AppendSpeechServerLog(JarvisDataPaths.Resolve("data/startup-error.log"), $"LM Studio CLI skipped: {exception.Message}");
+            }
         }
 
-        // Per-request timeouts are applied below because the first reply from a large local model
-        // can take far longer than a simple model-list request.
+        // Poll the models endpoint every 0.5 s until the planner model is listed or the deadline passes.
+        // The deadline is 90 s when Jarvis just launched its own engine (loading a model is slow), otherwise 30 s.
         using var httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, Timeout.InfiniteTimeSpan);
 
         var plannerApiKey = ApiKeyResolver.Resolve(
@@ -129,6 +152,7 @@ internal static class AppBootstrapper
 
         var modelsEndpoint = BuildLocalPlannerEndpoint(options.PlannerBaseUrl, "models");
         var chatEndpoint = BuildLocalPlannerEndpoint(options.PlannerBaseUrl, "chat/completions");
+        // Overall deadline for the model to appear; each single request is limited to 12 s inside the loop.
         var deadlineUtc = DateTimeOffset.UtcNow.AddSeconds(startedOwnEngine ? 90 : 30);
         var modelFound = false;
 
@@ -136,10 +160,12 @@ internal static class AppBootstrapper
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // llama-server exits at once when the model will not load; don't wait out the deadline.
+            // llama-server exits at once when the model will not load or the port is already taken.
+            // Give whatever holds the port a short chance (15 s) before giving up.
             if (startedOwnEngine && _ownLlmProcess is { HasExited: true })
             {
-                break;
+                startedOwnEngine = false;
+                deadlineUtc = DateTimeOffset.UtcNow.AddSeconds(15);
             }
 
             try
@@ -162,12 +188,15 @@ internal static class AppBootstrapper
             await Task.Delay(500, cancellationToken);
         }
 
+        // The model never showed up: stop startup with a message telling Noah where to look.
         if (!modelFound)
         {
             throw new InvalidOperationException(
                 $"The local planner model `{model}` is not ready at {modelsEndpoint}. Check %LOCALAPPDATA%\\Jarvis\\data\\llm-server.log, run scripts\\Setup-LocalLlm.ps1 once, or start LM Studio and load that model, before launching Jarvis.");
         }
 
+        // Warm-up: one tiny chat request so the model is loaded into memory now, not on the first real command.
+        // The 120 s limit allows for a large model loading from disk.
         var warmupPayload = new Dictionary<string, object?>
         {
             ["model"] = model,
@@ -205,6 +234,7 @@ internal static class AppBootstrapper
         }
     }
 
+    // The llama-server process Jarvis launched itself, if any; used to notice it crashed and to kill it on exit.
     private static Process? _ownLlmProcess;
     // stdout and stderr lines arrive on separate threads; appends to one file must not overlap.
     private static readonly object OwnLlmLogLock = new();
@@ -239,10 +269,14 @@ internal static class AppBootstrapper
                 RedirectStandardError = true
             };
 
+            // Command-line flags for llama-server: the model file, the name to answer to, host and port taken from the planner URL,
+            // context size (at least 4096), all layers on the GPU (-ngl 99), one request at a time (-np 1).
             foreach (var argument in new[]
             {
                 "-m", modelPath, "--alias", model, "--host", plannerUri.Host, "--port", plannerUri.Port.ToString(),
                 "-c", Math.Max(4096, options.PlannerLocalContextLength).ToString(), "-ngl", "99", "-np", "1",
+                // q8 KV cache halves context memory on the 4 GB GPU at no measurable quality cost (16k fits where f16 spilled).
+                "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0",
                 "-t", Math.Clamp(options.PlannerLocalCpuThreads, 1, Environment.ProcessorCount).ToString(),
                 "-tb", Math.Clamp(options.PlannerLocalCpuThreads, 1, Environment.ProcessorCount).ToString(), "--jinja", "--no-webui"
             })
@@ -296,6 +330,8 @@ internal static class AppBootstrapper
         }
     }
 
+    // Uses the LM Studio command line tool (lms) to start its server, then loads the planner model with the wanted context length.
+    // Does nothing if lms is not installed.
     private static async Task EnsureLmStudioServerAndModelAsync(
         JarvisOptions options,
         string model,
@@ -322,12 +358,14 @@ internal static class AppBootstrapper
                 cancellationToken);
         }
 
+        // Ask LM Studio what is loaded now, so the model is not reloaded when it is already right.
         var loadedModels = await RunProcessAsync(
             cliPath,
             ["ps", "--json"],
             10_000,
             cancellationToken);
 
+        // If the right model is already loaded with enough context, nothing more to do.
         var targetContextLength = Math.Max(4096, options.PlannerLocalContextLength);
         var matchingModels = ParseLoadedLmStudioModels(loadedModels)
             .Where(candidate =>
@@ -342,6 +380,7 @@ internal static class AppBootstrapper
             return;
         }
 
+        // Otherwise unload any wrongly configured copy first, then load it again with the wanted context length.
         foreach (var loadedModel in matchingModels)
         {
             if (string.IsNullOrWhiteSpace(loadedModel.Identifier))
@@ -358,7 +397,8 @@ internal static class AppBootstrapper
 
         await RunProcessAsync(
             cliPath,
-            ["load", model, "--identifier", model, "--context-length", targetContextLength.ToString(), "-y"],
+            // One user, one prediction at a time: extra slots would multiply the KV cache and push it off the 4 GB GPU.
+            ["load", model, "--identifier", model, "--context-length", targetContextLength.ToString(), "--parallel", "1", "-y"],
             120_000,
             cancellationToken);
     }
@@ -370,6 +410,7 @@ internal static class AppBootstrapper
     /// </summary>
     private static void StartLocalSpeechServerInBackground(string workspaceRoot, JarvisOptions options)
     {
+        // Only run when speech recognition is on, the address is this machine, and the provider is one the local server handles.
         if (!options.SpeechRecognitionEnabled
             || !Uri.TryCreate(options.SpeechRecognitionBaseUrl, UriKind.Absolute, out var speechUri)
             || !speechUri.IsLoopback
@@ -442,6 +483,7 @@ internal static class AppBootstrapper
         });
     }
 
+    // Appends one timestamped line to a log file.
     private static void AppendSpeechServerLog(string logPath, string message)
     {
         try
@@ -455,11 +497,13 @@ internal static class AppBootstrapper
         }
     }
 
+    // Quick check whether anything answers HTTP at this address.
     private static async Task<bool> IsLocalApiReachableAsync(string baseUrl, CancellationToken cancellationToken)
     {
         try
         {
-            using var probeClient = LocalAiPolicy.CreateHttpClient(true, TimeSpan.FromSeconds(2));
+            // LM Studio's first answer after idling measured 3.4 s; a closed port still refuses instantly.
+            using var probeClient = LocalAiPolicy.CreateHttpClient(true, TimeSpan.FromSeconds(10));
 
             // Any HTTP response, even an auth error, proves the server is up.
             using var response = await probeClient.GetAsync(
@@ -474,6 +518,7 @@ internal static class AppBootstrapper
         }
     }
 
+    // True when the planner is the "local" provider or its URL points at localhost / 127.0.0.1.
     private static bool LooksLikeLocalPlanner(JarvisOptions options)
     {
         if (string.Equals(options.PlannerProvider, "local", StringComparison.OrdinalIgnoreCase))
@@ -490,6 +535,7 @@ internal static class AppBootstrapper
             || string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase);
     }
 
+    // Picks the model used for warm-up: the fast model if set, else the reasoning model, else the main planner model.
     private static string ResolvePlannerWarmupModel(JarvisOptions options)
     {
         if (!string.IsNullOrWhiteSpace(options.PlannerFastModel))
@@ -505,6 +551,7 @@ internal static class AppBootstrapper
         return options.PlannerModel.Trim();
     }
 
+    // Finds lms.exe, the LM Studio command line tool: LMSTUDIO_CLI_PATH override first, then the default LM Studio folder.
     private static string ResolveLmStudioCliPath()
     {
         var overridePath = Environment.GetEnvironmentVariable("LMSTUDIO_CLI_PATH");
@@ -525,6 +572,7 @@ internal static class AppBootstrapper
         return string.Empty;
     }
 
+    // Builds a URL like http://host:port/v1/models; adds the "/v1" part when the configured address has no path.
     private static string BuildLocalPlannerEndpoint(string baseUrl, string relativePath)
     {
         var trimmedBaseUrl = baseUrl.Trim().TrimEnd('/');
@@ -542,6 +590,7 @@ internal static class AppBootstrapper
         return $"{normalizedBaseUrl}/{relativePath}";
     }
 
+    // Checks the /models response for the wanted model id.
     private static bool ModelExists(string modelsPayload, string model)
     {
         try
@@ -575,6 +624,7 @@ internal static class AppBootstrapper
         return false;
     }
 
+    // Reads the JSON that "lms ps --json" prints into a list of loaded models.
     private static IReadOnlyList<LmStudioLoadedModel> ParseLoadedLmStudioModels(string payload)
     {
         var models = new List<LmStudioLoadedModel>();
@@ -619,6 +669,7 @@ internal static class AppBootstrapper
         return models;
     }
 
+    // Shortens long process output so error messages stay readable.
     private static string TrimStartupError(string text)
     {
         const int maxLength = 240;
@@ -626,6 +677,8 @@ internal static class AppBootstrapper
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
+    // Runs a command line program, waits up to timeoutMs, returns its output, and throws if it times out or exits with an error.
+    // Output is read concurrently with the wait so a full output buffer cannot freeze the process.
     private static async Task<string> RunProcessAsync(
         string fileName,
         IReadOnlyList<string> arguments,
@@ -685,6 +738,7 @@ internal static class AppBootstrapper
         return combined;
     }
 
+    // Kills a process (and its children) if still running, ignoring any failure.
     private static void TryKillProcess(Process process)
     {
         try
@@ -699,5 +753,6 @@ internal static class AppBootstrapper
         }
     }
 
+    // One model as reported by LM Studio: its key, the name it was loaded under, and its context length.
     private sealed record LmStudioLoadedModel(string ModelKey, string Identifier, int ContextLength);
 }

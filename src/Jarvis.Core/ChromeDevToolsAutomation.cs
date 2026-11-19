@@ -1,3 +1,9 @@
+// ChromeDevToolsAutomation.cs: lets Jarvis control a web page's contents (not just the browser window) by speaking
+// Chrome's DevTools protocol, the same channel Chrome's developer tools use. It backs the "chrome dom ..." commands:
+// open a page, list/select tabs, read/click/type into an element chosen by CSS selector, wait for an element, verify text.
+// Jarvis starts its own Chrome with --remote-debugging-port on a free local port and a separate profile folder (so it never
+// touches the user's normal Chrome or logins). Chrome serves a tab list over HTTP on that port; each tab has a WebSocket for JSON commands.
+// Page actions send small JavaScript snippets (Runtime.evaluate) and read back the result. Every public method returns a ToolResult.
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
@@ -8,21 +14,27 @@ namespace Jarvis.Core;
 
 internal static class ChromeDevToolsAutomation
 {
+    // Used only for Chrome's local debug endpoints (http://127.0.0.1:port/json/...), so a short 2.5 second timeout is enough.
     private static readonly HttpClient HttpClient = new()
     {
         Timeout = TimeSpan.FromSeconds(2.5)
     };
 
+    // JSON settings for reading Chrome's replies and writing the saved session file.
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true,
         WriteIndented = true
     };
 
+    // How long to wait for a freshly launched Chrome to open its debugging port.
     private static readonly TimeSpan SessionStartupTimeout = TimeSpan.FromSeconds(12);
+    // How long to wait for a page to finish loading after navigating.
     private static readonly TimeSpan PageReadyTimeout = TimeSpan.FromSeconds(10);
+    // How long "wait" looks for an element when the user gives no timeout.
     private static readonly TimeSpan DefaultSelectorTimeout = TimeSpan.FromSeconds(8);
 
+    // Splits "css-selector :: text" at the first "::". Both parts must be non-empty.
     public static bool TryParseSelectorAndText(string payload, out string selector, out string text)
     {
         selector = string.Empty;
@@ -45,6 +57,7 @@ internal static class ChromeDevToolsAutomation
         return !string.IsNullOrWhiteSpace(selector) && !string.IsNullOrWhiteSpace(text);
     }
 
+    // Reports whether the automation Chrome is running. It never launches Chrome itself (launchIfMissing is false).
     public static async Task<ToolResult> GetStatusAsync(ToolContext context, CancellationToken cancellationToken)
     {
         var acquisition = await EnsureSessionAsync(context, launchIfMissing: false, cancellationToken);
@@ -79,6 +92,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Chrome DOM automation is online.");
     }
 
+    // Lists the open page tabs, numbered from 1, and marks the one Jarvis is currently working in.
     public static async Task<ToolResult> ListTabsAsync(ToolContext context, CancellationToken cancellationToken)
     {
         var acquisition = await EnsureSessionAsync(context, launchIfMissing: true, cancellationToken);
@@ -114,6 +128,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Listed Chrome DOM tabs.");
     }
 
+    // Chooses the tab later commands act on: by number, by id, or by part of its title or URL. Brings it to the front.
     public static async Task<ToolResult> SelectTabAsync(string payload, ToolContext context, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(payload))
@@ -146,6 +161,8 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Selected a Chrome DOM tab.");
     }
 
+    // Opens a URL either in a new tab or in the current one, then waits until the page is at least "interactive".
+    // An empty target opens a blank page.
     public static async Task<ToolResult> OpenAsync(
         string target,
         bool newTab,
@@ -199,6 +216,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: newTab ? "Opened a Chrome DOM tab." : "Navigated a Chrome DOM tab.");
     }
 
+    // Summarizes the current page: title, address, load state and how many links/buttons/inputs it has.
     public static async Task<ToolResult> GetPageAsync(ToolContext context, CancellationToken cancellationToken)
     {
         var acquisition = await EnsureSessionAsync(context, launchIfMissing: true, cancellationToken);
@@ -232,6 +250,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Inspected the current Chrome DOM page.");
     }
 
+    // Reads one element chosen by CSS selector: its tag, text, input value, link address and whether it is visible.
     public static async Task<ToolResult> ReadAsync(string payload, ToolContext context, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(payload))
@@ -280,6 +299,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Read a DOM element in Chrome.");
     }
 
+    // Clicks the element with the given CSS selector and reports the page address afterwards.
     public static async Task<ToolResult> ClickAsync(string payload, ToolContext context, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(payload))
@@ -313,6 +333,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Clicked a DOM element in Chrome.");
     }
 
+    // Sets the text of an input or editable element and checks that the value really changed.
     public static async Task<ToolResult> TypeAsync(string payload, ToolContext context, CancellationToken cancellationToken)
     {
         if (!TryParseSelectorAndText(payload, out var selector, out var text))
@@ -352,6 +373,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Typed into a DOM element in Chrome.");
     }
 
+    // Waits until an element matching the selector exists on the page, or the timeout (default 8 s, at most 60 s) passes.
     public static async Task<ToolResult> WaitForAsync(string payload, ToolContext context, CancellationToken cancellationToken)
     {
         if (!TryParseSelectorAndTimeout(payload, out var selector, out var timeout, out var parseError))
@@ -381,6 +403,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Waited for a DOM element in Chrome.");
     }
 
+    // Checks that an element exists and, if expected text is given, that it contains that text (ignoring case).
     public static async Task<ToolResult> VerifyAsync(string payload, ToolContext context, CancellationToken cancellationToken)
     {
         if (!TryParseSelectorAndExpectation(payload, out var selector, out var expected))
@@ -426,6 +449,7 @@ internal static class ChromeDevToolsAutomation
             SummaryText: "Verified a DOM condition in Chrome.");
     }
 
+    // Builds a failed ToolResult; the second text is used for both the verification and the summary.
     private static ToolResult Failure(string response, string verificationOrSummary)
     {
         return new ToolResult(
@@ -435,6 +459,8 @@ internal static class ChromeDevToolsAutomation
             SummaryText: verificationOrSummary);
     }
 
+    // Finds the running automation Chrome (using the port saved from last time) or, when allowed, starts a new one.
+    // Returns the session, or null plus a message explaining why there is none.
     private static async Task<(ChromeSession? Session, string Detail)> EnsureSessionAsync(
         ToolContext context,
         bool launchIfMissing,
@@ -457,6 +483,7 @@ internal static class ChromeDevToolsAutomation
             return (null, "No DevTools-backed Chrome session is currently running.");
         }
 
+        // No usable session: pick an unused port, make sure the profile folder exists, start Chrome with the debugging flags, and wait for it.
         var port = GetFreeTcpPort();
         Directory.CreateDirectory(GetProfileDirectory(context.WorkspaceRoot));
         var arguments = BuildLaunchArguments(context.WorkspaceRoot, port);
@@ -477,6 +504,9 @@ internal static class ChromeDevToolsAutomation
         return (startedSession, launchResult);
     }
 
+    // Finds the tab to act on. There are two overloads: the first gets (or starts) the session first, the second works
+    // on a session that is already known. Order of preference: the tab selected last time, then the first non-blank tab,
+    // then the last tab; if there are none, a blank tab can be created. The choice is saved for the next command.
     private static async Task<ChromePageSelection> ResolveCurrentTabAsync(
         ToolContext context,
         bool launchIfMissing,
@@ -517,6 +547,7 @@ internal static class ChromeDevToolsAutomation
         return new ChromePageSelection(tab, string.Empty);
     }
 
+    // Polls every 250 ms until Chrome's debugging endpoint answers or the timeout passes.
     private static async Task<ChromeSession?> WaitForSessionAsync(
         string workspaceRoot,
         int port,
@@ -543,6 +574,7 @@ internal static class ChromeDevToolsAutomation
         return null;
     }
 
+    // Asks Chrome for its version info and tab list; null if nothing is listening on that port.
     private static async Task<ChromeSession?> TryGetSessionAsync(
         int port,
         ChromeAutomationState state,
@@ -564,6 +596,7 @@ internal static class ChromeDevToolsAutomation
             tabs);
     }
 
+    // GET /json/version. The reply includes the browser-wide WebSocket address used for commands such as creating tabs.
     private static async Task<ChromeVersionResponse?> GetVersionAsync(int port, CancellationToken cancellationToken)
     {
         try
@@ -585,6 +618,7 @@ internal static class ChromeDevToolsAutomation
         }
     }
 
+    // GET /json/list. Only real page tabs are kept (not extensions, service workers or background pages).
     private static async Task<IReadOnlyList<ChromeTab>> GetTabsAsync(int port, CancellationToken cancellationToken)
     {
         try
@@ -617,6 +651,7 @@ internal static class ChromeDevToolsAutomation
         }
     }
 
+    // Picks the working tab (see ResolveCurrentTabAsync for the order).
     private static ChromeTab? SelectCurrentTab(ChromeSession session)
     {
         var selectedId = session.State.LastTargetId?.Trim() ?? string.Empty;
@@ -636,6 +671,7 @@ internal static class ChromeDevToolsAutomation
             ?? session.Tabs.LastOrDefault();
     }
 
+    // Opens a new tab with the DevTools command Target.createTarget, then waits up to 8 seconds for it to appear in the tab list.
     private static async Task<ChromeTab> CreateTargetAsync(
         ChromeSession session,
         string url,
@@ -668,6 +704,7 @@ internal static class ChromeDevToolsAutomation
         throw new InvalidOperationException("Chrome created a new tab, but the DevTools target never became addressable.");
     }
 
+    // Brings a tab to the front (Target.activateTarget).
     private static async Task ActivateTargetAsync(
         ChromeSession session,
         string targetId,
@@ -677,6 +714,7 @@ internal static class ChromeDevToolsAutomation
         await browserClient.SendCommandAsync("Target.activateTarget", new { targetId }, cancellationToken);
     }
 
+    // Sends the tab to a new address (Page.navigate).
     private static async Task NavigateTabAsync(
         ChromeTab tab,
         string url,
@@ -687,6 +725,8 @@ internal static class ChromeDevToolsAutomation
         await client.SendCommandAsync("Page.navigate", new { url }, cancellationToken);
     }
 
+    // Polls the page's readyState every 250 ms until it is "interactive" or "complete", or the timeout passes. Errors
+    // while the page is loading are ignored because the page's JavaScript context resets during navigation.
     private static async Task<JsonElement> WaitForPageReadyAsync(
         ChromeTab tab,
         CancellationToken cancellationToken)
@@ -720,6 +760,7 @@ internal static class ChromeDevToolsAutomation
         return lastSnapshot ?? await EvaluatePageSnapshotAsync(tab, cancellationToken);
     }
 
+    // Runs a small JavaScript snippet that returns the page title, address, load state and count of interactive elements.
     private static async Task<JsonElement> EvaluatePageSnapshotAsync(ChromeTab tab, CancellationToken cancellationToken)
     {
         return await EvaluateOnTabAsync(
@@ -743,6 +784,8 @@ internal static class ChromeDevToolsAutomation
         return await EvaluateOnTabAsync(tab, BuildReadExpression(selector), cancellationToken);
     }
 
+    // The workhorse: connects to the tab, runs a JavaScript expression there (Runtime.evaluate) and returns the result as JSON.
+    // returnByValue gives back plain data, awaitPromise lets async scripts finish, userGesture makes the page treat it like a real user action.
     private static async Task<JsonElement> EvaluateOnTabAsync(
         ChromeTab tab,
         string expression,
@@ -764,6 +807,7 @@ internal static class ChromeDevToolsAutomation
         return ExtractEvaluateValue(result);
     }
 
+    // Pulls the returned value out of Chrome's reply; throws if the script raised an error or returned something that is not plain data.
     private static JsonElement ExtractEvaluateValue(JsonElement evaluateResult)
     {
         if (evaluateResult.TryGetProperty("exceptionDetails", out var exceptionDetails))
@@ -786,6 +830,10 @@ internal static class ChromeDevToolsAutomation
         throw new InvalidOperationException(description);
     }
 
+    // The Build*Expression methods produce the JavaScript sent to the page. The CSS selector (and any text) is inserted
+    // as a JSON string literal, which escapes quotes so a selector cannot break out of the script. In the raw string
+    // templates, {{ }} marks the C# values being inserted. Each script returns an object that the C# side reads back.
+    // This one returns the element's tag, text, value, link address and visibility (text values cut to 240 characters).
     private static string BuildReadExpression(string selector)
     {
         var selectorJson = JsonSerializer.Serialize(selector);
@@ -819,6 +867,7 @@ internal static class ChromeDevToolsAutomation
         """;
     }
 
+    // Script: scroll the element into view, focus and click it, wait 250 ms, then report the page address before and after.
     private static string BuildClickExpression(string selector)
     {
         var selectorJson = JsonSerializer.Serialize(selector);
@@ -851,6 +900,8 @@ internal static class ChromeDevToolsAutomation
         """;
     }
 
+    // Script: puts the text into the element (as a form value, or as text for editable areas), fires "input" and "change"
+    // events so the page's own code notices, and reports whether the element now holds exactly the requested text.
     private static string BuildTypeExpression(string selector, string text)
     {
         var selectorJson = JsonSerializer.Serialize(selector);
@@ -898,6 +949,7 @@ internal static class ChromeDevToolsAutomation
         """;
     }
 
+    // Script: checks every 200 ms for the element until the timeout (never less than 250 ms); reports how long it took.
     private static string BuildWaitExpression(string selector, TimeSpan timeout)
     {
         var selectorJson = JsonSerializer.Serialize(selector);
@@ -942,6 +994,7 @@ internal static class ChromeDevToolsAutomation
         """;
     }
 
+    // Script: compares the element's text and value (joined with " | ") to the expected text, ignoring case; no expected text means "just exists".
     private static string BuildVerifyExpression(string selector, string expected)
     {
         var selectorJson = JsonSerializer.Serialize(selector);
@@ -975,6 +1028,7 @@ internal static class ChromeDevToolsAutomation
         """;
     }
 
+    // Splits "selector :: expected text"; the expected part is optional.
     private static bool TryParseSelectorAndExpectation(string payload, out string selector, out string expected)
     {
         selector = string.Empty;
@@ -996,6 +1050,7 @@ internal static class ChromeDevToolsAutomation
         return !string.IsNullOrWhiteSpace(selector);
     }
 
+    // Splits "selector :: seconds"; the timeout is optional, must be above zero, and is capped at 60 seconds.
     private static bool TryParseSelectorAndTimeout(
         string payload,
         out string selector,
@@ -1036,6 +1091,8 @@ internal static class ChromeDevToolsAutomation
         return true;
     }
 
+    // Matches the user's tab choice: a number (1-based), an exact tab id, or text found in the title, URL or short id.
+    // More than one text match is an error, so the wrong tab is never picked silently.
     private static (ChromeTab? Tab, string? Error) FindTabMatch(IReadOnlyList<ChromeTab> tabs, string selector)
     {
         if (tabs.Count == 0)
@@ -1074,6 +1131,7 @@ internal static class ChromeDevToolsAutomation
         };
     }
 
+    // Reads the saved port and selected tab from the session file, so Jarvis can reattach to the same Chrome after a restart.
     private static async Task<ChromeAutomationState> LoadStateAsync(string workspaceRoot, CancellationToken cancellationToken)
     {
         var statePath = GetStatePath(workspaceRoot);
@@ -1096,18 +1154,23 @@ internal static class ChromeDevToolsAutomation
         await JsonSerializer.SerializeAsync(stream, state, JsonOptions, cancellationToken);
     }
 
+    // Where the session file and Chrome profile live, under Jarvis's data folder. (The workspaceRoot argument is not used.)
     private static string GetStatePath(string workspaceRoot) =>
         JarvisDataPaths.Resolve("data/automation/chrome-devtools-session.json");
 
     private static string GetProfileDirectory(string workspaceRoot) =>
         JarvisDataPaths.Resolve("data/automation/chrome-devtools-profile");
 
+    // Chrome command line: debugging port, a private profile folder, skip first-run and default-browser prompts, open a blank window.
+    // No --remote-allow-origins: Chrome then refuses any connection that sends an Origin header, which every web page does,
+    // while Jarvis's ClientWebSocket sends none and still connects.
     private static string BuildLaunchArguments(string workspaceRoot, int port)
     {
         var profileDir = GetProfileDirectory(workspaceRoot);
-        return $"--remote-debugging-port={port} --remote-allow-origins=* --user-data-dir=\"{profileDir}\" --no-first-run --no-default-browser-check --new-window about:blank";
+        return $"--remote-debugging-port={port} --user-data-dir=\"{profileDir}\" --no-first-run --no-default-browser-check --new-window about:blank";
     }
 
+    // Asks Windows for an unused port by listening on port 0, reads which one was given, then releases it for Chrome to use.
     private static int GetFreeTcpPort()
     {
         var listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
@@ -1123,6 +1186,7 @@ internal static class ChromeDevToolsAutomation
         }
     }
 
+    // True for blank and new-tab pages, which are the least preferred tabs to act on.
     private static bool IsPlaceholderUrl(string url)
     {
         return url.Equals("about:blank", StringComparison.OrdinalIgnoreCase)
@@ -1140,6 +1204,7 @@ internal static class ChromeDevToolsAutomation
         return $"{ShortTargetId(tab.Id)} | {TrimForInline(tab.Title, 80)} | {TrimForInline(tab.Url, 120)}";
     }
 
+    // Tab ids are long hexadecimal strings; the first 8 characters are enough to show and type.
     private static string ShortTargetId(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -1150,17 +1215,10 @@ internal static class ChromeDevToolsAutomation
         return value.Length <= 8 ? value : value[..8];
     }
 
-    private static string TrimForInline(string value, int maxLength)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
+    // Shortens text for messages (Clip is a string helper defined elsewhere in Jarvis.Core).
+    private static string TrimForInline(string value, int maxLength) => value.Clip(maxLength);
 
-        var flattened = value.ReplaceLineEndings(" ").Trim();
-        return flattened.Length <= maxLength ? flattened : flattened[..maxLength] + "...";
-    }
-
+    // The Get* helpers read a JSON property safely and return the fallback (or false / 0) if it is missing or the wrong type.
     private static string GetString(JsonElement element, string propertyName, string fallback)
     {
         return element.TryGetProperty(propertyName, out var property)
@@ -1192,8 +1250,10 @@ internal static class ChromeDevToolsAutomation
             : 0d;
     }
 
+    // What is saved between commands: which debugging port Chrome is on and which tab was last used.
     private sealed record ChromeAutomationState(int Port, string LastTargetId, DateTimeOffset UpdatedAtUtc);
 
+    // A live connection target: port, browser name, the browser-wide WebSocket address, saved state and the current tabs.
     private sealed record ChromeSession(
         int Port,
         string BrowserName,
@@ -1201,18 +1261,22 @@ internal static class ChromeDevToolsAutomation
         ChromeAutomationState State,
         IReadOnlyList<ChromeTab> Tabs);
 
+    // The result of choosing a tab: the tab, or null with a reason.
     private sealed record ChromePageSelection(ChromeTab? Tab, string Error);
 
+    // One page tab: its id, title, address and the WebSocket address for sending commands to it.
     private sealed record ChromeTab(
         string Id,
         string Title,
         string Url,
         string WebSocketDebuggerUrl);
 
+    // The part of Chrome's /json/version reply that Jarvis uses. The JsonPropertyName attributes match Chrome's exact field names.
     private sealed record ChromeVersionResponse(
         [property: JsonPropertyName("Browser")] string Browser,
         [property: JsonPropertyName("webSocketDebuggerUrl")] string WebSocketDebuggerUrl);
 
+    // One entry of Chrome's /json/list reply (pages, but also extensions and workers, hence the Type check).
     private sealed record ChromeTargetDescriptor(
         [property: JsonPropertyName("id")] string Id,
         [property: JsonPropertyName("title")] string Title,
@@ -1220,6 +1284,8 @@ internal static class ChromeDevToolsAutomation
         [property: JsonPropertyName("type")] string Type,
         [property: JsonPropertyName("webSocketDebuggerUrl")] string WebSocketDebuggerUrl);
 
+    // A minimal DevTools protocol client over one WebSocket. Each command is a JSON message with a number (id); Chrome's
+    // reply carries the same id. Short-lived: commands open a connection, send what they need and dispose it.
     private sealed class DevToolsClient : IAsyncDisposable
     {
         private readonly ClientWebSocket _socket;
@@ -1237,6 +1303,8 @@ internal static class ChromeDevToolsAutomation
             return new DevToolsClient(socket);
         }
 
+        // Sends one command and waits for its reply. Other messages on the socket (events Chrome announces by itself, which
+        // have no matching id) are skipped. A DevTools error reply becomes an exception.
         public async Task<JsonElement> SendCommandAsync(string method, object? parameters, CancellationToken cancellationToken)
         {
             var id = Interlocked.Increment(ref _nextId);
@@ -1269,6 +1337,7 @@ internal static class ChromeDevToolsAutomation
             }
         }
 
+        // Reads one whole WebSocket message, which can arrive in several 8 KB pieces, and parses it as JSON.
         private async Task<JsonDocument> ReceiveDocumentAsync(CancellationToken cancellationToken)
         {
             var buffer = new byte[8192];
@@ -1293,6 +1362,7 @@ internal static class ChromeDevToolsAutomation
             }
         }
 
+        // Closes the WebSocket politely if it is still open, ignoring errors.
         public async ValueTask DisposeAsync()
         {
             if (_socket.State is WebSocketState.Open or WebSocketState.CloseReceived)

@@ -1,3 +1,9 @@
+# planner-eval.py: a developer tool for measuring how well the "planner" model picks tools.
+# Jarvis logs every planner call (the request it sent to the language model and the reply) to
+# data/planner-log.jsonl under %LOCALAPPDATA%\Jarvis. This script lets you list those calls (show), copy
+# chosen ones into a test file (pick), and replay them against a model served over an OpenAI-style
+# /chat/completions endpoint, such as LM Studio (score). A replay passes when the model chooses the same
+# set of tools as the logged reply did. It is not used by the running app.
 """Review Jarvis's logged planner calls, pick a test set, and score tool choice.
 
     python scripts\planner-eval.py show
@@ -16,21 +22,25 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Where Jarvis keeps its data (see JarvisDataPaths.cs); LOG is what Jarvis writes, EVAL is the hand-picked test set.
 # Same private folder Jarvis writes to (JarvisDataPaths.cs), outside OneDrive.
 ROOT = Path(os.environ["LOCALAPPDATA"]) / "Jarvis"
 LOG = "data/planner-log.jsonl"
 EVAL = "data/planner-eval.jsonl"
 
 
+# Treat relative paths as living under the Jarvis data folder.
 def path_of(p):
     p = Path(p)
     return p if p.is_absolute() else ROOT / p
 
 
+# Make text safe to print on a console that cannot show non-ASCII characters (unknown ones become "?").
 def ascii_(s):
     return str(s).encode("ascii", "replace").decode("ascii")
 
 
+# Collapse whitespace and cut to n characters so each log entry fits on one line.
 def flat(s, n):
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[:n] + "..."
@@ -45,6 +55,7 @@ def text_of(content):
     return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
 
 
+# Find the text of the most recent user message in a logged request.
 def last_user_text(request):
     for m in reversed(request.get("messages") or []):
         if m.get("role") == "user":
@@ -52,14 +63,17 @@ def last_user_text(request):
     return ""
 
 
+# The tool calls in a model reply (empty list if none).
 def tool_calls(message):
     return (message or {}).get("tool_calls") or []
 
 
+# Names of the tools a reply asked for, as a set, so order and repeats do not matter.
 def tool_names(message):
     return {c.get("function", {}).get("name", "?") for c in tool_calls(message)}
 
 
+# Do all tool calls in this reply carry arguments that parse into a JSON object? A malformed reply would fail in Jarvis.
 def args_valid(message):
     for c in tool_calls(message):
         a = c.get("function", {}).get("arguments")
@@ -73,14 +87,17 @@ def args_valid(message):
     return True
 
 
+# Two replies agree when they chose exactly the same tools.
 def match(expected, got):
     return expected == got
 
 
+# Read a file as a list of lines.
 def read_lines(p):
     return path_of(p).read_text(encoding="utf-8").splitlines()
 
 
+# One-line summary of a reply for the "show" listing: its tool calls, or the text it said.
 def describe(message):
     calls = tool_calls(message)
     if calls:
@@ -90,6 +107,7 @@ def describe(message):
     return "say: " + flat(text_of((message or {}).get("content")), 60)
 
 
+# "show": print one numbered line per logged call so you can decide which to pick.
 def cmd_show(a):
     for n, line in enumerate(read_lines(a.file), 1):
         if not line.strip():
@@ -104,6 +122,7 @@ def cmd_show(a):
             print("%d (unreadable line)" % n)
 
 
+# "pick": copy chosen line numbers from the log into the eval file, skipping duplicates and blank lines.
 def cmd_pick(a):
     src = read_lines(a.src)
     dest = path_of(a.dest)
@@ -123,6 +142,7 @@ def cmd_pick(a):
     print("added %d to %s (%d already there or skipped)" % (len(new), a.dest, len(a.numbers) - len(new)))
 
 
+# Re-send a logged request to the model. temperature 0 makes the answer as repeatable as possible.
 def ask(url, request, model):
     body = dict(request, temperature=0)
     if model:
@@ -132,8 +152,10 @@ def ask(url, request, model):
         return json.loads(r.read().decode("utf-8"))
 
 
+# "score": replay every eval entry and compare tool choice with what was logged.
 def cmd_score(a):
     base = a.base_url.rstrip("/")
+    # Accept a base URL with or without the /v1 part.
     url = (base if base.endswith("/v1") else base + "/v1") + "/chat/completions"
     lines = [(n, l) for n, l in enumerate(read_lines(a.file), 1) if l.strip()]
     if a.limit:
@@ -143,6 +165,7 @@ def cmd_score(a):
     for n, line in lines:
         rec = json.loads(line)
         resp = rec.get("response") or {}
+        # Replies cut off for length can't be judged fairly, so they are skipped.
         if resp.get("finish_reason") == "length":
             skipped += 1
             print("%d SKIP (logged reply was truncated)" % n)
@@ -155,6 +178,7 @@ def cmd_score(a):
         except (urllib.error.URLError, OSError):
             print("Could not reach %s. Is LM Studio's server running with the model loaded?" % url)
             return 1
+        # The server reports which model actually answered; show that in the summary.
         model = out.get("model") or model
         new = out["choices"][0]["message"]
         want, got = tool_names(resp.get("message")), tool_names(new)
@@ -162,6 +186,7 @@ def cmd_score(a):
         total += 1
         ok += passed
         valid += args_valid(new)
+        # Readable label for a set of tool names.
         show = lambda s: ", ".join(sorted(s)) or "(answered directly)"
         print(ascii_("%d %s %s | expected %s / got %s" % (
             n, "PASS" if passed else "FAIL", flat(last_user_text(rec["request"]), 50), show(want), show(got))))
@@ -171,6 +196,7 @@ def cmd_score(a):
     return 0
 
 
+# Built-in check of the helper functions with made-up data; no network. Run with the "selftest" argument.
 def selftest():
     msg = {"tool_calls": [{"function": {"name": "open_app", "arguments": "{\"name\":\"Spotify\"}"}},
                           {"function": {"name": "set_volume", "arguments": "{}"}}]}
@@ -208,6 +234,7 @@ def selftest():
     print("selftest ok")
 
 
+# Define the command-line: show, pick, score, selftest.
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)

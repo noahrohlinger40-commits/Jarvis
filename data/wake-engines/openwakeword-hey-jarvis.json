@@ -1,0 +1,10 @@
+{
+  "name": "openwakeword-hey-jarvis",
+  "displayName": "openWakeWord hey_jarvis",
+  "description": "Scores each utterance with openWakeWord's pretrained hey_jarvis model through the local speech server's /v1/wake endpoint. A detection only opens the follow-up window; it never runs the transcript as a command by itself.",
+  "engineKind": "external-process",
+  "executablePath": "curl.exe",
+  "arguments": "-s -S -m 3 -F \"file=@{audioPath}\" http://127.0.0.1:8178/v1/wake",
+  "commandTimeoutMilliseconds": 4000,
+  "minimumConfidence": 0.6
+}

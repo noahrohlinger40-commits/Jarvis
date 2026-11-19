@@ -1,3 +1,7 @@
+// PresenceWorkbenchForm.cs: a settings dialog for Jarvis's "presence" (its personality): preset, reply style,
+// what to call the user, small talk, pronunciation hints and a free-text persona. Opened from the main window
+// (JarvisMainForm.Runtime.cs). It works on a copy of the options; if the user presses Apply, the caller reads
+// SelectedOptions and saves them. The right-hand panel previews sample replies live as the fields change.
 using System.Drawing;
 using System.Windows.Forms;
 using Jarvis.Core;
@@ -6,8 +10,10 @@ namespace Jarvis.App;
 
 internal sealed class PresenceWorkbenchForm : Form
 {
+    // The options the dialog was opened with; edits are applied on top of these via BuildOptions.
     private readonly JarvisOptions _initialOptions;
 
+    // Controls, built in InitializeUi (null! means "assigned before first use").
     private ComboBox _presencePresetComboBox = null!;
     private ComboBox _responseStyleComboBox = null!;
     private TextBox _nicknameBox = null!;
@@ -19,13 +25,16 @@ internal sealed class PresenceWorkbenchForm : Form
     public PresenceWorkbenchForm(JarvisOptions options)
     {
         _initialOptions = options;
+        // Until Apply is pressed, the "selected" options are just the original ones.
         SelectedOptions = options;
         InitializeUi();
         RefreshPreview();
     }
 
+    // The options to save after the dialog returns OK.
     public JarvisOptions SelectedOptions { get; private set; }
 
+    // Build the window: a two-column grid (editor left 54%, preview right 46%) with a button bar across the bottom.
     private void InitializeUi()
     {
         Text = "Presence Workbench";
@@ -50,11 +59,13 @@ internal sealed class PresenceWorkbenchForm : Form
         root.Controls.Add(BuildEditorPanel(), 0, 0);
         root.Controls.Add(BuildPreviewPanel(), 1, 0);
         root.Controls.Add(BuildButtonBar(), 0, 1);
+        // Make the button bar (row 1) span both columns.
         root.SetColumnSpan(root.GetControlFromPosition(0, 1)!, 2);
 
         Controls.Add(root);
     }
 
+    // Left panel: the editable fields.
     private Control BuildEditorPanel()
     {
         var panel = new Panel
@@ -87,7 +98,9 @@ internal sealed class PresenceWorkbenchForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 116f));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
+        // Preset and style lists; the values are matched by AssistantPersonaConfiguration, so they must stay in sync with it.
         _presencePresetComboBox = CreateComboBox(["baseline", "operator", "warm", "cinematic"]);
+        // Select the saved value (ignoring case), or the fallback if it is not in the list.
         SelectComboValue(_presencePresetComboBox, AssistantPersonaConfiguration.ResolvePresencePreset(_initialOptions), "baseline");
 
         _responseStyleComboBox = CreateComboBox(["adaptive", "concise", "normal", "detailed", "cinematic"]);
@@ -111,6 +124,7 @@ internal sealed class PresenceWorkbenchForm : Form
         _personaBox = CreateTextBox(multiline: true);
         _personaBox.Text = _initialOptions.AssistantPersona ?? string.Empty;
 
+        // Each field is a labelled row in the grid.
         AddRow(layout, 0, "Preset", _presencePresetComboBox);
         AddRow(layout, 1, "Style", _responseStyleComboBox);
         AddRow(layout, 2, "Nickname", _nicknameBox);
@@ -118,6 +132,7 @@ internal sealed class PresenceWorkbenchForm : Form
         AddRow(layout, 4, "Pronunciation", _pronunciationBox);
         AddRow(layout, 5, "Persona", _personaBox);
 
+        // Re-render the preview whenever any field changes.
         _presencePresetComboBox.SelectedIndexChanged += (_, _) => RefreshPreview();
         _responseStyleComboBox.SelectedIndexChanged += (_, _) => RefreshPreview();
         _nicknameBox.TextChanged += (_, _) => RefreshPreview();
@@ -125,6 +140,7 @@ internal sealed class PresenceWorkbenchForm : Form
         _pronunciationBox.TextChanged += (_, _) => RefreshPreview();
         _personaBox.TextChanged += (_, _) => RefreshPreview();
 
+        // Docking order: WinForms docks the last-added control first, so the layout is added first and the title and intro are brought to front to sit at the top.
         panel.Controls.Add(layout);
         panel.Controls.Add(intro);
         panel.Controls.Add(title);
@@ -133,6 +149,7 @@ internal sealed class PresenceWorkbenchForm : Form
         return panel;
     }
 
+    // Right panel: the live preview text box.
     private Control BuildPreviewPanel()
     {
         var panel = new Panel
@@ -161,6 +178,7 @@ internal sealed class PresenceWorkbenchForm : Form
         return panel;
     }
 
+    // Bottom bar: Apply, Cancel and Reset, laid out right to left so Apply ends up rightmost.
     private Control BuildButtonBar()
     {
         var bar = new FlowLayoutPanel
@@ -174,6 +192,7 @@ internal sealed class PresenceWorkbenchForm : Form
         var cancelButton = CreateButton("Cancel");
         var resetButton = CreateButton("Reset");
 
+        // Apply: keep the edited options and close with OK.
         saveButton.Click += (_, _) =>
         {
             SelectedOptions = BuildOptions();
@@ -185,6 +204,7 @@ internal sealed class PresenceWorkbenchForm : Form
             DialogResult = DialogResult.Cancel;
             Close();
         };
+        // Reset: back to the default look (baseline preset, adaptive style, no nickname, small talk on, no hints, no persona).
         resetButton.Click += (_, _) =>
         {
             _presencePresetComboBox.SelectedItem = "baseline";
@@ -202,10 +222,12 @@ internal sealed class PresenceWorkbenchForm : Form
         return bar;
     }
 
+    // Show what Jarvis would say with the current field values, using the same functions the real assistant uses (greeting, "who are you", an urgent acknowledgement, and a finished-task reply).
     private void RefreshPreview()
     {
         var options = BuildOptions();
         var preferredAddress = options.AssistantUserNickname?.Trim() ?? string.Empty;
+        // The hello route can decline, so each preview line has a fallback text.
         var greeting = AssistantPresenceStyle.TryBuildSocialReply("hello", options, preferredAddress, out var socialReply)
             ? socialReply
             : "Greeting route unavailable.";
@@ -247,10 +269,12 @@ internal sealed class PresenceWorkbenchForm : Form
             taskReply);
     }
 
+    // Turn the field values into a new JarvisOptions (a record, so "with" copies the original and changes only these fields).
     private JarvisOptions BuildOptions()
     {
         var selectedPreset = _presencePresetComboBox.SelectedItem as string ?? "baseline";
         var selectedStyle = _responseStyleComboBox.SelectedItem as string ?? "adaptive";
+        // One pronunciation hint per line; blank lines and duplicates (ignoring case) are removed.
         var pronunciationHints = _pronunciationBox.Text
             .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(value => !string.IsNullOrWhiteSpace(value))
@@ -268,6 +292,7 @@ internal sealed class PresenceWorkbenchForm : Form
         };
     }
 
+    // Add a label (left) and its control (right) to one grid row.
     private static void AddRow(TableLayoutPanel layout, int rowIndex, string labelText, Control control)
     {
         var label = new Label
@@ -284,6 +309,7 @@ internal sealed class PresenceWorkbenchForm : Form
         layout.Controls.Add(control, 1, rowIndex);
     }
 
+    // The remaining helpers create the dark-themed controls with a shared look.
     private static TextBox CreateTextBox(bool multiline = false)
     {
         return new TextBox

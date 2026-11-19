@@ -1,3 +1,8 @@
+// GoogleCalendar.cs: Jarvis's Google Calendar support, in three layers.
+// CalendarTool is the chat command ("calendar today", "calendar add dentist tomorrow at 3pm").
+// CalendarText turns spoken or typed phrases into dates, times, durations and colors, and turns events back into
+// sentences to speak (pure text code, easy to test). GoogleCalendarClient talks to Google's REST API and handles
+// sign-in (OAuth with a browser window; the long-lived refresh token is kept in Windows Credential Manager).
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -11,14 +16,19 @@ using System.Web;
 
 namespace Jarvis.Core;
 
+// One of Google Calendar's event colors. Google identifies colors by a number "colorId" (1 to 11) and gives them names such as Tomato.
 public sealed record GoogleEventColor(string Id, string Name);
 
+// An event to create. A null Start means an all-day event.
 public sealed record CalendarEventRequest(string Title, DateOnly Date, TimeOnly? Start, TimeSpan Duration, GoogleEventColor? Color);
 
+// An event read back from Google, ready to be described out loud.
 public sealed record CalendarEventInfo(string Title, DateTimeOffset Start, DateTimeOffset End, bool AllDay);
 
+// A problem with a friendly message that is safe to show or speak to the user (not set up, sign-in failed, API error).
 public sealed class CalendarException(string message) : Exception(message);
 
+// The "calendar" command: read a day, add an event, or connect to Google. Anything else gets a usage hint.
 public sealed class CalendarTool : IAssistantTool
 {
     private GoogleCalendarClient? _client;
@@ -32,10 +42,12 @@ public sealed class CalendarTool : IAssistantTool
 
     public bool CanHandle(string input) => ToolInputHelper.StartsWithCommand(input, "calendar");
 
+    // Routes the command: "connect" signs in, "add ..." creates an event, otherwise the text is read as a day to list.
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
         var tail = ToolInputHelper.GetCommandTail(input, "calendar").Trim();
         var now = DateTime.Now;
+        // Created on first use and reused afterwards, so the cached access token survives between commands.
         _client ??= new GoogleCalendarClient(JarvisDataPaths.Resolve(context.Options.GoogleCalendarClientSecretPath));
 
         try
@@ -71,6 +83,8 @@ public sealed class CalendarTool : IAssistantTool
         }
     }
 
+    // Parses the event text and creates it. If the title or the time is missing, it asks a question and the user's
+    // answer is appended to the same command (FollowUpCommand).
     private async Task<ToolResult> AddAsync(string text, DateTime now, CancellationToken cancellationToken)
     {
         if (!CalendarText.TryParseEvent(text, now, out var request, out var missing))
@@ -108,33 +122,43 @@ public static partial class CalendarText
         ("tomato", new("11", "Tomato")), ("red", new("11", "Tomato"))
     ];
 
+    // All color words joined into one regex alternation (red|blue|light\s+green|...); spaces become \s+ so extra spaces still match.
     private static readonly string ColorWords = string.Join("|", Colors.Select(color => color.Word.Replace(" ", @"\s+")));
 
     // A color counts only when it is marked as one ("in red", "red box", "color it blue"), so a title
     // such as "Red Sox game" keeps its name. The structured "::" form accepts a bare color.
+    // Finds a color phrase such as "in red", "colored blue", "make it green", "color it pink", "with the color teal" or "blue box".
+    // The color word is captured in the group named "c".
     private static readonly Regex MarkedColorRegex = new(
         $@"(?:,\s*)?(?:\b(?:in|as|colou?red|colou?r(?:\s+it)?|make\s+it|with\s+(?:a\s+|the\s+)?colou?r(?:\s+of)?)\s+(?:the\s+colou?r\s+)?(?<c>{ColorWords})\b(?:\s+(?:colou?r|box|block))?|\b(?<c>{ColorWords})\s+(?:colou?r|box|block)\b)",
         RegexOptions.IgnoreCase);
 
+    // Matches a field that is only a color word, such as the "red" in "dentist :: tomorrow :: red".
     private static readonly Regex BareColorRegex = new($@"^\s*(?<c>{ColorWords})\s*$", RegexOptions.IgnoreCase);
 
     // Whisper writes "3:30" as "3.30", which the app's punctuation cleanup can turn into "3. 30".
     private const string Minutes = @"(?:[:.]\s?\d{2})";
 
+    // One clock time: "3", "3:30", "3.30", "3pm", "3:30 p.m.", "noon" or "midnight". The doubled braces are literal braces
+    // because this is an interpolated string.
     private const string TimeToken = $@"(?:\d{{1,2}}{Minutes}?\s*(?:[ap]\.?\s?m\.?)?|noon|midnight)";
 
     // The trailing (?![\w/:]) keeps "at 3rd street" and "at 3/28" from reading as a time.
+    // Matches "from 3 to 4pm", "at 3-4", "between 9 and 10:30": a start time (group "s") and an end time (group "e").
     private static readonly Regex TimeRangeRegex = new(
         $@"\b(?:from|at|between)\s+(?<s>{TimeToken})\s*(?:-|to|until|till|and)\s*(?<e>{TimeToken})(?![\w/:])",
         RegexOptions.IgnoreCase);
 
+    // Matches a single start time after "at", such as "at 3pm" or "at 6".
     private static readonly Regex AtTimeRegex = new($@"\bat\s+(?<s>{TimeToken})(?![\w/:])", RegexOptions.IgnoreCase);
 
     // "3pm" or "3:30 p.m." said without "at".
     private static readonly Regex MeridiemTimeRegex = new($@"\b(?<s>\d{{1,2}}{Minutes}?\s*[ap]\.?\s?m\.?)(?![\w/:])", RegexOptions.IgnoreCase);
 
+    // Matches a field that is only a time or a time range, such as "3pm" or "3 to 4pm".
     private static readonly Regex BareTimeRegex = new($@"^\s*(?<s>{TimeToken})\s*(?:(?:-|to)\s*(?<e>{TimeToken})\s*)?$", RegexOptions.IgnoreCase);
 
+    // Matches a length such as "for an hour", "for half an hour", "for 90 minutes" or "for two hrs". Groups: "half", "n" (the amount), "u" (the unit).
     private static readonly Regex DurationRegex = new(
         @"\bfor\s+(?:(?<half>half\s+an)|(?<n>an?|one|two|three|four|\d+(?:\.\d+)?))\s*(?<u>hours?|hrs?|minutes?|mins?)\b",
         RegexOptions.IgnoreCase);
@@ -142,6 +166,9 @@ public static partial class CalendarText
     private const string Months = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec";
     private const string Weekdays = "sunday|monday|tuesday|wednesday|thursday|friday|saturday";
 
+    // Matches the many ways to say a date. The groups tell which form it was: after = "day after tomorrow", tomorrow, today,
+    // weekday (optionally "next" or "this"), d1/m1/y1 = "28th of March 2027", m2/d2/y2 = "March 28", y3-m3-d3 = "2027-03-28",
+    // m4/d4/y4 = "3/28" or "3/28/27", d5 = "the 28th". IgnorePatternWhitespace lets the pattern be laid out over several lines.
     private static readonly Regex DateRegex = new(
         $@"\b(?:on\s+|for\s+)?(?:
             (?<after>(?:the\s+)?day\s+after\s+tomorrow)
@@ -156,18 +183,24 @@ public static partial class CalendarText
         )\b",
         RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
 
+    // Matches filler like "to my calendar" or "on Google calendar" so it does not end up in the title.
     private static readonly Regex CalendarPhraseRegex = new(
         @"\b(?:to|on|in|onto|into)\s+(?:my\s+)?(?:google\s+)?calendar\b",
         RegexOptions.IgnoreCase);
 
+    // Matches the command verb at the start of the text ("please add ", "schedule ", "set up ").
     private static readonly Regex LeadingVerbRegex = new(
         @"^(?:please\s+)?(?:add|schedule|put|create|make|book|set\s+up)\s+",
         RegexOptions.IgnoreCase);
 
+    // Matches leading filler such as "a new event called ", "an appointment for ", "the " before the real title.
     private static readonly Regex LeadingEventWordsRegex = new(
         @"^(?:(?:an?|the)\s+)?(?:new\s+)?(?:(?:event|appointment|entry)\s+)?(?:called|named|titled|that\s+says|for)\s+|^(?:an?|the)\s+(?:new\s+)?(?:event|appointment|entry)\b\s*|^(?:an?|the)\s+",
         RegexOptions.IgnoreCase);
 
+    // Turns text into an event request. Returns false and sets missing to "title" or "when" if that part could not be found.
+    // Works on either the structured form "title :: date :: time :: color" (from the planner) or free speech
+    // ("dentist tomorrow at 3pm for an hour in red").
     public static bool TryParseEvent(string text, DateTime now, out CalendarEventRequest request, out string missing)
     {
         request = null!;
@@ -195,6 +228,7 @@ public static partial class CalendarText
         }
         else
         {
+            // Free-text form: pull the color, length, time and date out of the sentence one by one; whatever is left is the title.
             var value = CalendarPhraseRegex.Replace(text, " ");
             color = ExtractColor(ref value, bare: false);
             duration = ExtractDuration(ref value);
@@ -225,6 +259,7 @@ public static partial class CalendarText
             date = time!.Value.Start > TimeOnly.FromDateTime(now) ? today : today.AddDays(1);
         }
 
+        // Length of the event: an explicit duration wins, then the time range (3 to 4pm), otherwise one hour.
         var length = duration
             ?? (time?.End is TimeOnly end && end > time.Value.Start ? end - time.Value.Start : TimeSpan.FromHours(1));
 
@@ -233,6 +268,7 @@ public static partial class CalendarText
         return true;
     }
 
+    // For "calendar friday": true only if the text is a date and nothing else important.
     public static bool TryParseDay(string text, DateTime now, out DateOnly day)
     {
         var value = text;
@@ -256,6 +292,7 @@ public static partial class CalendarText
         return ExtractDate(ref value, now);
     }
 
+    // Builds the spoken summary: "Today you have 2 events: Standup from 9 AM to 9:30 AM, and Dentist at 3 PM."
     public static string DescribeDay(IReadOnlyList<CalendarEventInfo> events, DateOnly day, DateOnly today)
     {
         var dayLabel = DescribeDate(day, today);
@@ -281,11 +318,13 @@ public static partial class CalendarText
                 : end > start ? $"{item.Title} from {FormatTime(start.DateTime)} to {FormatTime(end.DateTime)}" : $"{item.Title} at {FormatTime(start.DateTime)}";
         }).ToList();
 
+        // Joins the items as "A", or "A, B, and C".
         var list = items.Count == 1 ? items[0] : string.Join(", ", items.Take(items.Count - 1)) + ", and " + items[^1];
         var count = events.Count == 1 ? "one event" : $"{events.Count} events";
         return $"{char.ToUpperInvariant(dayLabel[0])}{dayLabel[1..]} you have {count}: {list}.";
     }
 
+    // Describes when a new event is, for the confirmation message.
     public static string DescribeWhen(CalendarEventRequest request, DateOnly today)
     {
         var date = DescribeDate(request.Date, today);
@@ -298,6 +337,7 @@ public static partial class CalendarText
     public static string DescribeMoment(DateTime at, DateOnly today) =>
         $"{DescribeDate(DateOnly.FromDateTime(at), today)} at {FormatTime(at)}";
 
+    // "today", "tomorrow", or "on Friday, October 2".
     private static string DescribeDate(DateOnly day, DateOnly today) =>
         day == today ? "today"
         : day == today.AddDays(1) ? "tomorrow"
@@ -307,6 +347,9 @@ public static partial class CalendarText
     private static string FormatTime(DateTime time) =>
         time.ToString(time.Minute == 0 ? "h tt" : "h:mm tt", CultureInfo.InvariantCulture);
 
+    // The Extract* methods share one idea: find one piece of information (color, length, time or date), cut it out of the
+    // text (replacing it with a space, which is why text is passed by ref) and return it. The text left over becomes the title.
+    // bare = true accepts a field that is just a color word; false needs a marked phrase like "in red". The last match wins.
     private static GoogleEventColor? ExtractColor(ref string text, bool bare)
     {
         var match = bare ? BareColorRegex.Match(text) : MarkedColorRegex.Matches(text).LastOrDefault();
@@ -321,6 +364,7 @@ public static partial class CalendarText
         return Colors.First(color => color.Word == word).Color;
     }
 
+    // Reads "for 2 hours" or "for half an hour" into a TimeSpan; the number can be written as digits or as a word up to four.
     private static TimeSpan? ExtractDuration(ref string text)
     {
         var match = DurationRegex.Match(text);
@@ -346,6 +390,7 @@ public static partial class CalendarText
             : TimeSpan.FromMinutes(amount);
     }
 
+    // Looks for a time range first, then "at 3pm", then a bare "3pm". Returns the start and optional end time.
     private static (TimeOnly Start, TimeOnly? End)? ExtractTime(ref string text, bool bare)
     {
         var match = bare ? BareTimeRegex.Match(text) : TimeRangeRegex.Match(text);
@@ -434,6 +479,7 @@ public static partial class CalendarText
         return new TimeOnly(hour, minute);
     }
 
+    // Finds a date phrase and works out the actual calendar date relative to today.
     private static DateOnly? ExtractDate(ref string text, DateTime now)
     {
         var match = DateRegex.Match(text);
@@ -471,6 +517,7 @@ public static partial class CalendarText
 
             date = today.AddDays(ahead);
         }
+        // Month-name dates in either order: "28 March" (m1/d1) or "March 28" (m2/d2).
         else if (groups["m1"].Success || groups["m2"].Success)
         {
             var month = ParseMonth(groups["m1"].Success ? groups["m1"].Value : groups["m2"].Value);
@@ -522,6 +569,7 @@ public static partial class CalendarText
         return !explicitYear && date < today ? date.AddYears(1) : date;
     }
 
+    // Month name or abbreviation (including "sept") to a number 1-12; returns 0 if it is not a month.
     private static int ParseMonth(string value)
     {
         var key = value.ToLowerInvariant().TrimEnd('.');
@@ -529,6 +577,8 @@ public static partial class CalendarText
         return Array.FindIndex(CultureInfo.InvariantCulture.DateTimeFormat.AbbreviatedMonthNames, name => name.Length > 0 && key.StartsWith(name.ToLowerInvariant(), StringComparison.Ordinal)) + 1;
     }
 
+    // Tidies what is left after the date, time and color were removed: strips stray punctuation, the leading verb
+    // ("add ...") and filler words, trailing "on/at/for", and capitalizes the first letter. Returns empty if nothing real is left.
     private static string CleanTitle(string value)
     {
         var title = Regex.Replace(value, @"\s+", " ").Trim(' ', ',', '.', ';', ':', '-', '"', '\'');
@@ -555,21 +605,28 @@ public static partial class CalendarText
 /// </summary>
 internal sealed class GoogleCalendarClient(string clientSecretPath)
 {
+    // The name under which the refresh token is saved in Windows Credential Manager.
     private const string CredentialTarget = "Jarvis/GoogleCalendar";
     private const string ApiBase = "https://www.googleapis.com/calendar/v3";
+    // The permissions asked from Google: manage events, and read the list of calendars (read-only).
     private const string Scopes = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly";
 
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(30) };
 
+    // Lets only one caller at a time refresh the token or open the sign-in window.
     private readonly SemaphoreSlim _authGate = new(1, 1);
+    // The short-lived access token and the time it expires; kept in memory only.
     private string _accessToken = string.Empty;
     private DateTimeOffset _accessTokenExpiresUtc;
 
+    // Forces a sign-in if needed (used by "calendar connect").
     public async Task ConnectAsync(CancellationToken cancellationToken)
     {
         await GetAccessTokenAsync(forceRefresh: false, cancellationToken);
     }
 
+    // Lists the day's events from the primary calendar and any calendar ticked in Google Calendar's sidebar.
+    // Cancelled events are skipped, duplicates across calendars are merged, and all-day events sort first.
     public async Task<IReadOnlyList<CalendarEventInfo>> ListEventsAsync(DateOnly day, CancellationToken cancellationToken)
     {
         var dayStart = new DateTimeOffset(day.ToDateTime(TimeOnly.MinValue));
@@ -586,6 +643,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
 
         foreach (var calendarId in calendarIds)
         {
+            // singleEvents=true expands repeating events into individual occurrences, which orderBy=startTime requires.
             var url = $"{ApiBase}/calendars/{Uri.EscapeDataString(calendarId)}/events?singleEvents=true&orderBy=startTime"
                 + $"&timeMin={Uri.EscapeDataString(ToRfc3339(dayStart))}&timeMax={Uri.EscapeDataString(ToRfc3339(dayEnd))}";
             using var page = await SendAsync(HttpMethod.Get, url, null, cancellationToken);
@@ -601,6 +659,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
                 var end = item.GetProperty("end");
                 var title = ReadString(item, "summary").Trim() is { Length: > 0 } summary ? summary : "Untitled event";
 
+                // Timed events carry "dateTime"; all-day events carry only "date", so the two shapes are handled separately.
                 events.Add(start.TryGetProperty("dateTime", out var startTime)
                     ? new CalendarEventInfo(title, DateTimeOffset.Parse(startTime.GetString()!, CultureInfo.InvariantCulture), DateTimeOffset.Parse(end.GetProperty("dateTime").GetString()!, CultureInfo.InvariantCulture), false)
                     : new CalendarEventInfo(title, new DateTimeOffset(DateOnly.Parse(start.GetProperty("date").GetString()!, CultureInfo.InvariantCulture).ToDateTime(TimeOnly.MinValue)), dayEnd, true));
@@ -616,6 +675,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
             .ToList();
     }
 
+    // Creates the event on the primary calendar with a POST of the JSON body Google expects (summary, colorId, start, end).
     public async Task AddEventAsync(CalendarEventRequest request, CancellationToken cancellationToken)
     {
         var body = new Dictionary<string, object> { ["summary"] = request.Title };
@@ -642,6 +702,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         using var _ = await SendAsync(HttpMethod.Post, $"{ApiBase}/calendars/primary/events", JsonSerializer.Serialize(body), cancellationToken);
     }
 
+    // One authorized API call. On the first 401 (token rejected) it refreshes the token and tries once more.
     private async Task<JsonDocument> SendAsync(HttpMethod method, string url, string? json, CancellationToken cancellationToken)
     {
         for (var attempt = 0; ; attempt++)
@@ -673,6 +734,8 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         }
     }
 
+    // Returns a valid access token: the cached one if still fresh, otherwise a new one from the saved refresh token,
+    // otherwise a full browser sign-in. Guarded by a lock so two commands cannot sign in at once.
     private async Task<string> GetAccessTokenAsync(bool forceRefresh, CancellationToken cancellationToken)
     {
         await _authGate.WaitAsync(cancellationToken);
@@ -712,6 +775,9 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         }
     }
 
+    // Google's OAuth sign-in for desktop apps. It opens the Google consent page in the default browser and waits on a
+    // temporary local port for Google to redirect back with a one-time code, then swaps the code for tokens.
+    // Gives up after 3 minutes.
     private async Task<string> SignInAsync(string clientId, string clientSecret, CancellationToken cancellationToken)
     {
         // Google sends the browser back to this port on this PC; nothing listens beyond 127.0.0.1.
@@ -721,6 +787,8 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         try
         {
             var redirectUri = $"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}/";
+            // PKCE: a random secret (verifier) is made here, and only its SHA-256 hash (the code_challenge) is sent to Google.
+            // Later the verifier proves this app is the one that started the sign-in. "state" is a random value checked on return to block forged redirects.
             var verifier = Base64Url(RandomNumberGenerator.GetBytes(32));
             var state = Base64Url(RandomNumberGenerator.GetBytes(16));
             var query = new Dictionary<string, string>
@@ -729,6 +797,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
                 ["redirect_uri"] = redirectUri,
                 ["response_type"] = "code",
                 ["scope"] = Scopes,
+                // "offline" plus prompt=consent makes Google return a refresh token, so the user does not sign in again each time.
                 ["access_type"] = "offline",
                 ["prompt"] = "consent",
                 ["code_challenge"] = Base64Url(SHA256.HashData(Encoding.ASCII.GetBytes(verifier))),
@@ -751,6 +820,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
                 await using var stream = connection.GetStream();
                 using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
                 var requestLine = await reader.ReadLineAsync(timeout.Token) ?? string.Empty;
+                // The first line of the browser's request looks like "GET /?code=...&state=... HTTP/1.1"; take the second word.
                 var path = requestLine.Split(' ') is [_, var target, ..] ? target : "/";
                 var parameters = HttpUtility.ParseQueryString(new Uri(new Uri(redirectUri), path).Query);
                 var code = parameters["code"];
@@ -826,10 +896,13 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         }
 
         _accessToken = root.GetProperty("access_token").GetString()!;
+        // Treat the token as expired one minute early so it is never used right at its limit.
         _accessTokenExpiresUtc = DateTimeOffset.UtcNow.AddSeconds(root.GetProperty("expires_in").GetInt32() - 60);
         return _accessToken;
     }
 
+    // Reads the OAuth client JSON downloaded from Google Cloud Console. Desktop-app files nest the values under
+    // "installed" (web ones under "web"); if neither exists the top level is used. Throws a how-to message when the file is missing.
     private (string ClientId, string ClientSecret) ReadClientSecret()
     {
         if (!File.Exists(clientSecretPath))
@@ -858,6 +931,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         return (clientId, clientSecret);
     }
 
+    // Turns a Google error reply into a readable message, with a specific hint when the Calendar API is not enabled.
     private static string DescribeApiError(HttpStatusCode status, string body)
     {
         if (body.Contains("accessNotConfigured", StringComparison.Ordinal) || body.Contains("SERVICE_DISABLED", StringComparison.Ordinal))
@@ -878,6 +952,7 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         }
     }
 
+    // Writes a tiny hand-made HTTP response (a short web page) to the browser tab that Google redirected back.
     private static async Task RespondAsync(Stream stream, string status, string message, CancellationToken cancellationToken)
     {
         var html = $"<!doctype html><meta charset=\"utf-8\"><title>Jarvis</title><body style=\"font-family:sans-serif;padding:2em\">{WebUtility.HtmlEncode(message)}</body>";
@@ -885,10 +960,13 @@ internal sealed class GoogleCalendarClient(string clientSecretPath)
         await stream.WriteAsync(bytes, cancellationToken);
     }
 
+    // Formats a time the way Google expects, e.g. 2027-03-28T15:00:00-04:00.
     private static string ToRfc3339(DateTimeOffset value) => value.ToString("yyyy-MM-dd'T'HH:mm:sszzz", CultureInfo.InvariantCulture);
 
+    // URL-safe Base64 without padding, as PKCE requires.
     private static string Base64Url(byte[] bytes) => Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
+    // ReadBool and ReadString read a JSON property safely, giving false or an empty string when it is missing or the wrong type.
     private static bool ReadBool(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
 

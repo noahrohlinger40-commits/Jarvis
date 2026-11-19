@@ -1,3 +1,7 @@
+// ExternalToolIntegration.cs: helpers for running an outside program as a plug-in and reading what it prints.
+// The only caller is WakeWordDetector.cs, which runs a configured "wake engine" program (described by a
+// manifest such as data/wake-engines/*.json) to decide whether the user said the wake word. Two classes:
+// ConfiguredExternalProcessRunner starts the program safely, ExternalWakeEngineResponseParser interprets its output.
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
@@ -5,6 +9,7 @@ using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// The outcome of running an external program: success flag, exit code, captured output and error text, whether it was killed for taking too long, and the full path actually run.
 internal sealed record ExternalProcessExecutionResult(
     bool Succeeded,
     int ExitCode,
@@ -13,8 +18,10 @@ internal sealed record ExternalProcessExecutionResult(
     bool TimedOut,
     string ExecutablePath);
 
+// Starts a configured program, waits for it within a time limit, and returns its output. Ordinary failures come back as Succeeded = false, never as exceptions.
 internal static class ConfiguredExternalProcessRunner
 {
+    // Manifest settings may contain placeholders like {wakePhrase}; "definitionDirectory" is the manifest's folder, used to resolve relative paths.
     public static async Task<ExternalProcessExecutionResult> RunAsync(
         string executablePath,
         string arguments,
@@ -25,11 +32,13 @@ internal static class ConfiguredExternalProcessRunner
         int timeoutMilliseconds,
         CancellationToken cancellationToken)
     {
+        // Fill in {placeholder} markers in the program path, arguments and working directory.
         var expandedExecutablePath = ExpandTemplate(executablePath, placeholders);
         var expandedArguments = ExpandTemplate(arguments, placeholders);
         var expandedWorkingDirectory = ExpandTemplate(workingDirectory, placeholders);
         var resolvedExecutablePath = ResolveExecutablePath(expandedExecutablePath, definitionDirectory);
 
+        // Nothing to run.
         if (string.IsNullOrWhiteSpace(resolvedExecutablePath))
         {
             return new ExternalProcessExecutionResult(
@@ -43,6 +52,7 @@ internal static class ConfiguredExternalProcessRunner
 
         var resolvedWorkingDirectory = ResolveWorkingDirectory(expandedWorkingDirectory, definitionDirectory);
 
+        // Run without a window, with output captured instead of shown, and no shell (so no cmd.exe quoting surprises).
         var startInfo = new ProcessStartInfo
         {
             FileName = resolvedExecutablePath,
@@ -54,6 +64,7 @@ internal static class ConfiguredExternalProcessRunner
             CreateNoWindow = true
         };
 
+        // Pass the placeholders and manifest settings to the program as environment variables too.
         foreach (var pair in BuildEnvironmentVariables(environmentVariables, placeholders))
         {
             startInfo.Environment[pair.Key] = pair.Value;
@@ -64,6 +75,7 @@ internal static class ConfiguredExternalProcessRunner
             StartInfo = startInfo
         };
 
+        // Start can fail (file not found, no permission); report that as a normal failed result.
         try
         {
             if (!process.Start())
@@ -88,13 +100,17 @@ internal static class ConfiguredExternalProcessRunner
                 ExecutablePath: resolvedExecutablePath);
         }
 
+        // Keep the time limit between 0.25 s and 60 s whatever the manifest asks for.
         var timeout = Math.Clamp(timeoutMilliseconds, 250, 60000);
+        // Read output right away: a program that fills its output buffer while nobody reads would freeze.
         var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
         var waitForExitTask = process.WaitForExitAsync(cancellationToken);
+        // Timeout: whichever finishes first, the process exiting or the delay, wins.
         var timeoutTask = Task.Delay(timeout, cancellationToken);
         var completedTask = await Task.WhenAny(waitForExitTask, timeoutTask).ConfigureAwait(false);
 
+        // Timed out: kill the program (and anything it started) and return whatever it printed so far.
         if (completedTask == timeoutTask)
         {
             TryTerminate(process);
@@ -111,6 +127,7 @@ internal static class ConfiguredExternalProcessRunner
                 ExecutablePath: resolvedExecutablePath);
         }
 
+        // Finished in time: now it is safe to collect the output.
         await waitForExitTask.ConfigureAwait(false);
         var standardOutput = await SafeReadAsync(stdoutTask).ConfigureAwait(false);
         var standardError = await SafeReadAsync(stderrTask).ConfigureAwait(false);
@@ -124,6 +141,7 @@ internal static class ConfiguredExternalProcessRunner
             ExecutablePath: resolvedExecutablePath);
     }
 
+    // Replace every {name} in a template with its value, ignoring letter case. Example: "--phrase {wakePhrase}" becomes "--phrase hey jarvis".
     public static string ExpandTemplate(string? template, IReadOnlyDictionary<string, string> placeholders)
     {
         if (string.IsNullOrWhiteSpace(template))
@@ -141,6 +159,7 @@ internal static class ConfiguredExternalProcessRunner
         return expanded;
     }
 
+    // Turn a path from the manifest into an absolute one: absolute paths stay, relative ones are taken from the manifest's folder.
     public static string ResolveOptionalPath(string? path, string definitionDirectory, IReadOnlyDictionary<string, string>? placeholders = null)
     {
         var expanded = placeholders is null
@@ -160,6 +179,7 @@ internal static class ConfiguredExternalProcessRunner
         return Path.GetFullPath(Path.Combine(definitionDirectory, expanded));
     }
 
+    // The standard set of {placeholders} offered to wake-engine manifests: app folder, assistant name, microphone device, wake phrase, audio-processing profile names, and model/asset paths.
     public static Dictionary<string, string> BuildCommonPlaceholders(
         JarvisOptions options,
         ResolvedMicrophoneProcessingProfile profile)
@@ -174,11 +194,11 @@ internal static class ConfiguredExternalProcessRunner
             ["hardwareDspProfile"] = profile.EffectiveHardwareDspProfileName,
             ["wakeWordAssetPath"] = profile.EffectiveWakeWordAssetPath,
             ["wakeEnginePath"] = profile.EffectiveWakeEnginePath,
-            ["vendorDspProfilePath"] = profile.EffectiveVendorDspProfilePath,
             ["speechRecognitionModel"] = options.SpeechRecognitionModel?.Trim() ?? string.Empty
         };
     }
 
+    // A bare name like "python" is left alone so Windows searches PATH; anything with a slash or ending in .exe/.cmd/.bat is treated as a file relative to the manifest.
     private static string ResolveExecutablePath(string path, string definitionDirectory)
     {
         if (string.IsNullOrWhiteSpace(path))
@@ -203,6 +223,7 @@ internal static class ConfiguredExternalProcessRunner
         return path;
     }
 
+    // Use the manifest's folder when no working directory is given.
     private static string ResolveWorkingDirectory(string path, string definitionDirectory)
     {
         if (string.IsNullOrWhiteSpace(path))
@@ -215,6 +236,7 @@ internal static class ConfiguredExternalProcessRunner
             : Path.GetFullPath(Path.Combine(definitionDirectory, path));
     }
 
+    // Environment for the child program: JARVIS_WORKSPACE_ROOT, one JARVIS_* variable per placeholder, then the manifest's own variables (which win on conflicts).
     private static IReadOnlyDictionary<string, string> BuildEnvironmentVariables(
         IReadOnlyDictionary<string, string> manifestVariables,
         IReadOnlyDictionary<string, string> placeholders)
@@ -247,6 +269,7 @@ internal static class ConfiguredExternalProcessRunner
         return environment;
     }
 
+    // Name for a placeholder's environment variable, e.g. "wakePhrase" becomes JARVIS_WAKEPHRASE and "wake.path" becomes JARVIS_WAKE_PATH.
     private static string BuildEnvironmentVariableName(string key)
     {
         if (string.IsNullOrWhiteSpace(key))
@@ -266,6 +289,7 @@ internal static class ConfiguredExternalProcessRunner
         return builder.ToString();
     }
 
+    // Read a finished task's text, or an empty string if reading failed (for example after the process was killed).
     private static async Task<string> SafeReadAsync(Task<string> task)
     {
         try
@@ -278,6 +302,7 @@ internal static class ConfiguredExternalProcessRunner
         }
     }
 
+    // Best-effort kill of the whole process tree; errors are ignored because the process may already have exited.
     private static void TryTerminate(Process process)
     {
         try
@@ -293,121 +318,8 @@ internal static class ConfiguredExternalProcessRunner
     }
 }
 
-internal sealed class VendorDspControlSession
-{
-    private readonly JarvisOptions _options;
-    private readonly ResolvedMicrophoneProcessingProfile _profile;
-    private readonly VendorDspProfileDescriptor _descriptor;
-    private readonly IReadOnlyDictionary<string, string> _basePlaceholders;
-    private bool _isApplied;
-
-    public VendorDspControlSession(
-        JarvisOptions options,
-        ResolvedMicrophoneProcessingProfile profile,
-        VendorDspProfileDescriptor descriptor)
-    {
-        _options = options;
-        _profile = profile;
-        _descriptor = descriptor;
-        _basePlaceholders = BuildPlaceholders();
-    }
-
-    public static VendorDspControlSession? Create(JarvisOptions options, ResolvedMicrophoneProcessingProfile profile)
-    {
-        var descriptor = VendorDspProfileCatalog.ResolveDescriptorByPath(
-            Directory.GetCurrentDirectory(),
-            options,
-            profile.EffectiveVendorDspProfilePath);
-
-        return descriptor.IsNone ? null : new VendorDspControlSession(options, profile, descriptor);
-    }
-
-    public async Task<string?> EnsureAppliedAsync(CancellationToken cancellationToken)
-    {
-        if (_isApplied)
-        {
-            return null;
-        }
-
-        if (string.IsNullOrWhiteSpace(_descriptor.ExecutablePath)
-            || string.IsNullOrWhiteSpace(_descriptor.ApplyArguments))
-        {
-            return null;
-        }
-
-        var result = await ConfiguredExternalProcessRunner.RunAsync(
-            _descriptor.ExecutablePath,
-            _descriptor.ApplyArguments,
-            _descriptor.WorkingDirectory,
-            _descriptor.DefinitionDirectory,
-            _descriptor.EnvironmentVariables,
-            _basePlaceholders,
-            _descriptor.ApplyTimeoutMilliseconds,
-            cancellationToken).ConfigureAwait(false);
-
-        if (!result.Succeeded)
-        {
-            return BuildErrorMessage("apply", result);
-        }
-
-        _isApplied = true;
-        return null;
-    }
-
-    public async Task ReleaseAsync(CancellationToken cancellationToken)
-    {
-        if (!_isApplied)
-        {
-            return;
-        }
-
-        _isApplied = false;
-
-        if (string.IsNullOrWhiteSpace(_descriptor.ExecutablePath)
-            || string.IsNullOrWhiteSpace(_descriptor.ReleaseArguments))
-        {
-            return;
-        }
-
-        await ConfiguredExternalProcessRunner.RunAsync(
-            _descriptor.ExecutablePath,
-            _descriptor.ReleaseArguments,
-            _descriptor.WorkingDirectory,
-            _descriptor.DefinitionDirectory,
-            _descriptor.EnvironmentVariables,
-            _basePlaceholders,
-            _descriptor.ReleaseTimeoutMilliseconds,
-            cancellationToken).ConfigureAwait(false);
-    }
-
-    private IReadOnlyDictionary<string, string> BuildPlaceholders()
-    {
-        var placeholders = ConfiguredExternalProcessRunner.BuildCommonPlaceholders(_options, _profile);
-        placeholders["vendorDspProfileName"] = _descriptor.BuildShortLabel();
-        placeholders["vendorDspProfileFile"] = ConfiguredExternalProcessRunner.ResolveOptionalPath(
-            _descriptor.ProfilePath,
-            _descriptor.DefinitionDirectory);
-        placeholders["vendorDspDefinitionDirectory"] = _descriptor.DefinitionDirectory;
-        return placeholders;
-    }
-
-    private string BuildErrorMessage(string operation, ExternalProcessExecutionResult result)
-    {
-        var detail = string.IsNullOrWhiteSpace(result.StandardError)
-            ? result.StandardOutput
-            : result.StandardError;
-
-        if (string.IsNullOrWhiteSpace(detail))
-        {
-            detail = result.TimedOut
-                ? "The vendor DSP command timed out."
-                : $"The vendor DSP command exited with code {result.ExitCode}.";
-        }
-
-        return $"{_descriptor.BuildShortLabel()} {operation} failed: {detail.Trim()}";
-    }
-}
-
+// Turns whatever a wake-engine program printed into a WakeWordDetectionResult.
+// Accepted shapes, in order: nothing (not detected); the word true, 1 or detected; plain text containing the wake phrase; or a JSON object such as {"detected": true, "confidence": 0.9, "shouldArmOnly": true}.
 internal static class ExternalWakeEngineResponseParser
 {
     public static WakeWordDetectionResult Parse(
@@ -419,11 +331,13 @@ internal static class ExternalWakeEngineResponseParser
     {
         var trimmedOutput = output?.Trim() ?? string.Empty;
 
+        // Empty output means no detection.
         if (string.IsNullOrWhiteSpace(trimmedOutput))
         {
             return WakeWordDetectionResult.None;
         }
 
+        // A bare "true" / "1" / "detected" counts as a detection with no command attached.
         if (string.Equals(trimmedOutput, "true", StringComparison.OrdinalIgnoreCase)
             || string.Equals(trimmedOutput, "1", StringComparison.OrdinalIgnoreCase)
             || string.Equals(trimmedOutput, "detected", StringComparison.OrdinalIgnoreCase))
@@ -437,6 +351,7 @@ internal static class ExternalWakeEngineResponseParser
                 MatchDuration: TimeSpan.Zero);
         }
 
+        // Maybe the engine printed a transcript: clean it up and look for the wake phrase (and a command after it).
         var normalizedText = VoiceRecognitionText.NormalizeTranscript(trimmedOutput, options);
         var extractedText = tryExtractWakeCommand(normalizedText);
 
@@ -453,6 +368,7 @@ internal static class ExternalWakeEngineResponseParser
                 InlineCommand: extractedText.InlineCommand);
         }
 
+        // Otherwise expect JSON. Several property names are accepted for the same idea because engines differ.
         try
         {
             using var document = JsonDocument.Parse(trimmedOutput);
@@ -476,6 +392,7 @@ internal static class ExternalWakeEngineResponseParser
             var inlineCommand = TryGetString(root, "inlineCommand")
                 ?? TryGetString(root, "command")
                 ?? string.Empty;
+            // "Arm only" means: wake word heard, now listen for the command, rather than treating this utterance as the command.
             var shouldArmOnly = TryGetBoolean(root, "shouldArmOnly");
 
             if (!string.IsNullOrWhiteSpace(recognizedText))
@@ -496,6 +413,7 @@ internal static class ExternalWakeEngineResponseParser
                 recognizedText = normalized;
             }
 
+            // With no command included, the engine can only have woken Jarvis up.
             if (string.IsNullOrWhiteSpace(inlineCommand))
             {
                 shouldArmOnly = true;
@@ -511,12 +429,14 @@ internal static class ExternalWakeEngineResponseParser
                 RecognizedText: recognizedText,
                 InlineCommand: inlineCommand);
         }
+        // Not valid JSON or unexpected shape: treat as not detected.
         catch
         {
             return WakeWordDetectionResult.None;
         }
     }
 
+    // Small JSON readers that return a default instead of throwing when a property is missing or has the wrong type. TryGetBoolean also accepts "true" strings and non-zero numbers.
     private static string? TryGetString(JsonElement root, string propertyName)
     {
         return root.TryGetProperty(propertyName, out var element) && element.ValueKind == JsonValueKind.String

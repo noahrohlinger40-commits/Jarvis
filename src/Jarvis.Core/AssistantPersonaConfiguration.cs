@@ -1,7 +1,13 @@
+// AssistantPersonaConfiguration.cs: turns the personality settings in JarvisOptions (persona text, presence preset,
+// response style, nickname, pronunciation hints) into the instruction text that is put into the model's prompt and
+// into the voice's speaking instructions. Everything here only builds strings or picks valid values; nothing is
+// sent anywhere. Learned habits come in from the memory profile (MemoryProfileSnapshot).
 namespace Jarvis.Core;
 
+// Static helpers; there is no state, each method reads the options it is given.
 public static class AssistantPersonaConfiguration
 {
+    // The allowed values for the AssistantPresencePreset setting. Anything else falls back to "baseline".
     private static readonly string[] SupportedPresencePresets =
     [
         "baseline",
@@ -10,6 +16,7 @@ public static class AssistantPersonaConfiguration
         "cinematic"
     ];
 
+    // The allowed values for the AssistantResponseStyle setting. Anything else falls back to "adaptive".
     private static readonly string[] SupportedResponseStyles =
     [
         "adaptive",
@@ -19,9 +26,12 @@ public static class AssistantPersonaConfiguration
         "cinematic"
     ];
 
+    // The personality used when the user has not written one (the baseline preset).
     private const string DefaultPersona =
         "Calm, precise, restrained, technically grounded, and proactively helpful. Keep replies concise, natural, and quietly confident.";
 
+    // The final persona text. Baseline preset: the user's own persona replaces the default. Other presets: the
+    // preset's persona comes first and the user's text is added as extra guidance.
     public static string Resolve(JarvisOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -39,6 +49,7 @@ public static class AssistantPersonaConfiguration
             : $"{presetPersona} Additional persona guidance: {configured}";
     }
 
+    // Returns the configured preset name in lower case, or "baseline" when it is missing or not one of the supported names.
     public static string ResolvePresencePreset(JarvisOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -49,6 +60,7 @@ public static class AssistantPersonaConfiguration
             : "baseline";
     }
 
+    // Cleans the pronunciation hint list: removes blanks and duplicates (ignoring case).
     public static IReadOnlyList<string> ResolvePronunciationHints(JarvisOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -60,11 +72,13 @@ public static class AssistantPersonaConfiguration
             .ToArray();
     }
 
+    // A prompt line telling the model to keep the persona steady and not drift with recent conversation style.
     public static string BuildStabilityInstruction()
     {
         return "Treat the configured persona as the assistant's persistent baseline identity. Keep it stable across turns and sessions. If the user requests a temporary tone or formatting change, apply it for that reply or task and then return to the configured persona. Do not let recent conversation style or learned preferences rewrite the core persona.";
     }
 
+    // A one-line, shortened persona for showing in the UI.
     public static string BuildStatusSummary(JarvisOptions options, int maxLength = 120)
     {
         if (maxLength <= 0)
@@ -76,6 +90,7 @@ public static class AssistantPersonaConfiguration
         return persona.Length <= maxLength ? persona : persona[..maxLength] + "...";
     }
 
+    // Returns the configured response style, or "adaptive" when it is missing or unsupported.
     public static string ResolveResponseStyle(JarvisOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -86,6 +101,8 @@ public static class AssistantPersonaConfiguration
             : "adaptive";
     }
 
+    // What to call the user: the nickname from settings if set, otherwise one learned from memory (a saved preference
+    // like "call the user Sir"), otherwise nothing.
     public static string ResolvePreferredUserAddress(JarvisOptions options, MemoryProfileSnapshot? memoryProfile = null)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -114,6 +131,8 @@ public static class AssistantPersonaConfiguration
         return addressPreference ?? string.Empty;
     }
 
+    // Builds the block of "how to behave" lines added to the model prompt: preset, style, small talk, nickname,
+    // pronunciation hints, then preferences learned from memory (at most 3 or 4 of each kind, most often observed first).
     public static string BuildPresenceGuidance(JarvisOptions options, MemoryProfileSnapshot? memoryProfile = null)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -145,6 +164,7 @@ public static class AssistantPersonaConfiguration
 
         if (memoryProfile is not null)
         {
+            // Tone and phrasing preferences the user has shown over time.
             var learnedPreferences = memoryProfile.Preferences
                 .Where(preference =>
                     string.Equals(preference.Category, "tone", StringComparison.OrdinalIgnoreCase)
@@ -164,6 +184,7 @@ public static class AssistantPersonaConfiguration
                 lines.AddRange(learnedPreferences.Select(value => $"- {value}"));
             }
 
+            // Preferences about apps, automations and places.
             var workflowPreferences = memoryProfile.Preferences
                 .Where(preference =>
                     string.Equals(preference.Category, "apps", StringComparison.OrdinalIgnoreCase)
@@ -182,6 +203,7 @@ public static class AssistantPersonaConfiguration
                 lines.AddRange(workflowPreferences.Select(value => $"- {value}"));
             }
 
+            // Saved routines and habits (uses the summary when there is one, otherwise the name).
             var routinesAndHabits = memoryProfile.StructuredMemories
                 .Where(memory =>
                     string.Equals(memory.Kind, "routine", StringComparison.OrdinalIgnoreCase)
@@ -205,6 +227,8 @@ public static class AssistantPersonaConfiguration
         return string.Join(Environment.NewLine, lines);
     }
 
+    // Instructions for how the text-to-speech voice should sound. An explicit VoiceInstructions setting wins;
+    // otherwise they are assembled from the persona, preset, style, small-talk setting, nickname and pronunciation hints.
     public static string ResolveVoiceInstructions(JarvisOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -233,6 +257,8 @@ public static class AssistantPersonaConfiguration
         return $"Speak in a way that matches this assistant persona: {Resolve(options)} Presence preset: {DescribePresencePreset(preset)} Response style: {DescribeResponseStyle(style)}. {smallTalk}{addressInstruction}{pronunciationInstruction}";
     }
 
+    // Speaking speed for the built-in Windows voice, from -10 (slow) to 10 (fast): whisper mode is slightly slow,
+    // operator and concise styles are slightly fast, warm, cinematic and detailed are slightly slow, everything else normal.
     public static int ResolveWindowsSpeechRate(JarvisOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -255,6 +281,7 @@ public static class AssistantPersonaConfiguration
         };
     }
 
+    // Plain-English description of a response style, inserted into prompts.
     private static string DescribeResponseStyle(string style)
     {
         return style switch
@@ -267,6 +294,7 @@ public static class AssistantPersonaConfiguration
         };
     }
 
+    // Plain-English description of a presence preset, inserted into prompts.
     private static string DescribePresencePreset(string preset)
     {
         return preset switch
@@ -278,6 +306,7 @@ public static class AssistantPersonaConfiguration
         };
     }
 
+    // The default persona text for each preset.
     private static string BuildPresetPersona(string preset)
     {
         return preset switch
@@ -289,6 +318,7 @@ public static class AssistantPersonaConfiguration
         };
     }
 
+    // Pulls the name out of a saved preference such as "Call the user Boss." (text after "call the user ", without end punctuation).
     private static string? TryExtractPreferredAddress(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -308,6 +338,7 @@ public static class AssistantPersonaConfiguration
         return string.IsNullOrWhiteSpace(remainder) ? null : remainder;
     }
 
+    // Removes one trailing full stop so preferences read cleanly as bullet points.
     private static string TrimPreferenceSentence(string value)
     {
         if (string.IsNullOrWhiteSpace(value))

@@ -1,7 +1,16 @@
+// MicrophoneProcessingProfiles.cs: turns the microphone type and saved calibration into the numbers the voice pipeline uses
+// (speech threshold, gain limit, target volume, echo and barge-in sensitivity). Output is one ResolvedMicrophoneProcessingProfile,
+// built by MicrophoneProcessingProfileResolver.Resolve and used by OpenAiCompatibleVoiceRuntime, VoiceAcousticEchoSuppressor,
+// WakeWordDetector and LectureRecorder. Two small catalogues of presets feed it: "beamforming" profiles (what kind of
+// microphone and how far away the speaker is) and "hardware DSP" profiles (what cleanup the microphone/Windows already does).
+// Most numbers are multipliers: 1.0 = no change, below 1 = more sensitive, above 1 = less sensitive. Levels are 0..1 loudness.
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// A preset describing the microphone setup. "Beamforming" = a microphone array that focuses on the speaker's direction. Scales
+// adjust how readily speech is detected (VoiceActivityScale), how far gain may go (InputGainCapScale), the volume aimed for,
+// how strict the echo check is, and the minimum peak a sound needs to count as speech. AutoKeywords are words in the device name that select it.
 internal sealed record BeamformingProfile(
     string Name,
     string DisplayName,
@@ -14,6 +23,8 @@ internal sealed record BeamformingProfile(
     double MinimumSpeechPeakLevel,
     string[] AutoKeywords);
 
+// A preset describing cleanup the hardware/Windows already does (echo cancellation, noise suppression, beamforming) and how
+// much the app should therefore trust or distrust the signal. The scales feed VoiceAcousticEchoSuppressor.
 internal sealed record HardwareDspProfile(
     string Name,
     string DisplayName,
@@ -21,18 +32,17 @@ internal sealed record HardwareDspProfile(
     bool UseHardwareEchoCancellation,
     bool UseHardwareNoiseSuppression,
     bool UseHardwareBeamforming,
-    string RealtimeNoiseReductionMode,
-    int RealtimeCaptureBufferMilliseconds,
     int RollingCaptureBufferMilliseconds,
     double VoiceActivityScale,
     double EchoGateScale,
-    double ServerVadThresholdScale,
     double PlaybackEchoFloorScale,
     double AmbientFloorScale,
     double BargeInThresholdScale,
     double ContinuingSpeechThresholdScale,
     string[] AutoKeywords);
 
+// The final combined settings for the chosen microphone: which profiles are active (requested vs. actually used), the wake
+// engine and asset, and the computed numbers used at runtime. Calibration and Validation hold the measured results, if any.
 internal sealed record ResolvedMicrophoneProcessingProfile(
     string DeviceName,
     string RequestedBeamformingProfileName,
@@ -51,17 +61,9 @@ internal sealed record ResolvedMicrophoneProcessingProfile(
     string WakeWordAssetDisplayName,
     string EffectiveWakeWordAssetPath,
     bool WakeWordAssetAutomaticallyResolved,
-    string RequestedVendorDspProfilePath,
-    string VendorDspProfileDisplayName,
-    string EffectiveVendorDspProfilePath,
-    string EffectiveVendorDspDescription,
-    bool VendorDspProfileAutomaticallyResolved,
     bool HardwareEchoCancellationEnabled,
     bool HardwareNoiseSuppressionEnabled,
     bool HardwareBeamformingEnabled,
-    bool UseFarFieldNoiseReduction,
-    string? RealtimeNoiseReductionMode,
-    int RealtimeCaptureBufferMilliseconds,
     int RollingCaptureBufferMilliseconds,
     double VoiceActivityThreshold,
     double AmbientNoiseFloor,
@@ -69,7 +71,6 @@ internal sealed record ResolvedMicrophoneProcessingProfile(
     double TargetPeakLevel,
     double EchoGateScale,
     double MinimumSpeechPeakLevel,
-    double ServerVadThresholdScale,
     double PlaybackEchoFloorScale,
     double AmbientFloorScale,
     double BargeInThresholdScale,
@@ -77,6 +78,7 @@ internal sealed record ResolvedMicrophoneProcessingProfile(
     SpeechRecognitionCalibrationProfile? Calibration,
     SpeechRecognitionValidationProfile? Validation)
 {
+    // One-line summary for the status bar.
     public string BuildStatusLabel()
     {
         var calibrationLabel = Calibration is null ? "uncalibrated" : "calibrated";
@@ -89,17 +91,13 @@ internal sealed record ResolvedMicrophoneProcessingProfile(
             EffectiveHardwareDspDisplayName
         };
 
-        if (!string.IsNullOrWhiteSpace(EffectiveVendorDspProfilePath))
-        {
-            parts.Add(VendorDspProfileDisplayName);
-        }
-
         parts.Add(WakeEngineDisplayName);
         parts.Add(calibrationLabel);
         parts.Add(validationLabel);
         return string.Join(", ", parts);
     }
 
+    // Longer summary for the settings screen (calibration, wake and duplex scores, profile names).
     public string BuildUiSummary()
     {
         var parts = new List<string>();
@@ -122,11 +120,6 @@ internal sealed record ResolvedMicrophoneProcessingProfile(
         parts.Add(EffectiveBeamformingDisplayName);
         parts.Add(EffectiveHardwareDspDisplayName);
 
-        if (!string.IsNullOrWhiteSpace(EffectiveVendorDspProfilePath))
-        {
-            parts.Add(VendorDspProfileDisplayName);
-        }
-
         parts.Add(WakeEngineDisplayName);
 
         if (!string.IsNullOrWhiteSpace(WakeWordAssetDisplayName))
@@ -138,8 +131,10 @@ internal sealed record ResolvedMicrophoneProcessingProfile(
     }
 }
 
+// The list of beamforming presets and the rules for choosing one.
 internal static class BeamformingProfileCatalog
 {
+    // Presets: auto, off, desktop (default), headset (close, so more sensitive), conference and far-field-array (further away, so less sensitive and more gain).
     public static IReadOnlyList<BeamformingProfile> All { get; } =
     [
         new(
@@ -210,6 +205,7 @@ internal static class BeamformingProfileCatalog
             AutoKeywords: ["array", "beam", "far field", "far-field", "respeaker", "smart speaker", "studio mic"])
     ];
 
+    // Returns the named preset; "auto" is chosen from the device name; an unknown name falls back to "desktop".
     public static BeamformingProfile Resolve(string? requestedName, string? deviceName)
     {
         var normalized = Normalize(requestedName);
@@ -223,6 +219,7 @@ internal static class BeamformingProfileCatalog
             ?? All.First(profile => profile.Name == "desktop");
     }
 
+    // Chooses a preset by looking for keywords ("headset", "array", "usb"...) in the microphone name; "desktop" if nothing matches.
     public static BeamformingProfile ResolveAuto(string? deviceName)
     {
         var name = deviceName?.Trim() ?? string.Empty;
@@ -243,6 +240,7 @@ internal static class BeamformingProfileCatalog
         return All.First(profile => profile.Name == "desktop");
     }
 
+    // Empty means "auto"; otherwise lower-case.
     private static string Normalize(string? name)
     {
         return string.IsNullOrWhiteSpace(name)
@@ -251,8 +249,11 @@ internal static class BeamformingProfileCatalog
     }
 }
 
+// The list of hardware-cleanup presets and the rules for choosing one.
 internal static class HardwareDspProfileCatalog
 {
+    // Presets: auto, off ("software only"), system-aec (Windows echo cancellation), voice-processing, conference-array, vendor-beamforming.
+    // RollingCaptureBufferMilliseconds is the length of each recorded chunk (shorter = quicker reaction).
     public static IReadOnlyList<HardwareDspProfile> All { get; } =
     [
         new(
@@ -262,12 +263,9 @@ internal static class HardwareDspProfileCatalog
             UseHardwareEchoCancellation: false,
             UseHardwareNoiseSuppression: false,
             UseHardwareBeamforming: false,
-            RealtimeNoiseReductionMode: string.Empty,
-            RealtimeCaptureBufferMilliseconds: 20,
             RollingCaptureBufferMilliseconds: 60,
             VoiceActivityScale: 1.0,
             EchoGateScale: 1.0,
-            ServerVadThresholdScale: 1.0,
             PlaybackEchoFloorScale: 1.0,
             AmbientFloorScale: 1.0,
             BargeInThresholdScale: 1.0,
@@ -280,12 +278,9 @@ internal static class HardwareDspProfileCatalog
             UseHardwareEchoCancellation: false,
             UseHardwareNoiseSuppression: false,
             UseHardwareBeamforming: false,
-            RealtimeNoiseReductionMode: string.Empty,
-            RealtimeCaptureBufferMilliseconds: 20,
             RollingCaptureBufferMilliseconds: 60,
             VoiceActivityScale: 1.0,
             EchoGateScale: 1.0,
-            ServerVadThresholdScale: 1.0,
             PlaybackEchoFloorScale: 1.0,
             AmbientFloorScale: 1.0,
             BargeInThresholdScale: 1.0,
@@ -298,12 +293,9 @@ internal static class HardwareDspProfileCatalog
             UseHardwareEchoCancellation: true,
             UseHardwareNoiseSuppression: true,
             UseHardwareBeamforming: false,
-            RealtimeNoiseReductionMode: "near_field",
-            RealtimeCaptureBufferMilliseconds: 18,
             RollingCaptureBufferMilliseconds: 48,
             VoiceActivityScale: 0.94,
             EchoGateScale: 0.82,
-            ServerVadThresholdScale: 0.94,
             PlaybackEchoFloorScale: 0.82,
             AmbientFloorScale: 0.92,
             BargeInThresholdScale: 0.88,
@@ -316,12 +308,9 @@ internal static class HardwareDspProfileCatalog
             UseHardwareEchoCancellation: true,
             UseHardwareNoiseSuppression: true,
             UseHardwareBeamforming: false,
-            RealtimeNoiseReductionMode: "near_field",
-            RealtimeCaptureBufferMilliseconds: 18,
             RollingCaptureBufferMilliseconds: 46,
             VoiceActivityScale: 0.92,
             EchoGateScale: 0.78,
-            ServerVadThresholdScale: 0.92,
             PlaybackEchoFloorScale: 0.78,
             AmbientFloorScale: 0.90,
             BargeInThresholdScale: 0.82,
@@ -334,12 +323,9 @@ internal static class HardwareDspProfileCatalog
             UseHardwareEchoCancellation: true,
             UseHardwareNoiseSuppression: true,
             UseHardwareBeamforming: true,
-            RealtimeNoiseReductionMode: "far_field",
-            RealtimeCaptureBufferMilliseconds: 16,
             RollingCaptureBufferMilliseconds: 42,
             VoiceActivityScale: 1.08,
             EchoGateScale: 0.74,
-            ServerVadThresholdScale: 0.98,
             PlaybackEchoFloorScale: 0.70,
             AmbientFloorScale: 0.88,
             BargeInThresholdScale: 0.74,
@@ -352,12 +338,9 @@ internal static class HardwareDspProfileCatalog
             UseHardwareEchoCancellation: false,
             UseHardwareNoiseSuppression: true,
             UseHardwareBeamforming: true,
-            RealtimeNoiseReductionMode: "far_field",
-            RealtimeCaptureBufferMilliseconds: 16,
             RollingCaptureBufferMilliseconds: 44,
             VoiceActivityScale: 1.02,
             EchoGateScale: 0.88,
-            ServerVadThresholdScale: 1.00,
             PlaybackEchoFloorScale: 0.80,
             AmbientFloorScale: 0.90,
             BargeInThresholdScale: 0.80,
@@ -365,6 +348,7 @@ internal static class HardwareDspProfileCatalog
             AutoKeywords: ["array", "beam", "far field", "far-field", "respeaker", "smart speaker"])
     ];
 
+    // Returns the named preset, or picks automatically if the name is unknown.
     public static HardwareDspProfile Resolve(
         string? requestedName,
         string? deviceName,
@@ -381,6 +365,7 @@ internal static class HardwareDspProfileCatalog
             ?? ResolveAuto(deviceName, beamformingProfile);
     }
 
+    // Chooses by the beamforming preset first (far-field array and conference microphones imply matching hardware), then by device-name keywords; otherwise "off".
     public static HardwareDspProfile ResolveAuto(string? deviceName, BeamformingProfile beamformingProfile)
     {
         var name = deviceName?.Trim() ?? string.Empty;
@@ -406,6 +391,7 @@ internal static class HardwareDspProfileCatalog
         return All.First(profile => profile.Name == "off");
     }
 
+    // Empty means "auto"; otherwise lower-case.
     private static string Normalize(string? name)
     {
         return string.IsNullOrWhiteSpace(name)
@@ -414,8 +400,11 @@ internal static class HardwareDspProfileCatalog
     }
 }
 
+// Combines the user's settings, saved calibration, saved validation and wake asset/engine choice into one profile.
 internal static class MicrophoneProcessingProfileResolver
 {
+    // The choices depend on each other (the saved calibration to use depends on the profile, and the profile can depend on the
+    // calibration), so Resolve works in rounds: a first guess, find the calibration, a second guess, find the validation, a final pass.
     public static ResolvedMicrophoneProcessingProfile Resolve(JarvisOptions options)
     {
         var selectedWakeWordAsset = WakeWordAssetCatalog.ResolveSelectionDescriptor(options);
@@ -435,19 +424,10 @@ internal static class MicrophoneProcessingProfileResolver
             initialRequestedWakeEnginePath,
             initialBeamformingProfile.Name,
             initialHardwareDspProfile.Name);
-        var initialRequestedVendorDspProfilePath = ResolveRequestedVendorDspProfilePath(options, validation: null, wakeWordAsset);
-        var selectedVendorDspProfile = VendorDspProfileCatalog.ResolveSelectionDescriptor(options);
-        var vendorDspProfile = ResolveVendorDspProfile(
-            options,
-            wakeWordAsset,
-            initialRequestedVendorDspProfilePath,
-            initialBeamformingProfile.Name,
-            initialHardwareDspProfile.Name);
         var calibration = ResolveCalibration(
             options,
             initialBeamformingProfile.Name,
-            initialHardwareDspProfile.Name,
-            vendorDspProfile);
+            initialHardwareDspProfile.Name);
         var requestedBeamformingProfileName = ResolveRequestedBeamformingProfile(options, calibration, wakeWordAsset);
         var beamformingProfile = BeamformingProfileCatalog.Resolve(requestedBeamformingProfileName, options.SpeechRecognitionDeviceName);
         var tentativeHardwareDspProfileName = ResolveRequestedHardwareDspProfile(options, validation: null, wakeWordAsset);
@@ -462,20 +442,12 @@ internal static class MicrophoneProcessingProfileResolver
             tentativeWakeEnginePath,
             beamformingProfile.Name,
             hardwareDspProfile.Name);
-        var tentativeVendorDspProfilePath = ResolveRequestedVendorDspProfilePath(options, validation: null, wakeWordAsset);
-        vendorDspProfile = ResolveVendorDspProfile(
-            options,
-            wakeWordAsset,
-            tentativeVendorDspProfilePath,
-            beamformingProfile.Name,
-            hardwareDspProfile.Name);
         var validation = ResolveValidation(
             options,
             wakeWordAsset,
             wakeEngine,
             beamformingProfile.Name,
-            hardwareDspProfile.Name,
-            vendorDspProfile);
+            hardwareDspProfile.Name);
         var requestedHardwareDspProfileName = ResolveRequestedHardwareDspProfile(options, validation, wakeWordAsset);
         hardwareDspProfile = HardwareDspProfileCatalog.Resolve(
             requestedHardwareDspProfileName,
@@ -488,21 +460,15 @@ internal static class MicrophoneProcessingProfileResolver
             requestedWakeEnginePath,
             beamformingProfile.Name,
             hardwareDspProfile.Name);
-        var requestedVendorDspProfilePath = ResolveRequestedVendorDspProfilePath(options, validation, wakeWordAsset);
-        vendorDspProfile = ResolveVendorDspProfile(
-            options,
-            wakeWordAsset,
-            requestedVendorDspProfilePath,
-            beamformingProfile.Name,
-            hardwareDspProfile.Name);
         validation = ResolveValidation(
             options,
             wakeWordAsset,
             wakeEngine,
             beamformingProfile.Name,
-            hardwareDspProfile.Name,
-            vendorDspProfile);
+            hardwareDspProfile.Name);
 
+        // Speech threshold: the calibrated value if there is one, else the setting; scaled by the beamforming and hardware presets (and
+        // 6% lower when the wake word was found unreliable in testing), kept between 0.0025 and 0.040.
         var baseThreshold = calibration?.RecommendedVoiceActivityThreshold > 0
             ? calibration.RecommendedVoiceActivityThreshold
             : options.SpeechRecognitionVoiceActivityThreshold;
@@ -513,50 +479,43 @@ internal static class MicrophoneProcessingProfileResolver
             baseThreshold
             * beamformingProfile.VoiceActivityScale
             * hardwareDspProfile.VoiceActivityScale
-            * vendorDspProfile.VoiceActivityScale
             * wakeSensitivityScale,
             0.0025,
             0.040);
+        // Room noise level: from calibration, else 30% of the speech threshold; never under 22% of the threshold; kept between 0.0015 and 0.10.
         var ambientNoiseFloor = Math.Clamp(
             Math.Max(calibration?.AmbientRmsLevel ?? (voiceActivityThreshold * 0.30), voiceActivityThreshold * 0.22),
             0.0015,
             0.10);
+        // Largest automatic volume boost: calibrated value (default 4x) times the preset, kept between 1x and 6x.
         var inputGainCap = Math.Clamp(
             (calibration?.RecommendedInputGainCap ?? 4.0)
-            * beamformingProfile.InputGainCapScale
-            * vendorDspProfile.InputGainCapScale,
+            * beamformingProfile.InputGainCapScale,
             1.0,
             6.0);
+        // Volume the automatic gain aims for (the loudest sample): the preset's value, or the average of preset and calibration, kept between 0.24 and 0.50.
         var targetPeak = Math.Clamp(
             (calibration is null
                 ? beamformingProfile.TargetPeakLevel
-                : (calibration.RecommendedTargetPeakLevel + beamformingProfile.TargetPeakLevel) / 2.0)
-            * vendorDspProfile.TargetPeakLevelScale,
+                : (calibration.RecommendedTargetPeakLevel + beamformingProfile.TargetPeakLevel) / 2.0),
             0.24,
             0.50);
+        // If testing showed Jarvis's own voice leaks into the microphone, the echo gate is made stricter (up to 1.18x); good full-duplex scores relax it to 0.96x.
         var validationEchoScale = validation is null
             ? 1.0
             : Math.Clamp(1.18 - (validation.FullDuplexReadinessScore * 0.18), 0.96, 1.18);
+        // Weak full-duplex score raises the minimum peak a sound needs to count as the user interrupting (up to +0.018).
         var validationSpeechPeakOffset = validation is null
             ? 0
             : Math.Clamp((0.70 - validation.FullDuplexReadinessScore) * 0.028, 0, 0.018);
-        var useFarFieldNoiseReduction = beamformingProfile.UseFarFieldNoiseReduction
-            || string.Equals(hardwareDspProfile.RealtimeNoiseReductionMode, "far_field", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(vendorDspProfile.RealtimeNoiseReductionMode, "far_field", StringComparison.OrdinalIgnoreCase);
-        var hardwareEchoCancellationEnabled = hardwareDspProfile.UseHardwareEchoCancellation
-            || vendorDspProfile.UseHardwareEchoCancellation;
-        var hardwareNoiseSuppressionEnabled = hardwareDspProfile.UseHardwareNoiseSuppression
-            || vendorDspProfile.UseHardwareNoiseSuppression;
+        var hardwareEchoCancellationEnabled = hardwareDspProfile.UseHardwareEchoCancellation;
+        var hardwareNoiseSuppressionEnabled = hardwareDspProfile.UseHardwareNoiseSuppression;
+        // Beamforming counts as on when enabled in settings or implied by the preset.
         var hardwareBeamformingEnabled = options.SpeechRecognitionBeamformingEnabled
             || beamformingProfile.UseFarFieldNoiseReduction
-            || hardwareDspProfile.UseHardwareBeamforming
-            || vendorDspProfile.UseHardwareBeamforming;
-        var realtimeNoiseReductionMode = ResolveRealtimeNoiseReductionMode(
-            options,
-            hardwareDspProfile,
-            vendorDspProfile,
-            useFarFieldNoiseReduction);
+            || hardwareDspProfile.UseHardwareBeamforming;
 
+        // Assemble the result; scales are clamped to safe ranges.
         return new ResolvedMicrophoneProcessingProfile(
             DeviceName: options.SpeechRecognitionDeviceName?.Trim() ?? string.Empty,
             RequestedBeamformingProfileName: requestedBeamformingProfileName,
@@ -575,22 +534,10 @@ internal static class MicrophoneProcessingProfileResolver
             WakeWordAssetDisplayName: BuildWakeWordAssetDisplayName(selectedWakeWordAsset, wakeWordAsset),
             EffectiveWakeWordAssetPath: wakeWordAsset?.Path ?? string.Empty,
             WakeWordAssetAutomaticallyResolved: selectedWakeWordAsset.IsAutomaticSelection,
-            RequestedVendorDspProfilePath: requestedVendorDspProfilePath,
-            VendorDspProfileDisplayName: BuildVendorDspProfileDisplayName(selectedVendorDspProfile, vendorDspProfile),
-            EffectiveVendorDspProfilePath: vendorDspProfile.Path,
-            EffectiveVendorDspDescription: vendorDspProfile.Description,
-            VendorDspProfileAutomaticallyResolved: selectedVendorDspProfile.IsAutomaticSelection,
             HardwareEchoCancellationEnabled: hardwareEchoCancellationEnabled,
             HardwareNoiseSuppressionEnabled: hardwareNoiseSuppressionEnabled,
             HardwareBeamformingEnabled: hardwareBeamformingEnabled,
-            UseFarFieldNoiseReduction: useFarFieldNoiseReduction,
-            RealtimeNoiseReductionMode: realtimeNoiseReductionMode,
-            RealtimeCaptureBufferMilliseconds: vendorDspProfile.RealtimeCaptureBufferMilliseconds > 0
-                ? vendorDspProfile.RealtimeCaptureBufferMilliseconds
-                : hardwareDspProfile.RealtimeCaptureBufferMilliseconds,
-            RollingCaptureBufferMilliseconds: vendorDspProfile.RollingCaptureBufferMilliseconds > 0
-                ? vendorDspProfile.RollingCaptureBufferMilliseconds
-                : hardwareDspProfile.RollingCaptureBufferMilliseconds,
+            RollingCaptureBufferMilliseconds: hardwareDspProfile.RollingCaptureBufferMilliseconds,
             VoiceActivityThreshold: voiceActivityThreshold,
             AmbientNoiseFloor: ambientNoiseFloor,
             InputGainCap: inputGainCap,
@@ -598,77 +545,39 @@ internal static class MicrophoneProcessingProfileResolver
             EchoGateScale: Math.Clamp(
                 beamformingProfile.EchoGateScale
                 * hardwareDspProfile.EchoGateScale
-                * vendorDspProfile.EchoGateScale
                 * validationEchoScale,
                 0.70,
                 1.80),
             MinimumSpeechPeakLevel: Math.Clamp(
                 beamformingProfile.MinimumSpeechPeakLevel
-                + vendorDspProfile.MinimumSpeechPeakLevelOffset
                 + validationSpeechPeakOffset,
                 0.030,
                 0.12),
-            ServerVadThresholdScale: Math.Clamp(
-                hardwareDspProfile.ServerVadThresholdScale * vendorDspProfile.ServerVadThresholdScale,
-                0.60,
-                1.80),
             PlaybackEchoFloorScale: Math.Clamp(
-                hardwareDspProfile.PlaybackEchoFloorScale * vendorDspProfile.PlaybackEchoFloorScale,
+                hardwareDspProfile.PlaybackEchoFloorScale,
                 0.55,
                 1.80),
             AmbientFloorScale: Math.Clamp(
-                hardwareDspProfile.AmbientFloorScale * vendorDspProfile.AmbientFloorScale,
+                hardwareDspProfile.AmbientFloorScale,
                 0.55,
                 1.80),
             BargeInThresholdScale: Math.Clamp(
-                hardwareDspProfile.BargeInThresholdScale * vendorDspProfile.BargeInThresholdScale,
+                hardwareDspProfile.BargeInThresholdScale,
                 0.55,
                 1.90),
             ContinuingSpeechThresholdScale: Math.Clamp(
-                hardwareDspProfile.ContinuingSpeechThresholdScale * vendorDspProfile.ContinuingSpeechThresholdScale,
+                hardwareDspProfile.ContinuingSpeechThresholdScale,
                 0.55,
                 1.90),
             Calibration: calibration,
             Validation: validation);
     }
 
-    private static string? ResolveRealtimeNoiseReductionMode(
-        JarvisOptions options,
-        HardwareDspProfile hardwareDspProfile,
-        VendorDspProfileDescriptor vendorDspProfile,
-        bool useFarFieldNoiseReduction)
-    {
-        if (!options.SpeechRecognitionNoiseSuppressionEnabled
-            && !options.SpeechRecognitionEchoCancellationEnabled
-            && !hardwareDspProfile.UseHardwareBeamforming
-            && !hardwareDspProfile.UseHardwareEchoCancellation
-            && !hardwareDspProfile.UseHardwareNoiseSuppression
-            && !vendorDspProfile.UseHardwareBeamforming
-            && !vendorDspProfile.UseHardwareEchoCancellation
-            && !vendorDspProfile.UseHardwareNoiseSuppression
-            && !useFarFieldNoiseReduction)
-        {
-            return null;
-        }
-
-        if (!string.IsNullOrWhiteSpace(vendorDspProfile.RealtimeNoiseReductionMode))
-        {
-            return vendorDspProfile.RealtimeNoiseReductionMode;
-        }
-
-        if (!string.IsNullOrWhiteSpace(hardwareDspProfile.RealtimeNoiseReductionMode))
-        {
-            return hardwareDspProfile.RealtimeNoiseReductionMode;
-        }
-
-        return useFarFieldNoiseReduction ? "far_field" : "near_field";
-    }
-
+    // Finds the saved calibration for this microphone, best-matching beamforming/DSP profile first, newest as tie-breaker. Null if none.
     private static SpeechRecognitionCalibrationProfile? ResolveCalibration(
         JarvisOptions options,
         string beamformingProfileName,
-        string hardwareDspProfileName,
-        VendorDspProfileDescriptor vendorDspProfile)
+        string hardwareDspProfileName)
     {
         if (options.SpeechRecognitionCalibrationProfiles.Length == 0
             || string.IsNullOrWhiteSpace(options.SpeechRecognitionDeviceName))
@@ -678,10 +587,6 @@ internal static class MicrophoneProcessingProfileResolver
 
         var normalizedBeamformingProfileName = NormalizeProfileName(beamformingProfileName);
         var normalizedHardwareDspProfileName = NormalizeProfileName(hardwareDspProfileName);
-        var normalizedVendorDspProfilePath = VendorDspProfileCatalog.NormalizeStoredPath(vendorDspProfile.Path);
-        var normalizedVendorDspProfileName = vendorDspProfile.IsNone
-            ? "No Vendor SDK"
-            : vendorDspProfile.BuildShortLabel();
 
         return options.SpeechRecognitionCalibrationProfiles
             .Where(profile =>
@@ -695,9 +600,7 @@ internal static class MicrophoneProcessingProfileResolver
                 Score = ScoreCalibrationProfile(
                     profile,
                     normalizedBeamformingProfileName,
-                    normalizedHardwareDspProfileName,
-                    normalizedVendorDspProfilePath,
-                    normalizedVendorDspProfileName)
+                    normalizedHardwareDspProfileName)
             })
             .OrderByDescending(item => item.Score)
             .ThenByDescending(item => item.Profile.CapturedUtc)
@@ -705,13 +608,13 @@ internal static class MicrophoneProcessingProfileResolver
             .FirstOrDefault();
     }
 
+    // Finds the saved validation for this microphone, best matching the wake asset, wake engine and profiles, newest first. Null if none.
     private static SpeechRecognitionValidationProfile? ResolveValidation(
         JarvisOptions options,
         WakeWordAssetDescriptor? wakeWordAsset,
         WakeWordEngineDescriptor wakeEngine,
         string beamformingProfileName,
-        string hardwareDspProfileName,
-        VendorDspProfileDescriptor vendorDspProfile)
+        string hardwareDspProfileName)
     {
         if (options.SpeechRecognitionValidationProfiles.Length == 0
             || string.IsNullOrWhiteSpace(options.SpeechRecognitionDeviceName))
@@ -725,10 +628,6 @@ internal static class MicrophoneProcessingProfileResolver
         var normalizedWakeEngineName = wakeEngine.BuildShortLabel();
         var normalizedBeamformingProfileName = NormalizeProfileName(beamformingProfileName);
         var normalizedHardwareDspProfileName = NormalizeProfileName(hardwareDspProfileName);
-        var normalizedVendorDspProfilePath = VendorDspProfileCatalog.NormalizeStoredPath(vendorDspProfile.Path);
-        var normalizedVendorDspProfileName = vendorDspProfile.IsNone
-            ? "No Vendor SDK"
-            : vendorDspProfile.BuildShortLabel();
 
         return options.SpeechRecognitionValidationProfiles
             .Where(profile =>
@@ -746,9 +645,7 @@ internal static class MicrophoneProcessingProfileResolver
                     normalizedWakeEnginePath,
                     normalizedWakeEngineName,
                     normalizedBeamformingProfileName,
-                    normalizedHardwareDspProfileName,
-                    normalizedVendorDspProfilePath,
-                    normalizedVendorDspProfileName)
+                    normalizedHardwareDspProfileName)
             })
             .OrderByDescending(item => item.Score)
             .ThenByDescending(item => item.Profile.ValidatedUtc)
@@ -756,6 +653,7 @@ internal static class MicrophoneProcessingProfileResolver
             .FirstOrDefault();
     }
 
+    // Which beamforming profile to request. Order of preference: explicit setting, the profile the calibration was made with, the wake asset's preference, else "auto".
     private static string ResolveRequestedBeamformingProfile(
         JarvisOptions options,
         SpeechRecognitionCalibrationProfile? calibration,
@@ -782,6 +680,7 @@ internal static class MicrophoneProcessingProfileResolver
             : options.SpeechRecognitionBeamformingProfile.Trim();
     }
 
+    // Which hardware DSP profile to request. Order: explicit setting, the validation's profile, the wake asset's preference, else "auto".
     private static string ResolveRequestedHardwareDspProfile(
         JarvisOptions options,
         SpeechRecognitionValidationProfile? validation,
@@ -809,6 +708,7 @@ internal static class MicrophoneProcessingProfileResolver
             : options.SpeechRecognitionHardwareDspProfile.Trim();
     }
 
+    // Which wake engine file to request. Order: explicit setting, the validation's choice, the wake asset's preference, else "auto".
     private static string ResolveRequestedWakeEnginePath(
         JarvisOptions options,
         SpeechRecognitionValidationProfile? validation,
@@ -837,34 +737,7 @@ internal static class MicrophoneProcessingProfileResolver
             : WakeWordEngineCatalog.NormalizeStoredPath(options.SpeechRecognitionWakeEnginePath);
     }
 
-    private static string ResolveRequestedVendorDspProfilePath(
-        JarvisOptions options,
-        SpeechRecognitionValidationProfile? validation,
-        WakeWordAssetDescriptor? wakeWordAsset)
-    {
-        if (!string.IsNullOrWhiteSpace(options.SpeechRecognitionVendorDspProfilePath)
-            && !VendorDspProfileCatalog.IsAutoSelectionPath(options.SpeechRecognitionVendorDspProfilePath))
-        {
-            return VendorDspProfileCatalog.NormalizeStoredPath(options.SpeechRecognitionVendorDspProfilePath);
-        }
-
-        if (validation is not null
-            && (!string.IsNullOrWhiteSpace(validation.VendorDspProfilePath)
-                || !string.IsNullOrWhiteSpace(validation.VendorDspProfileName)))
-        {
-            return VendorDspProfileCatalog.NormalizeStoredPath(validation.VendorDspProfilePath);
-        }
-
-        if (!string.IsNullOrWhiteSpace(wakeWordAsset?.PreferredVendorDspProfilePath))
-        {
-            return VendorDspProfileCatalog.NormalizeStoredPath(wakeWordAsset.PreferredVendorDspProfilePath);
-        }
-
-        return string.IsNullOrWhiteSpace(options.SpeechRecognitionVendorDspProfilePath)
-            ? VendorDspProfileCatalog.AutoSelectionPath
-            : VendorDspProfileCatalog.NormalizeStoredPath(options.SpeechRecognitionVendorDspProfilePath);
-    }
-
+    // Finds the wake engine: "auto" picks the best for the microphone, otherwise the named file.
     private static WakeWordEngineDescriptor ResolveWakeEngine(
         JarvisOptions options,
         WakeWordAssetDescriptor? wakeWordAsset,
@@ -890,31 +763,7 @@ internal static class MicrophoneProcessingProfileResolver
             requestedWakeEnginePath);
     }
 
-    private static VendorDspProfileDescriptor ResolveVendorDspProfile(
-        JarvisOptions options,
-        WakeWordAssetDescriptor? wakeWordAsset,
-        string requestedVendorDspProfilePath,
-        string beamformingProfileName,
-        string hardwareDspProfileName)
-    {
-        if (VendorDspProfileCatalog.IsAutoSelectionPath(requestedVendorDspProfilePath))
-        {
-            return VendorDspProfileCatalog.ResolveConfiguredProfile(
-                options with
-                {
-                    SpeechRecognitionVendorDspProfilePath = VendorDspProfileCatalog.AutoSelectionPath
-                },
-                wakeWordAsset,
-                beamformingProfileName,
-                hardwareDspProfileName);
-        }
-
-        return VendorDspProfileCatalog.ResolveDescriptorByPath(
-            Directory.GetCurrentDirectory(),
-            options,
-            requestedVendorDspProfilePath);
-    }
-
+    // Text like "Auto -> Hey Jarvis" so the UI shows both the setting and what it resolved to.
     private static string BuildWakeWordAssetDisplayName(
         WakeWordAssetDescriptor selectionDescriptor,
         WakeWordAssetDescriptor? effectiveDescriptor)
@@ -929,6 +778,7 @@ internal static class MicrophoneProcessingProfileResolver
         return effectiveDescriptor?.BuildShortLabel() ?? "Recognizer Default";
     }
 
+    // Same idea for the wake engine name.
     private static string BuildWakeEngineDisplayName(
         WakeWordEngineDescriptor selectionDescriptor,
         WakeWordEngineDescriptor effectiveDescriptor)
@@ -941,32 +791,15 @@ internal static class MicrophoneProcessingProfileResolver
         return effectiveDescriptor.BuildShortLabel();
     }
 
-    private static string BuildVendorDspProfileDisplayName(
-        VendorDspProfileDescriptor selectionDescriptor,
-        VendorDspProfileDescriptor effectiveDescriptor)
-    {
-        if (selectionDescriptor.IsAutomaticSelection)
-        {
-            return $"Auto -> {effectiveDescriptor.BuildShortLabel()}";
-        }
-
-        return effectiveDescriptor.BuildShortLabel();
-    }
-
+    // Match score between a saved calibration and the current profiles: +24 beamforming match (+10 if either is "auto"), +18 hardware match (+8 for "auto").
     private static int ScoreCalibrationProfile(
         SpeechRecognitionCalibrationProfile profile,
         string normalizedBeamformingProfileName,
-        string normalizedHardwareDspProfileName,
-        string normalizedVendorDspProfilePath,
-        string normalizedVendorDspProfileName)
+        string normalizedHardwareDspProfileName)
     {
         var score = 0;
         var profileBeamformingProfileName = NormalizeProfileName(profile.PreferredBeamformingProfile);
         var profileHardwareDspProfileName = NormalizeProfileName(profile.HardwareDspProfileName);
-        var profileVendorDspProfilePath = VendorDspProfileCatalog.NormalizeStoredPath(profile.VendorDspProfilePath);
-        var profileVendorDspProfileName = string.IsNullOrWhiteSpace(profile.VendorDspProfileName)
-            ? "No Vendor SDK"
-            : profile.VendorDspProfileName.Trim();
 
         if (string.Equals(profileBeamformingProfileName, normalizedBeamformingProfileName, StringComparison.OrdinalIgnoreCase))
         {
@@ -986,26 +819,11 @@ internal static class MicrophoneProcessingProfileResolver
             score += 8;
         }
 
-        if (string.IsNullOrWhiteSpace(normalizedVendorDspProfilePath))
-        {
-            if (string.IsNullOrWhiteSpace(profileVendorDspProfilePath)
-                && string.Equals(profileVendorDspProfileName, "No Vendor SDK", StringComparison.OrdinalIgnoreCase))
-            {
-                score += 20;
-            }
-        }
-        else if (VendorDspProfileCatalog.StoredPathsMatch(profileVendorDspProfilePath, normalizedVendorDspProfilePath))
-        {
-            score += 24;
-        }
-        else if (string.Equals(profileVendorDspProfileName, normalizedVendorDspProfileName, StringComparison.OrdinalIgnoreCase))
-        {
-            score += 14;
-        }
-
         return score;
     }
 
+    // Match score between a saved validation and the current setup: wake asset (34 path / 28 default / 18 name), wake engine (30 / 26 / 16),
+    // beamforming (24, or 10 for "auto") and hardware profile (24, or 10 for "auto").
     private static int ScoreValidationProfile(
         SpeechRecognitionValidationProfile profile,
         string normalizedWakeWordAssetPath,
@@ -1013,9 +831,7 @@ internal static class MicrophoneProcessingProfileResolver
         string normalizedWakeEnginePath,
         string normalizedWakeEngineName,
         string normalizedBeamformingProfileName,
-        string normalizedHardwareDspProfileName,
-        string normalizedVendorDspProfilePath,
-        string normalizedVendorDspProfileName)
+        string normalizedHardwareDspProfileName)
     {
         var score = 0;
         var profileWakeWordAssetPath = WakeWordAssetCatalog.NormalizeStoredPath(profile.WakeWordAssetPath);
@@ -1028,10 +844,6 @@ internal static class MicrophoneProcessingProfileResolver
             : profile.WakeEngineName.Trim();
         var profileBeamformingProfileName = NormalizeProfileName(profile.BeamformingProfileName);
         var profileHardwareDspProfileName = NormalizeProfileName(profile.HardwareDspProfileName);
-        var profileVendorDspProfilePath = VendorDspProfileCatalog.NormalizeStoredPath(profile.VendorDspProfilePath);
-        var profileVendorDspProfileName = string.IsNullOrWhiteSpace(profile.VendorDspProfileName)
-            ? "No Vendor SDK"
-            : profile.VendorDspProfileName.Trim();
 
         if (string.IsNullOrWhiteSpace(normalizedWakeWordAssetPath))
         {
@@ -1085,26 +897,10 @@ internal static class MicrophoneProcessingProfileResolver
             score += 10;
         }
 
-        if (string.IsNullOrWhiteSpace(normalizedVendorDspProfilePath))
-        {
-            if (string.IsNullOrWhiteSpace(profileVendorDspProfilePath)
-                && string.Equals(profileVendorDspProfileName, "No Vendor SDK", StringComparison.OrdinalIgnoreCase))
-            {
-                score += 20;
-            }
-        }
-        else if (VendorDspProfileCatalog.StoredPathsMatch(profileVendorDspProfilePath, normalizedVendorDspProfilePath))
-        {
-            score += 26;
-        }
-        else if (string.Equals(profileVendorDspProfileName, normalizedVendorDspProfileName, StringComparison.OrdinalIgnoreCase))
-        {
-            score += 14;
-        }
-
         return score;
     }
 
+    // Empty means "auto"; otherwise lower-case.
     private static string NormalizeProfileName(string? profileName)
     {
         return string.IsNullOrWhiteSpace(profileName)

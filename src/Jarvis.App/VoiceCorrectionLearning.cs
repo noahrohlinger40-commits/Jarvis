@@ -1,15 +1,22 @@
+// VoiceCorrectionLearning.cs: lets Noah teach Jarvis its speech mistakes by voice. Saying "no, I said open Spotify, not open
+// spot of eye" is parsed here, and the pair is stored in the settings (SpeechRecognitionCorrections). VoiceRecognitionText
+// then applies these replacements to every later transcript. Options are immutable records, so each method returns a new copy.
 using System.Text.RegularExpressions;
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// A parsed correction: what the user meant (CorrectedText) and what the recogniser wrongly wrote (HeardText).
 internal sealed record VoiceCorrectionDirective(string CorrectedText, string HeardText);
 
+// Static helpers; "partial" because the regexes below are generated at compile time.
 internal static partial class VoiceCorrectionLearning
 {
+    // At most 48 learned corrections and 48 remembered rejected phrases are kept (the most used / most recent win).
     private const int MaxCorrectionEntries = 48;
     private const int MaxRejectedPhraseEntries = 48;
 
+    // Recognises a spoken correction sentence in either order and extracts the two phrases. Returns false if it is not a correction.
     public static bool TryParseCorrectionDirective(string input, out VoiceCorrectionDirective directive)
     {
         directive = default!;
@@ -20,6 +27,7 @@ internal static partial class VoiceCorrectionLearning
         }
 
         var trimmed = CollapseWhitespace(input);
+        // Tries "I said X, not Y" first, then "you heard Y, but I said X".
         var match = HeardSecondCorrectionRegex().Match(trimmed);
 
         if (!match.Success)
@@ -44,6 +52,7 @@ internal static partial class VoiceCorrectionLearning
         return true;
     }
 
+    // True when the user asks to see what has been learned ("voice corrections", "speech correction log", ...).
     public static bool IsReviewCommand(string input)
     {
         var normalized = NormalizeKey(input);
@@ -54,6 +63,7 @@ internal static partial class VoiceCorrectionLearning
             or "speech correction log";
     }
 
+    // A correction is worth saving only if both sides are non-empty, under 160 characters and actually different (ignoring case and punctuation).
     public static bool CanLearnCorrection(string heardText, string correctedText)
     {
         var heard = NormalizePhrase(heardText);
@@ -70,6 +80,8 @@ internal static partial class VoiceCorrectionLearning
         return !string.Equals(NormalizeKey(heard), NormalizeKey(corrected), StringComparison.Ordinal);
     }
 
+    // Adds or updates a correction in the settings. A repeat of the same heard text bumps its count and replaces the target.
+    // Also logs the heard phrase as rejected.
     public static JarvisOptions RecordCorrection(
         JarvisOptions options,
         string heardText,
@@ -115,6 +127,7 @@ internal static partial class VoiceCorrectionLearning
             });
         }
 
+        // Most-used corrections first, then newest; keep only the first 48.
         var updated = options with
         {
             SpeechRecognitionCorrections = corrections
@@ -127,6 +140,7 @@ internal static partial class VoiceCorrectionLearning
         return RecordRejectedPhrase(updated, heard, confidence);
     }
 
+    // Remembers a phrase the user said was wrong, with a count and time, so the review list can show it. Newest first, capped at 48.
     public static JarvisOptions RecordRejectedPhrase(
         JarvisOptions options,
         string heardText,
@@ -178,6 +192,7 @@ internal static partial class VoiceCorrectionLearning
         };
     }
 
+    // Builds the plain-text list shown for "voice corrections": the top 8 learned corrections and the 8 most recent rejected phrases.
     public static string BuildReview(JarvisOptions options)
     {
         var corrections = options.SpeechRecognitionCorrections
@@ -221,6 +236,7 @@ internal static partial class VoiceCorrectionLearning
         return string.Join(Environment.NewLine, lines);
     }
 
+    // Trims spaces, quotes and end punctuation around a phrase.
     private static string NormalizePhrase(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -236,6 +252,7 @@ internal static partial class VoiceCorrectionLearning
         return trimmed.Trim(',', '.', '!', '?', ':', ';');
     }
 
+    // Comparison form of a phrase: lower-case, punctuation turned into spaces, spaces collapsed, so "Open Spotify!" equals "open spotify".
     private static string NormalizeKey(string value)
     {
         var normalized = NormalizePhrase(value);
@@ -253,15 +270,21 @@ internal static partial class VoiceCorrectionLearning
         return CollapseWhitespace(new string(chars));
     }
 
+    // Trims text and collapses runs of whitespace to a single space.
     private static string CollapseWhitespace(string value) =>
         WhitespaceRegex().Replace(value.Trim(), " ");
 
+    // Matches "I said <corrected>, not <heard>" or "... instead of <heard>", with an optional leading "no".
+    // Example: "No, I said open Spotify not open spot a fly" gives corrected = "open Spotify", heard = "open spot a fly".
     [GeneratedRegex(@"^(?:no[, ]+)?i said (?<corrected>.+?)(?:,?\s+not|,?\s+instead of) (?<heard>.+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex HeardSecondCorrectionRegex();
 
+    // Matches "you heard <heard>, but I said <corrected>" (also "Jarvis heard", "you wrote", "Jarvis wrote").
+    // Example: "you heard open notebad but I said open notepad".
     [GeneratedRegex(@"^(?:you heard|jarvis heard|you wrote|jarvis wrote) (?<heard>.+?)(?:,?\s+(?:but\s+)?i said) (?<corrected>.+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex HeardFirstCorrectionRegex();
 
+    // Matches one or more whitespace characters.
     [GeneratedRegex(@"\s+")]
     private static partial Regex WhitespaceRegex();
 }

@@ -1,7 +1,14 @@
+// JarvisOptions.cs: every user-changeable Jarvis setting in one record. The app reads jarvis.settings.json
+// (next to the project) into this type in JarvisSettingsLoader.cs; each property here matches a camelCase JSON key
+// (PlannerBaseUrl is "plannerBaseUrl"). Any key missing from the file keeps the default written below.
+// The defaults are generic (for example the OpenAI URL); the shipped jarvis.settings.json overrides the Planner*
+// settings to use a local LM Studio server. The small records after JarvisOptions are list items stored inside it.
 namespace Jarvis.Core;
 
+// All settings. "init" means a value is set once when loaded; changing a setting creates a new copy (use "with").
 public sealed record JarvisOptions
 {
+    // Identity and personality: name, persona text, presence preset, response style, what to call the user, and small talk.
     public string AssistantName { get; init; } = "Jarvis";
 
     public string AssistantPersona { get; init; } = string.Empty;
@@ -14,10 +21,13 @@ public sealed record JarvisOptions
 
     public bool AssistantSmallTalkEnabled { get; init; } = true;
 
+    // Spoken-word hints so the voice says unusual names correctly.
     public string[] AssistantPronunciationHints { get; init; } = Array.Empty<string>();
 
+    // The word that wakes Jarvis up when listening for a command.
     public string WakePhrase { get; init; } = "jarvis";
 
+    // Text-to-speech (Jarvis talking). The Voice* settings pick the provider, server URL, model, voice name and audio format.
     public bool VoiceEnabled { get; init; }
 
     public string VoiceProvider { get; init; } = "auto";
@@ -26,6 +36,7 @@ public sealed record JarvisOptions
 
     public string VoiceModel { get; init; } = "gpt-4o-mini-tts";
 
+    // Key lookup for the voice service, in order: this value, the Windows Credential Manager entry, then the environment variable (see ApiKeyResolver).
     public string VoiceApiKey { get; init; } = string.Empty;
 
     public string VoiceApiKeyCredentialTarget { get; init; } = string.Empty;
@@ -38,6 +49,8 @@ public sealed record JarvisOptions
 
     public string VoiceResponseFormat { get; init; } = "pcm";
 
+    // Speech recognition (Jarvis listening). Settings starting with SpeechRecognition cover the engine, language, wake word,
+    // microphone tuning and push-to-talk below.
     public bool SpeechRecognitionEnabled { get; init; } = true;
 
     public string SpeechRecognitionProvider { get; init; } = "auto";
@@ -60,14 +73,21 @@ public sealed record JarvisOptions
 
     public string SpeechRecognitionPrompt { get; init; } = string.Empty;
 
+    // Spoken nicknames mapped to what to launch: apps, websites, and the folders searched when looking for files.
     public Dictionary<string, string> ApplicationAliases { get; init; } = new();
 
+    public Dictionary<string, string> SiteAliases { get; init; } = new();
+
+    public string[] FileSearchRoots { get; init; } = Array.Empty<string>();
+
+    // Learned fixes for words the recognizer keeps mishearing, and phrases to ignore completely.
     public SpeechRecognitionCorrectionEntry[] SpeechRecognitionCorrections { get; init; } = Array.Empty<SpeechRecognitionCorrectionEntry>();
 
     public SpeechRecognitionRejectedPhrase[] SpeechRecognitionRejectedPhrases { get; init; } = Array.Empty<SpeechRecognitionRejectedPhrase>();
 
     public string[] SpeechRecognitionWakeAliases { get; init; } = Array.Empty<string>();
 
+    // Wake-word detection files and sensitivity. "auto" means Jarvis finds the shipped files itself.
     public string SpeechRecognitionWakeWordAssetPath { get; init; } = "auto";
 
     public string SpeechRecognitionWakeEnginePath { get; init; } = "auto";
@@ -76,10 +96,14 @@ public sealed record JarvisOptions
 
     public double SpeechRecognitionWakeDetectionSensitivity { get; init; } = 0.62;
 
+    // How long to wait for a command after the wake word before giving up.
     public int VoiceCommandTimeoutSeconds { get; init; } = 8;
 
+    // Recognized text scoring below this (0 to 1) is rejected as probably wrong.
     public double SpeechRecognitionConfidenceThreshold { get; init; } = 0.58;
 
+    // Microphone audio settings: sample rate, how loud counts as speech, how long a pause ends a phrase, audio kept from
+    // just before speech starts (pre-roll) and the shortest phrase worth sending.
     public int SpeechRecognitionSampleRateHz { get; init; } = 16000;
 
     public double SpeechRecognitionVoiceActivityThreshold { get; init; } = 0.008;
@@ -92,12 +116,14 @@ public sealed record JarvisOptions
 
     public string SpeechRecognitionDeviceName { get; init; } = string.Empty;
 
+    // Push-to-talk and the global hotkey (default Control+Space) as alternatives to the wake word.
     public bool SpeechRecognitionPushToTalkEnabled { get; init; } = false;
 
     public bool SpeechRecognitionHotkeyEnabled { get; init; } = true;
 
     public string SpeechRecognitionHotkey { get; init; } = "Control+Space";
 
+    // Optional audio cleanup: noise suppression, echo cancellation, beamforming and hardware DSP profiles.
     public bool SpeechRecognitionNoiseSuppressionEnabled { get; init; } = false;
 
     public bool SpeechRecognitionEchoCancellationEnabled { get; init; } = false;
@@ -114,58 +140,56 @@ public sealed record JarvisOptions
 
     public string SpeechRecognitionHardwareDspProfile { get; init; } = "auto";
 
-    public string SpeechRecognitionVendorDspProfilePath { get; init; } = "auto";
-
+    // Per-microphone measurements and test results, saved by the calibration and validation tools.
     public SpeechRecognitionCalibrationProfile[] SpeechRecognitionCalibrationProfiles { get; init; } = Array.Empty<SpeechRecognitionCalibrationProfile>();
 
     public SpeechRecognitionValidationProfile[] SpeechRecognitionValidationProfiles { get; init; } = Array.Empty<SpeechRecognitionValidationProfile>();
 
+    // "half-duplex" means Jarvis does not listen while it is speaking; "full-duplex" listens during replies.
     public string SpeechRecognitionMode { get; init; } = "half-duplex";
 
     public bool SpeechRecognitionPunctuationRestorationEnabled { get; init; } = true;
 
-    public bool ClapShortcutEnabled { get; init; } = false;
-
-    public int ClapShortcutRequiredClapCount { get; init; } = 2;
-
-    public int ClapShortcutMinimumIntervalMilliseconds { get; init; } = 120;
-
-    public int ClapShortcutMaximumIntervalMilliseconds { get; init; } = 900;
-
-    public int ClapShortcutCooldownMilliseconds { get; init; } = 2500;
-
-    public double ClapShortcutThreshold { get; init; } = 0.40;
-
+    // Closing the window hides Jarvis in the system tray instead of quitting.
     public bool KeepRunningInTrayOnClose { get; init; } = true;
 
+    // Safety switches: shell commands are off unless enabled, major actions ask for approval, and protected system folders are blocked.
     public bool ShellExecutionEnabled { get; init; }
 
     public bool SafetyRequireApprovalForMajorActions { get; init; } = true;
 
     public bool SafetyBlockProtectedSystemPaths { get; init; } = true;
 
+    // Optional link to the Brain notes workspace; the context is capped at BrainContextMaxCharacters.
     public bool BrainContextEnabled { get; init; } = false;
 
     public string BrainWorkspacePath { get; init; } = string.Empty;
 
     public int BrainContextMaxCharacters { get; init; } = 2400;
 
+    // When true, models may only run on this computer (enforced by LocalAiPolicy), so nothing is sent to the internet.
     public bool LocalAiOnly { get; init; } = true;
 
+    // How many model calls may run at once (1 to 4, see ModelWorkScheduler). Applied at startup only.
     public int ModelMaxConcurrentRequests { get; init; } = 1;
 
+    // Limits and tuning for local model runs: background task count, CPU threads, and whether to log each call to data/planner-log.jsonl.
     public int PlannerMaxConcurrentBackgroundTasks { get; init; } = 2;
 
     public int PlannerLocalCpuThreads { get; init; } = 2;
 
     public bool PlannerRecordLocalCalls { get; init; } = true;
 
+    // The "planner" is the language model that decides what Jarvis does. The settings below choose which server and models it uses (see ModelGateway.cs).
     public bool PlannerEnabled { get; init; } = true;
 
+    // "local" is a server on this PC (LM Studio); "openai" or "openai-compatible" is a hosted or other OpenAI-style server.
     public string PlannerProvider { get; init; } = "openai-compatible";
 
+    // Server address. For LM Studio use http://127.0.0.1:1234 ("/v1" is added automatically).
     public string PlannerBaseUrl { get; init; } = "https://api.openai.com/v1";
 
+    // Model names per route: general, fast, reasoning and vision. Empty ones fall back to another route's model.
     public string PlannerModel { get; init; } = "gpt-4o-mini";
 
     public string PlannerFastModel { get; init; } = "gpt-4o-mini";
@@ -174,39 +198,36 @@ public sealed record JarvisOptions
 
     public string PlannerVisionModel { get; init; } = string.Empty;
 
-    public string PlannerFastReasoningEffort { get; init; } = string.Empty;
+    /// <summary>Model for slow, off-turn thinking (brain think). Empty keeps it on the reasoning model.</summary>
+    public string PlannerDeepModel { get; init; } = string.Empty;
 
-    public string PlannerReasoningEffort { get; init; } = string.Empty;
-
-    public string PlannerVisionReasoningEffort { get; init; } = string.Empty;
-
-    public string[] PlannerFallbackModels { get; init; } = Array.Empty<string>();
-
-    public PlannerProviderProfile[] PlannerFallbackProviders { get; init; } = Array.Empty<PlannerProviderProfile>();
-
+    // API key lookup: typed value, then Credential Manager entry, then environment variable. Not needed for local servers.
     public string PlannerApiKey { get; init; } = string.Empty;
 
     public string PlannerApiKeyCredentialTarget { get; init; } = string.Empty;
 
     public string PlannerApiKeyEnvironmentVariable { get; init; } = "OPENAI_API_KEY";
 
+    // Context window (how much text the model can see at once) assumed for local models; the shipped settings use a smaller one.
     public int PlannerLocalContextLength { get; init; } = 16384;
 
+    // Extra standing instructions added to the model's prompt on every turn.
     public string PlannerInstructions { get; init; } =
         "Ground replies in the live computer context. When the user refers to apps, windows, or what is happening on the computer, prefer the computer, apps, and open app tools.";
 
+    // How much history goes into each prompt: recent conversation turns, saved memories and tool results.
     public int PlannerRecentTurnCount { get; init; } = 6;
 
     public int PlannerRecentMemoryCount { get; init; } = 8;
 
     public int PlannerRecentToolResultCount { get; init; } = 6;
 
+    // Maximum model-then-tool rounds in one turn, and how many times a failed model call is retried.
     public int PlannerMaxIterations { get; init; } = 5;
 
     public int PlannerRetryCount { get; init; } = 2;
 
-    public bool PlannerReflectionEnabled { get; init; } = true;
-
+    // Allows long jobs to run in the background; web research can be switched off and capped at a number of results.
     public bool PlannerBackgroundTasksEnabled { get; init; } = true;
 
     public bool PlannerWebResearchEnabled { get; init; } = true;
@@ -222,34 +243,15 @@ public sealed record JarvisOptions
     /// </summary>
     public string LectureNotesFolder { get; init; } = @"%USERPROFILE%\Lecture Notes";
 
+    // Where screenshots are saved and how many old ones are kept.
     public string VisualCaptureDirectory { get; init; } = Path.Combine("data", "captures");
 
     public int VisualCaptureRetentionCount { get; init; } = 24;
 
-    public bool AmbientContextEnabled { get; init; }
-
-    public string AmbientWebcamFramePath { get; init; } = string.Empty;
-
-    public int AmbientWebcamFreshnessSeconds { get; init; } = 90;
-
-    public string AmbientRoomSensorSnapshotPath { get; init; } = string.Empty;
-
-    public bool AmbientPresenceDetectionEnabled { get; init; }
-
-    public bool AmbientGestureDetectionEnabled { get; init; }
-
-    public bool AmbientFaceRecognitionEnabled { get; init; }
-
-    public bool AmbientFaceRecognitionConsentGranted { get; init; }
-
-    public string AmbientFaceProfilesPath { get; init; } = string.Empty;
-
-    public bool SpatialAudioCuesEnabled { get; init; }
-
-    public bool FarFieldListeningEnabled { get; init; }
-
+    // Place used when the user asks for the weather without naming one.
     public string DefaultWeatherLocation { get; init; } = string.Empty;
 
+    // Where runtime data lives: memory, conversation log, agent state and pending approvals. Relative paths resolve under the Jarvis data folder (JarvisDataPaths).
     public string MemoryFilePath { get; init; } = Path.Combine("data", "memory.json");
 
     public string TranscriptFilePath { get; init; } = Path.Combine("data", "transcript.jsonl");
@@ -258,48 +260,13 @@ public sealed record JarvisOptions
 
     public string PendingApprovalFilePath { get; init; } = Path.Combine("data", "pending-approval.json");
 
-    public string UserStateFilePath { get; init; } = Path.Combine("data", "user-state.json");
 
-    // Speaker volume and ambient-noise settings.
+    // Speaker volume settings.
     public bool WhisperModeEnabled { get; init; } = false;
     public double SpeakerVolumeMultiplier { get; init; } = 1.0;
-    public bool RoomVolumeAwarenessEnabled { get; init; } = true;
-    public double AmbientNoiseSampleIntervalSeconds { get; init; } = 10.0;
-    public double RoomQuietThresholdRms { get; init; } = 0.006;
-    public double RoomLoudThresholdRms { get; init; } = 0.025;
 }
 
-public sealed record PlannerProviderProfile
-{
-    public string Name { get; init; } = "fallback";
-
-    public string Provider { get; init; } = "openai-compatible";
-
-    public string BaseUrl { get; init; } = "https://api.openai.com/v1";
-
-    public string Model { get; init; } = string.Empty;
-
-    public string FastModel { get; init; } = string.Empty;
-
-    public string ReasoningModel { get; init; } = string.Empty;
-
-    public string VisionModel { get; init; } = string.Empty;
-
-    public string FastReasoningEffort { get; init; } = string.Empty;
-
-    public string ReasoningEffort { get; init; } = string.Empty;
-
-    public string VisionReasoningEffort { get; init; } = string.Empty;
-
-    public string ApiKey { get; init; } = string.Empty;
-
-    public string ApiKeyCredentialTarget { get; init; } = string.Empty;
-
-    public string ApiKeyEnvironmentVariable { get; init; } = string.Empty;
-
-    public string[] FallbackModels { get; init; } = Array.Empty<string>();
-}
-
+// Microphone measurements for one device (background noise level, speech level, recommended thresholds).
 public sealed record SpeechRecognitionCalibrationProfile
 {
     public string DeviceName { get; init; } = string.Empty;
@@ -322,13 +289,10 @@ public sealed record SpeechRecognitionCalibrationProfile
 
     public string HardwareDspProfileName { get; init; } = "auto";
 
-    public string VendorDspProfileName { get; init; } = string.Empty;
-
-    public string VendorDspProfilePath { get; init; } = string.Empty;
-
     public string Notes { get; init; } = string.Empty;
 }
 
+// Results of a wake-word and full-duplex readiness test for one device, with a recommended conversation mode.
 public sealed record SpeechRecognitionValidationProfile
 {
     public string DeviceName { get; init; } = string.Empty;
@@ -347,10 +311,6 @@ public sealed record SpeechRecognitionValidationProfile
 
     public string HardwareDspProfileName { get; init; } = "auto";
 
-    public string VendorDspProfileName { get; init; } = string.Empty;
-
-    public string VendorDspProfilePath { get; init; } = string.Empty;
-
     public double AmbientRmsLevel { get; init; } = 0.004;
 
     public double WakePhraseRmsLevel { get; init; } = 0.040;
@@ -368,6 +328,7 @@ public sealed record SpeechRecognitionValidationProfile
     public string Notes { get; init; } = string.Empty;
 }
 
+// One learned fix: when the recognizer hears HeardText, use CorrectedText (with a usage count).
 public sealed record SpeechRecognitionCorrectionEntry
 {
     public string HeardText { get; init; } = string.Empty;
@@ -381,6 +342,7 @@ public sealed record SpeechRecognitionCorrectionEntry
     public double? LastConfidence { get; init; }
 }
 
+// A phrase the user rejected; it is ignored in future (with a rejection count).
 public sealed record SpeechRecognitionRejectedPhrase
 {
     public string HeardText { get; init; } = string.Empty;

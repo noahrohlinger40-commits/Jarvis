@@ -1,3 +1,7 @@
+// DesktopAutomation.AppIndex.cs: the "which apps can I open?" slice of DesktopAutomationService.
+// It builds and caches the catalog of apps (start menu, registry, game launchers, Store apps), saves a copy to data\app-index.json,
+// and works out the spoken names for each app and how close a misheard name is (typo and sound-alike matching).
+// Used by DesktopAutomation.cs (open/launch/list app); the scanning helpers it calls live in that file.
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
@@ -11,9 +15,11 @@ namespace Jarvis.Core;
 /// </summary>
 public sealed partial class DesktopAutomationService
 {
+    // Prefix that makes explorer.exe start a Store or Start-menu app by its Windows app id.
     private const string ShellAppsFolderPrefix = "shell:AppsFolder\\";
 
     // Installed apps change rarely; a short cache avoids rescanning the disk for every spoken command.
+    // How long the scanned app list is reused: scanning folders and the registry takes time and apps rarely change.
     private static readonly TimeSpan StaticCatalogLifetime = TimeSpan.FromMinutes(10);
 
     // Windows' own app list needs a PowerShell call (about two seconds), so it is cached much longer.
@@ -24,15 +30,21 @@ public sealed partial class DesktopAutomationService
 
     private static readonly JsonSerializerOptions IndexJsonOptions = new() { WriteIndented = true };
 
+    // Protects the cached lists below: the index can be built on a background thread while a command reads it.
     private readonly object _catalogSync = new();
+    // The cached app list, and when it was built.
     private IReadOnlyList<ApplicationCandidate>? _staticCatalog;
+    // Every normalised name an app answers to, so IsKnownApplicationName can answer instantly.
     private HashSet<string> _knownNames = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _staticCatalogBuiltUtc = DateTime.MinValue;
+    // Apps listed by Windows itself (from PowerShell's Get-StartApps), with their own cache time, and the last list we saved to disk.
     private IReadOnlyList<StartAppEntry>? _startApps;
     private IReadOnlyList<StartAppEntry>? _lastPersistedStartApps;
     private DateTime _startAppsBuiltUtc = DateTime.MinValue;
+    // When the last rescan after an unknown app name happened (rate limit, see MissRefreshInterval).
     private DateTime _lastMissRefreshUtc = DateTime.MinValue;
 
+    // Where the saved copy of the index lives.
     private string ApplicationIndexPath => JarvisDataPaths.Resolve("data/app-index.json");
 
     /// <summary>
@@ -69,17 +81,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
-    /// <summary>The names people can say for every indexed app, for the speech vocabulary.</summary>
-    public IReadOnlyList<string> GetSpokenApplicationNames()
-    {
-        return GetStaticCatalog(forceRefresh: false)
-            .Where(candidate => !string.Equals(candidate.Source, "alias", StringComparison.OrdinalIgnoreCase))
-            .Select(candidate => candidate.DisplayName)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
+    // Returns the cached app list, rebuilding it when missing, older than ten minutes, or forceRefresh is true. Locked so two threads do not scan at once.
     private IReadOnlyList<ApplicationCandidate> GetStaticCatalog(bool forceRefresh)
     {
         lock (_catalogSync)
@@ -101,6 +103,7 @@ public sealed partial class DesktopAutomationService
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             // The saved copy is informational, so write it only after a real rescan of Windows' app list
+            // The saved copy is informational, so write it only after a real rescan of Windows' app list
             // (or the first build), not on every ten-minute cache rebuild.
             if (!ReferenceEquals(startApps, _lastPersistedStartApps) || !File.Exists(ApplicationIndexPath))
             {
@@ -112,6 +115,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Collects every installable/launchable thing from all the scanners into one de-duplicated list, aliases first.
     private IReadOnlyList<ApplicationCandidate> BuildStaticApplicationCandidates(IReadOnlyList<StartAppEntry> startApps)
     {
         var candidates = new List<ApplicationCandidate>();
@@ -125,6 +129,7 @@ public sealed partial class DesktopAutomationService
                 new ApplicationCandidate(alias.Key, alias.Value, "alias", false, IntPtr.Zero, 0, alias.Key, string.Empty));
         }
 
+        // Each entry here is one scanner method; they are all run in turn and their results merged.
         foreach (var source in new Func<IEnumerable<ApplicationCandidate>>[]
                  {
                      GetStartMenuApplications,
@@ -146,6 +151,7 @@ public sealed partial class DesktopAutomationService
         }
 
         // Anything Windows lists as an app that the scans above did not find, mainly Microsoft Store apps
+        // Anything Windows lists as an app that the scans above did not find, mainly Microsoft Store apps
         // such as Clock, Photos, Claude or ChatGPT, which have no Start Menu shortcut file.
         var known = candidates
             .Where(candidate => !string.Equals(candidate.Source, "alias", StringComparison.OrdinalIgnoreCase))
@@ -165,6 +171,7 @@ public sealed partial class DesktopAutomationService
                 new ApplicationCandidate(
                     startApp.Name,
                     ShellAppsFolderPrefix + startApp.AppId,
+                    // An app id containing "!" is a packaged Store app (for example "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"); others are plain Start-menu entries.
                     startApp.AppId.Contains('!') ? "store app" : "start app",
                     false,
                     IntPtr.Zero,
@@ -176,6 +183,7 @@ public sealed partial class DesktopAutomationService
         return candidates;
     }
 
+    // Returns Windows' own app list: from memory if fresh, else from the saved file if fresh, else by running PowerShell (about two seconds). Falls back to older data if the scan fails.
     private IReadOnlyList<StartAppEntry> GetStartApps(bool forceRefresh)
     {
         if (!forceRefresh && _startApps is not null && DateTime.UtcNow - _startAppsBuiltUtc < StartAppsLifetime)
@@ -206,8 +214,10 @@ public sealed partial class DesktopAutomationService
         return _startApps ?? persisted ?? [];
     }
 
+    // Runs PowerShell's Get-StartApps and reads "name<TAB>appId" lines back. Gives up after 20 seconds and kills the process tree so a hung PowerShell cannot block Jarvis.
     private static IReadOnlyList<StartAppEntry> QueryStartApps()
     {
+        // Any failure (PowerShell blocked, missing) just returns an empty list.
         try
         {
             var startInfo = new ProcessStartInfo
@@ -234,6 +244,7 @@ public sealed partial class DesktopAutomationService
                 return [];
             }
 
+            // Output is read in the background while we wait, otherwise a full output buffer could stop PowerShell and the wait would time out.
             var outputTask = process.StandardOutput.ReadToEndAsync();
 
             if (!process.WaitForExit(20_000))
@@ -254,6 +265,7 @@ public sealed partial class DesktopAutomationService
 
             foreach (var line in outputTask.GetAwaiter().GetResult().Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
+                // Each line is "App Name<TAB>AppID"; splitting at the first tab keeps names that contain spaces. Duplicate names are dropped.
                 var parts = line.TrimEnd('\r').Split('\t', 2);
 
                 if (parts.Length != 2
@@ -275,6 +287,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Reads the saved index back. Returns true only when the file is fresh enough (under six hours) to skip a rescan; a stale file is still returned through the out parameter as a fallback.
     private bool TryLoadPersistedStartApps(out IReadOnlyList<StartAppEntry> startApps, out DateTime generatedUtc)
     {
         startApps = [];
@@ -327,6 +340,7 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Writes the index to data\app-index.json (apps, launch targets and spoken names). It is informational and also feeds the speech vocabulary; errors are ignored.
     private void PersistApplicationIndex(IReadOnlyList<ApplicationCandidate> candidates, IReadOnlyList<StartAppEntry> startApps)
     {
         try
@@ -357,13 +371,16 @@ public sealed partial class DesktopAutomationService
         }
     }
 
+    // Spoken names
     // ---- Spoken names ---------------------------------------------------------------------------
 
+    // Brand and filler words dropped from the start of an app name to get a shorter spoken name ("Microsoft Edge" answers to "edge").
     private static readonly HashSet<string> LeadingNoiseWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "microsoft", "windows", "google", "adobe", "apple", "intel", "nvidia", "dell", "hp", "amazon", "my", "the"
     };
 
+    // Filler words dropped from the end of an app name ("Spotify app" answers to "spotify").
     private static readonly HashSet<string> TrailingNoiseWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "app", "application", "desktop", "launcher", "client", "program", "shortcut", "for", "windows", "edition"
@@ -373,6 +390,7 @@ public sealed partial class DesktopAutomationService
     /// The ways a person would naturally say an app's name: the full name, the name without a subtitle
     /// or version, and without words such as "Microsoft" or "app". "Microsoft Edge" answers to "edge".
     /// </summary>
+    // Produces all the ways a person might say an app's name. Every variant is normalised and must be at least 3 characters.
     internal static IReadOnlyList<string> BuildSpokenNames(string displayName)
     {
         var names = new List<string>();
@@ -387,6 +405,7 @@ public sealed partial class DesktopAutomationService
             }
         }
 
+        // Step 1: the full name. Step 2: "&" read aloud as "and". Step 3: strip the subtitle after a separator. Step 4: strip bracketed text, symbols and version numbers. Step 5: peel off leading then trailing filler words.
         Add(displayName);
 
         // "Movies & TV" is spoken "Movies and TV".
@@ -396,11 +415,15 @@ public sealed partial class DesktopAutomationService
         }
 
         // "Audibly — Audiobook Player" -> "Audibly"
+        // Regex matches a dash, en dash, em dash, hyphen, colon or pipe with a space on each side; splitting there and taking the first part turns "Audibly — Audiobook Player" into "Audibly".
         var cleaned = Regex.Split(displayName, @"\s[—–\-:|]\s")[0];
         Add(cleaned);
 
+        // Removes anything in (round) or [square] brackets.
         cleaned = Regex.Replace(cleaned, @"[\(\[].*?[\)\]]", " ");
+        // Removes registered, trademark and copyright symbols.
         cleaned = Regex.Replace(cleaned, @"[®™©]", " ");
+        // Removes version numbers and architecture tags such as "v2.1", "10.0.1", "x64", "64-bit".
         cleaned = Regex.Replace(cleaned, @"\b(v?\d+(\.\d+)*|x64|x86|64-bit|32-bit)\b", " ", RegexOptions.IgnoreCase);
         Add(cleaned);
 
@@ -421,8 +444,10 @@ public sealed partial class DesktopAutomationService
         return names;
     }
 
+    // Matching
     // ---- Matching -------------------------------------------------------------------------------
 
+    // Remembers the spoken names of each display name, because scoring asks for them for every app on every command.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string[]> SpokenNameCache =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -430,11 +455,13 @@ public sealed partial class DesktopAutomationService
     private static IReadOnlyList<string> GetSpokenNames(string displayName) =>
         SpokenNameCache.GetOrAdd(displayName, name => BuildSpokenNames(name).ToArray());
 
+    // Filler words stripped from the start of what the user says.
     private static readonly HashSet<string> QueryLeadingNoiseWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "the", "my", "microsoft", "windows", "app", "application", "program"
     };
 
+    // Filler words stripped from the end of what the user says.
     private static readonly HashSet<string> QueryTrailingNoiseWords = new(StringComparer.OrdinalIgnoreCase)
     {
         "app", "application", "program"
@@ -444,6 +471,7 @@ public sealed partial class DesktopAutomationService
     /// Drops filler from a spoken app name so "the Spotify app" is "spotify" and "Microsoft Photos" is
     /// "photos". A name that is only filler ("windows") is left alone.
     /// </summary>
+    // Cleans the user's spoken app name (already lower-cased and normalised). Always keeps at least one word.
     private static string StripQueryNoise(string normalizedQuery)
     {
         var words = normalizedQuery.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
@@ -465,10 +493,13 @@ public sealed partial class DesktopAutomationService
     /// Scores how close a possibly misheard name is to an app, from 60 (barely close enough) to about 80.
     /// Returns 0 when nothing is close, so unrelated speech never opens an app.
     /// </summary>
+    // Typo and sound-alike scoring for speech-recognition mistakes. A close spelling (80% similar or better) scores 60 to 80; a sound-alike (same phonetic code, same first sound, at least 50% similar) scores 60 to 62.
     private static int ScoreFuzzyMatch(string normalizedQuery, string displayName)
     {
+        // Spaces are ignored so "dis cord" compares equal to "discord".
         var query = normalizedQuery.Replace(" ", string.Empty, StringComparison.Ordinal);
 
+        // Names under 4 letters are too short for guessing; unrelated short words would match everything.
         if (query.Length < 4)
         {
             return 0;
@@ -482,11 +513,13 @@ public sealed partial class DesktopAutomationService
         {
             var candidate = spoken.Replace(" ", string.Empty, StringComparison.Ordinal);
 
+            // Skip names whose length differs by more than 3, they cannot be a near miss.
             if (candidate.Length < 4 || Math.Abs(candidate.Length - query.Length) > 3)
             {
                 continue;
             }
 
+            // Edit distance counts the single-letter changes needed to turn one word into the other; similarity is 1 minus distance divided by the longer length.
             var distance = EditDistance(query, candidate);
             var similarity = 1.0 - ((double)distance / Math.Max(query.Length, candidate.Length));
             best = Math.Max(best, similarity);
@@ -509,6 +542,7 @@ public sealed partial class DesktopAutomationService
         return bestSoundAlike >= 0.5 ? 60 + (int)(bestSoundAlike * 5) : 0;
     }
 
+    // Groups of consonants that sound alike (b/p/f/v, c/g/k/s..., d/t, m/n); used to decide whether two first letters count as the same sound.
     private static bool IsSameSoundGroup(char left, char right) => SoundGroup(left) != '0' && SoundGroup(left) == SoundGroup(right);
 
     private static char SoundGroup(char letter) => letter switch
@@ -526,6 +560,7 @@ public sealed partial class DesktopAutomationService
     /// A rough "how it sounds" code: similar consonants share a digit, vowels are dropped. Two names with
     /// the same code sound alike ("claude" and "clawed" are both 243).
     /// </summary>
+    // Rough pronunciation code: skips vowels, maps consonants to their sound group digit, and collapses repeats. "claude" and "clawed" both become 243.
     private static string PhoneticKey(string value)
     {
         var key = new StringBuilder();
@@ -557,6 +592,7 @@ public sealed partial class DesktopAutomationService
         return key.ToString();
     }
 
+    // Classic Levenshtein edit distance (insert, delete or replace one letter) using two rolling rows instead of a full grid to save memory.
     private static int EditDistance(string left, string right)
     {
         var previous = new int[right.Length + 1];
@@ -583,5 +619,6 @@ public sealed partial class DesktopAutomationService
         return previous[right.Length];
     }
 
+    // One entry from Windows' app list: the display name and the app id used to start it.
     private sealed record StartAppEntry(string Name, string AppId);
 }

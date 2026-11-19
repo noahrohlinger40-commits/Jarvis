@@ -1,3 +1,7 @@
+// LocalNetworkMonitoring.cs: the code behind Jarvis's "what is on my network" answers. GetStatusAsync is the only entry
+// point; it returns a block of text. It actively probes the home/office network: it lists this PC's active adapters, pings
+// nearby addresses, looks up host names and MAC addresses, tries a few common TCP ports, and guesses what each device is
+// (router, printer, NAS...). The sweep only targets private addresses on the local network (host names typed by the user are looked up in DNS).
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
@@ -9,11 +13,17 @@ namespace Jarvis.Core;
 
 internal static class LocalNetworkMonitoring
 {
+    // How long to wait for a ping reply before treating a device as absent. Short, because most addresses are empty.
     private const int PingTimeoutMilliseconds = 325;
+    // How long to wait for a TCP connection to a port before treating it as closed.
     private const int PortProbeTimeoutMilliseconds = 180;
+    // How many pings run at the same time while sweeping a subnet (keeps a /24 scan to a few seconds).
     private const int MaxConcurrentPings = 48;
+    // Port probing is slower, so only this many devices (the router first, then the fastest responders) get their ports checked.
     private const int MaxDevicesWithServiceProbe = 12;
 
+    // Ports checked on each device and the service each normally means. They are also the clues used by ClassifyDevice
+    // (for example 9100/631/515 point to a printer, 445 to Windows file sharing, 3389 to Remote Desktop).
     private static readonly IReadOnlyList<PortProbe> CommonPortProbes =
     [
         new(22, "ssh"),
@@ -27,10 +37,14 @@ internal static class LocalNetworkMonitoring
         new(9100, "jetdirect")
     ];
 
+    // Matches one data line of the output of "arp -a", e.g. "  192.168.1.1   aa-bb-cc-dd-ee-ff   dynamic".
+    // Captures the IP address ("ip"), the MAC address ("mac") and the entry type ("type").
     private static readonly Regex ArpEntryRegex = new(
         @"^\s*(?<ip>(?:\d{1,3}\.){3}\d{1,3})\s+(?<mac>(?:[0-9a-f]{2}-){5}[0-9a-f]{2})\s+(?<type>\w+)\s*$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
+    // Main entry point. An empty target gives an overview, "scan"/"devices" lists devices, "health"/"status" adds service checks,
+    // and anything else (an IP address or host name) inspects that one device.
     public static async Task<string> GetStatusAsync(string target, CancellationToken cancellationToken)
     {
         var request = ParseRequest(target);
@@ -51,6 +65,7 @@ internal static class LocalNetworkMonitoring
         return RenderSnapshot(snapshot, request.Mode);
     }
 
+    // Decides which of the modes above the typed text means.
     private static NetworkRequest ParseRequest(string target)
     {
         if (string.IsNullOrWhiteSpace(target))
@@ -74,6 +89,7 @@ internal static class LocalNetworkMonitoring
         return new NetworkRequest(NetworkRequestMode.Inspect, trimmed);
     }
 
+    // Sweeps the network once: works out which addresses to try, probes them, and packages the adapters and devices found.
     private static async Task<NetworkSnapshot> BuildSnapshotAsync(
         IReadOnlyList<ActiveAdapter> adapters,
         NetworkRequestMode mode,
@@ -88,6 +104,7 @@ internal static class LocalNetworkMonitoring
         {
             foreach (var gateway in adapter.Gateways)
             {
+                // Marks whether the router answered the sweep (used for the healthy / degraded label).
                 adapter.GatewayResponded = discovered.Any(device => device.Address.Equals(gateway));
             }
         }
@@ -103,6 +120,7 @@ internal static class LocalNetworkMonitoring
             elapsed);
     }
 
+    // Lists the network adapters that are up and usable (skips loopback and tunnels), best first: ones with a gateway, then fastest.
     private static IReadOnlyList<ActiveAdapter> GetActiveAdapters()
     {
         var adapters = new List<ActiveAdapter>();
@@ -130,6 +148,8 @@ internal static class LocalNetworkMonitoring
             .ToArray();
     }
 
+    // Reads one adapter's settings. Returns false unless it has a normal private IPv4 address (not link-local) with a
+    // usable subnet mask whose prefix length is between 1 and 30 (so /31 and /32 links are skipped).
     private static bool TryCreateAdapter(NetworkInterface networkInterface, out ActiveAdapter adapter)
     {
         var properties = networkInterface.GetIPProperties();
@@ -186,6 +206,7 @@ internal static class LocalNetworkMonitoring
         return true;
     }
 
+    // Builds the list of addresses to ping. If two adapters can reach the same address, it is listed once with both adapter names.
     private static IReadOnlyList<ScanCandidate> BuildScanCandidates(IReadOnlyList<ActiveAdapter> adapters)
     {
         var candidates = new Dictionary<string, ScanCandidate>(StringComparer.OrdinalIgnoreCase);
@@ -219,6 +240,8 @@ internal static class LocalNetworkMonitoring
         return candidates.Values.ToArray();
     }
 
+    // The addresses to try for one adapter. For subnets smaller than a /24 it uses every host (at most 254). For bigger
+    // subnets it only samples the /24 around this PC and around each gateway, because scanning thousands of addresses would be slow.
     private static IEnumerable<IPAddress> EnumerateCandidatesForAdapter(ActiveAdapter adapter)
     {
         var addresses = new HashSet<IPAddress>();
@@ -242,6 +265,7 @@ internal static class LocalNetworkMonitoring
         else
         {
             var network = ToUInt32(adapter.NetworkAddress);
+            // Hosts in a subnet = 2^(host bits) minus the network and broadcast addresses; capped at 254.
             var hostCount = Math.Min((1u << (32 - adapter.PrefixLength)) - 2u, 254u);
 
             for (var offset = 1u; offset <= hostCount; offset++)
@@ -260,6 +284,7 @@ internal static class LocalNetworkMonitoring
         return addresses;
     }
 
+    // Yields .1 to .254 in the same /24 as the given address (the first three numbers stay the same).
     private static IEnumerable<IPAddress> EnumerateLocalWindow(IPAddress address)
     {
         var bytes = address.GetAddressBytes();
@@ -275,12 +300,15 @@ internal static class LocalNetworkMonitoring
         }
     }
 
+    // Pings all candidates (at most MaxConcurrentPings at once), then for each device that answered looks up its host
+    // name, its MAC address (from the ARP cache) and, for the first few, its open service ports.
     private static async Task<IReadOnlyList<DiscoveredDevice>> ProbeCandidatesAsync(
         IReadOnlyList<ScanCandidate> candidates,
         IReadOnlyList<ActiveAdapter> adapters,
         NetworkRequestMode mode,
         CancellationToken cancellationToken)
     {
+        // The semaphore is a turnstile that lets only 48 pings run at once.
         var semaphore = new SemaphoreSlim(MaxConcurrentPings, MaxConcurrentPings);
         var results = new ConcurrentBag<PingResult>();
         var pingTasks = candidates.Select(async candidate =>
@@ -303,11 +331,13 @@ internal static class LocalNetworkMonitoring
         });
 
         await Task.WhenAll(pingTasks);
+        // The ARP cache (Windows' list of recently contacted IP-to-MAC pairs) is read after the pings so it includes the devices that just answered.
         var arpEntries = TryReadArpCache();
         var responsive = results
             .OrderByDescending(result => result.Candidate.IsGateway)
             .ThenBy(result => result.RoundtripMilliseconds)
             .ToArray();
+        // Health mode checks ports on up to 12 devices; other modes only on up to 6 (half), to stay fast.
         var probeServices = mode == NetworkRequestMode.Health || mode == NetworkRequestMode.Inspect;
         var maxServiceProbes = probeServices ? MaxDevicesWithServiceProbe : Math.Min(MaxDevicesWithServiceProbe / 2, responsive.Length);
         var devices = new List<DiscoveredDevice>(responsive.Length);
@@ -341,6 +371,7 @@ internal static class LocalNetworkMonitoring
         return devices;
     }
 
+    // Reports on a single device given by IP address or name: reachable, latency, reverse DNS, MAC, open services, guessed type.
     private static async Task<string> InspectTargetAsync(string target, CancellationToken cancellationToken)
     {
         var resolved = await ResolveTargetAsync(target, cancellationToken);
@@ -372,6 +403,7 @@ internal static class LocalNetworkMonitoring
         return string.Join(Environment.NewLine, lines);
     }
 
+    // Accepts an IPv4 address as is, or looks a name up in DNS and takes its first IPv4 address; null if neither works.
     private static async Task<ResolvedTarget?> ResolveTargetAsync(string target, CancellationToken cancellationToken)
     {
         if (IPAddress.TryParse(target.Trim(), out var ipAddress) && ipAddress.AddressFamily == AddressFamily.InterNetwork)
@@ -395,6 +427,7 @@ internal static class LocalNetworkMonitoring
         }
     }
 
+    // Pings once. Returns the round-trip time in milliseconds, or null if there was no reply or an error.
     private static async Task<long?> PingAsync(IPAddress address, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -412,6 +445,7 @@ internal static class LocalNetworkMonitoring
         }
     }
 
+    // Tries each common port in turn and returns the open ones as "name:port" (for example "ssh:22").
     private static async Task<string[]> ProbeServicesAsync(IPAddress address, CancellationToken cancellationToken)
     {
         var services = new List<string>();
@@ -429,6 +463,7 @@ internal static class LocalNetworkMonitoring
         return services.ToArray();
     }
 
+    // Tries a TCP connection and gives up after the port timeout. The connect and a delay race each other; whichever finishes first wins.
     private static async Task<bool> IsPortOpenAsync(IPAddress address, int port, CancellationToken cancellationToken)
     {
         using var client = new TcpClient();
@@ -452,6 +487,7 @@ internal static class LocalNetworkMonitoring
         }
     }
 
+    // Reverse DNS lookup (address to name), limited to 250 ms; returns empty text on failure or timeout.
     private static async Task<string> TryResolveHostNameAsync(IPAddress address, CancellationToken cancellationToken)
     {
         try
@@ -473,6 +509,7 @@ internal static class LocalNetworkMonitoring
         }
     }
 
+    // Runs the Windows command "arp -a" and parses it into a map of IP address to MAC address. Returns an empty map if it fails.
     private static Dictionary<string, string> TryReadArpCache()
     {
         try
@@ -518,6 +555,7 @@ internal static class LocalNetworkMonitoring
         }
     }
 
+    // Formats the sweep as text: one line per adapter (with a healthy / degraded / limited verdict), then the devices found.
     private static string RenderSnapshot(NetworkSnapshot snapshot, NetworkRequestMode mode)
     {
         var lines = new List<string>
@@ -534,6 +572,7 @@ internal static class LocalNetworkMonitoring
             var dnsText = adapter.DnsServers.Length == 0
                 ? "no DNS"
                 : string.Join(" | ", adapter.DnsServers.Select(address => address.ToString()));
+            // healthy = the router answered, degraded = there is a router but it did not answer, limited = no router configured.
             var health = adapter.HasGateway && adapter.GatewayResponded ? "healthy" : adapter.HasGateway ? "degraded" : "limited";
 
             lines.Add(
@@ -551,6 +590,7 @@ internal static class LocalNetworkMonitoring
 
         lines.Add("Discovered devices:");
 
+        // How many devices to list before summarizing the rest as "additional device(s) omitted".
         var maxDevices = mode switch
         {
             NetworkRequestMode.Scan => 20,
@@ -612,6 +652,7 @@ internal static class LocalNetworkMonitoring
         return string.Join(Environment.NewLine, lines);
     }
 
+    // A rough guess at the device type from its open ports (see CommonPortProbes). It is only a hint; checks run in this order.
     private static string ClassifyDevice(IReadOnlyList<string> services, bool isGateway)
     {
         if (isGateway)
@@ -651,6 +692,7 @@ internal static class LocalNetworkMonitoring
         return services.Count == 0 ? "online host" : "online service host";
     }
 
+    // True for the private ranges 10.x.x.x, 172.16-31.x.x and 192.168.x.x.
     private static bool IsPrivateIPv4(IPAddress address)
     {
         var bytes = address.GetAddressBytes();
@@ -664,12 +706,14 @@ internal static class LocalNetworkMonitoring
         };
     }
 
+    // True for 169.254.x.x, the address Windows gives itself when no DHCP server answered.
     private static bool IsLinkLocal(IPAddress address)
     {
         var bytes = address.GetAddressBytes();
         return bytes.Length == 4 && bytes[0] == 169 && bytes[1] == 254;
     }
 
+    // Counts the leading 1 bits of a subnet mask, e.g. 255.255.255.0 gives 24 (the "/24" prefix length).
     private static int CountMaskBits(IPAddress mask)
     {
         var count = 0;
@@ -694,6 +738,7 @@ internal static class LocalNetworkMonitoring
         return count;
     }
 
+    // Bitwise AND of address and mask gives the first address of the subnet (192.168.1.57 with /24 gives 192.168.1.0).
     private static IPAddress GetNetworkAddress(IPAddress address, IPAddress mask)
     {
         var addressBytes = address.GetAddressBytes();
@@ -708,6 +753,7 @@ internal static class LocalNetworkMonitoring
         return new IPAddress(networkBytes);
     }
 
+    // Converts an IPv4 address to a single number (and FromUInt32 converts back) so addresses can be counted by adding to them.
     private static uint ToUInt32(IPAddress address)
     {
         var bytes = address.GetAddressBytes();
@@ -725,6 +771,7 @@ internal static class LocalNetworkMonitoring
         ]);
     }
 
+    // Link speed as text, in steps of 1000: "867 Mbps", "1 Gbps". Zero or negative gives "unknown".
     private static string FormatBitsPerSecond(long bitsPerSecond)
     {
         if (bitsPerSecond <= 0)
@@ -747,6 +794,7 @@ internal static class LocalNetworkMonitoring
 
     private sealed record NetworkRequest(NetworkRequestMode Mode, string Target);
 
+    // What kind of report was asked for: Overview (default), Scan (device list), Health (adds service checks) or Inspect (one device).
     private enum NetworkRequestMode
     {
         Overview,
@@ -755,6 +803,7 @@ internal static class LocalNetworkMonitoring
         Inspect
     }
 
+    // One usable network adapter with its address, subnet size, gateways (routers), DNS servers and link speed.
     private sealed record ActiveAdapter(
         string Name,
         string Type,
@@ -771,16 +820,20 @@ internal static class LocalNetworkMonitoring
         public bool GatewayResponded { get; set; }
     }
 
+    // An address that will be pinged, and which adapters can reach it.
     private sealed record ScanCandidate(IPAddress Address, string[] AdapterNames, bool IsGateway);
 
+    // A candidate that answered a ping, with its round-trip time.
     private sealed record PingResult(ScanCandidate Candidate, long RoundtripMilliseconds);
 
+    // Everything one sweep found: adapters, responding devices, how many addresses were tried and how long it took.
     private sealed record NetworkSnapshot(
         ActiveAdapter[] Adapters,
         DiscoveredDevice[] Devices,
         int CandidateCount,
         TimeSpan Elapsed);
 
+    // One device that answered, with what is known about it, including a guessed type in Classification.
     private sealed record DiscoveredDevice(
         IPAddress Address,
         string HostName,
@@ -791,7 +844,9 @@ internal static class LocalNetworkMonitoring
         string[] AdapterNames,
         string Classification);
 
+    // The address (and name, if one was typed) of a device to inspect.
     private sealed record ResolvedTarget(IPAddress Address, string HostName);
 
+    // A TCP port number and the service name to report if it is open.
     private sealed record PortProbe(int Port, string Name);
 }

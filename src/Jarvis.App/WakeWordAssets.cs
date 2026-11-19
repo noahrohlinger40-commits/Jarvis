@@ -1,8 +1,13 @@
+// WakeWordAssets.cs: "wake word assets" are small JSON files (default folder data\wake-word-assets) describing a tuned wake
+// word setup: the phrases and spelling variants to accept, a confidence cutoff, a sensitivity tweak, which microphone types
+// it suits, and an optional detector model path. This file finds, loads (with a cache) and ranks them.
+// Used by WakeWordDetector, WakeWordEngines, VoiceRecognitionText and the settings UI. "Auto" picks the best asset for the active microphone.
 using System.Text.Json;
 using Jarvis.Core;
 
 namespace Jarvis.App;
 
+// One loaded wake word asset: everything from its JSON file plus the file path. Path "auto" means automatic choice; an empty path means "no asset".
 internal sealed record WakeWordAssetDescriptor(
     string Path,
     string Name,
@@ -15,18 +20,20 @@ internal sealed record WakeWordAssetDescriptor(
     string PreferredBeamformingProfile,
     string PreferredHardwareDspProfile,
     string PreferredWakeEnginePath,
-    string PreferredVendorDspProfilePath,
     string[] DeviceKeywords,
     string[] ExcludedDeviceKeywords)
 {
+    // True for the built-in "no dedicated asset" entry.
     public bool IsRecognizerDefault => string.IsNullOrWhiteSpace(Path);
 
+    // True for the "auto" entry that chooses an asset by microphone.
     public bool IsAutomaticSelection =>
         string.Equals(
             WakeWordAssetCatalog.NormalizeStoredPath(Path),
             WakeWordAssetCatalog.AutoSelectionPath,
             StringComparison.OrdinalIgnoreCase);
 
+    // Name to show in menus: display name, else name, else "Recognizer Default".
     public string BuildShortLabel()
     {
         if (!string.IsNullOrWhiteSpace(DisplayName))
@@ -42,6 +49,7 @@ internal sealed record WakeWordAssetDescriptor(
         return "Recognizer Default";
     }
 
+    // Wake phrases plus aliases, trimmed and de-duplicated, sorted by name.
     public IReadOnlyList<string> BuildWakeAliases()
     {
         var aliases = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -69,6 +77,8 @@ internal sealed record WakeWordAssetDescriptor(
         }
     }
 
+    // How well this asset suits a microphone: each device keyword found in the microphone name adds 18 plus the keyword's length (up to 18).
+    // An excluded keyword disqualifies it (int.MinValue). The default and auto entries never match (int.MinValue).
     public int ScoreDeviceMatch(string? deviceName)
     {
         if (IsRecognizerDefault || IsAutomaticSelection)
@@ -103,14 +113,20 @@ internal sealed record WakeWordAssetDescriptor(
     }
 }
 
+// Finds, loads and caches wake word assets.
 internal static class WakeWordAssetCatalog
 {
+    // JSON reading rules (case-insensitive property names).
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    // Lock for the cache below.
     private static readonly object Sync = new();
+    // Parsed assets keyed by file path, reloaded when the file's last-write time changes.
     private static readonly Dictionary<string, CachedWakeWordAsset> Cache = new(StringComparer.OrdinalIgnoreCase);
+    // Where assets live, relative to the app folder.
     private const string DefaultRelativeDirectory = "data\\wake-word-assets";
     public const string AutoSelectionPath = "auto";
 
+    // The "choose automatically" menu entry.
     public static WakeWordAssetDescriptor AutoSelection { get; } =
         new(
             Path: AutoSelectionPath,
@@ -124,10 +140,10 @@ internal static class WakeWordAssetCatalog
             PreferredBeamformingProfile: string.Empty,
             PreferredHardwareDspProfile: string.Empty,
             PreferredWakeEnginePath: string.Empty,
-            PreferredVendorDspProfilePath: string.Empty,
             DeviceKeywords: Array.Empty<string>(),
             ExcludedDeviceKeywords: Array.Empty<string>());
 
+    // The "use the built-in recogniser wake grammar, no asset" entry.
     public static WakeWordAssetDescriptor RecognizerDefault { get; } =
         new(
             Path: string.Empty,
@@ -141,10 +157,10 @@ internal static class WakeWordAssetCatalog
             PreferredBeamformingProfile: string.Empty,
             PreferredHardwareDspProfile: string.Empty,
             PreferredWakeEnginePath: string.Empty,
-            PreferredVendorDspProfilePath: string.Empty,
             DeviceKeywords: Array.Empty<string>(),
             ExcludedDeviceKeywords: Array.Empty<string>());
 
+    // Lists everything available: Auto, Default, then every valid .json asset from the configured file's folder and the default folder, sorted by name.
     public static IReadOnlyList<WakeWordAssetDescriptor> Discover(string workspaceRoot, JarvisOptions options)
     {
         var discovered = new List<WakeWordAssetDescriptor>();
@@ -158,7 +174,7 @@ internal static class WakeWordAssetCatalog
 
         if (!string.IsNullOrWhiteSpace(configuredPath) && !IsAutoSelectionPath(configuredPath))
         {
-            var configuredAbsolutePath = ResolveAbsolutePath(configuredPath, workspaceRoot);
+            var configuredAbsolutePath = WakeWordPaths.ResolveAbsolutePath(configuredPath, workspaceRoot);
             TryAdd(configuredPath, configuredAbsolutePath, discovered, seen);
 
             var configuredDirectory = Path.GetDirectoryName(configuredAbsolutePath);
@@ -169,13 +185,13 @@ internal static class WakeWordAssetCatalog
             }
         }
 
-        directories.Add(ResolveAbsolutePath(DefaultRelativeDirectory, workspaceRoot));
+        directories.Add(WakeWordPaths.ResolveAbsolutePath(DefaultRelativeDirectory, workspaceRoot));
 
         foreach (var directory in directories.Where(Directory.Exists))
         {
             foreach (var filePath in Directory.EnumerateFiles(directory, "*.json", SearchOption.TopDirectoryOnly))
             {
-                var storedPath = ToStoredPath(workspaceRoot, filePath);
+                var storedPath = WakeWordPaths.ToStoredPath(workspaceRoot, filePath);
                 TryAdd(storedPath, filePath, discovered, seen);
             }
         }
@@ -185,6 +201,7 @@ internal static class WakeWordAssetCatalog
             .OrderBy(asset => asset.BuildShortLabel(), StringComparer.OrdinalIgnoreCase)];
     }
 
+    // Returns the asset the settings point to. Auto picks the best one for the current microphone; an empty setting means none (null).
     public static WakeWordAssetDescriptor? ResolveConfiguredAsset(JarvisOptions options)
     {
         var storedPath = NormalizeStoredPath(options.SpeechRecognitionWakeWordAssetPath);
@@ -199,10 +216,11 @@ internal static class WakeWordAssetCatalog
             return null;
         }
 
-        var absolutePath = ResolveAbsolutePath(storedPath, Directory.GetCurrentDirectory());
+        var absolutePath = WakeWordPaths.ResolveAbsolutePath(storedPath, Directory.GetCurrentDirectory());
         return TryLoadDescriptor(storedPath, absolutePath);
     }
 
+    // Like ResolveConfiguredAsset but for showing the selection in the UI: never null, falls back to the recogniser default.
     public static WakeWordAssetDescriptor ResolveSelectionDescriptor(JarvisOptions options)
     {
         var storedPath = NormalizeStoredPath(options.SpeechRecognitionWakeWordAssetPath);
@@ -217,13 +235,15 @@ internal static class WakeWordAssetCatalog
             return RecognizerDefault;
         }
 
-        var absolutePath = ResolveAbsolutePath(storedPath, Directory.GetCurrentDirectory());
+        var absolutePath = WakeWordPaths.ResolveAbsolutePath(storedPath, Directory.GetCurrentDirectory());
         return TryLoadDescriptor(storedPath, absolutePath) ?? RecognizerDefault;
     }
 
+    // True if the setting is the word "auto".
     public static bool IsAutoSelectionPath(string? path) =>
         string.Equals(NormalizeStoredPath(path), AutoSelectionPath, StringComparison.OrdinalIgnoreCase);
 
+    // Trims and uses backslashes so the same path is always spelled the same way.
     public static string NormalizeStoredPath(string? path)
     {
         return string.IsNullOrWhiteSpace(path)
@@ -231,6 +251,8 @@ internal static class WakeWordAssetCatalog
             : path.Trim().Replace('/', '\\');
     }
 
+    // Chooses the best asset for the current microphone by score. If none scores above zero, prefers one whose preferred
+    // beamforming/DSP profile names match, then alphabetical.
     private static WakeWordAssetDescriptor? ResolveAutoAsset(JarvisOptions options)
     {
         var discovered = Discover(Directory.GetCurrentDirectory(), options)
@@ -269,6 +291,7 @@ internal static class WakeWordAssetCatalog
         return bestMatch.Asset;
     }
 
+    // Adds an asset to the list unless that path was already seen or the file cannot be read.
     private static void TryAdd(
         string storedPath,
         string absolutePath,
@@ -292,6 +315,7 @@ internal static class WakeWordAssetCatalog
         discovered.Add(asset);
     }
 
+    // Reads one JSON manifest into an asset, using the cache while the file is unchanged. Any read/parse error gives null (asset ignored).
     private static WakeWordAssetDescriptor? TryLoadDescriptor(string storedPath, string absolutePath)
     {
         if (!File.Exists(absolutePath))
@@ -329,16 +353,16 @@ internal static class WakeWordAssetCatalog
                     ? System.IO.Path.GetFileNameWithoutExtension(absolutePath)
                     : manifest.DisplayName.Trim(),
                 Description: manifest.Description?.Trim() ?? string.Empty,
-                WakePhrases: NormalizeValues(manifest.WakePhrases),
-                Aliases: NormalizeValues(manifest.Aliases),
+                WakePhrases: WakeWordPaths.NormalizeValues(manifest.WakePhrases),
+                Aliases: WakeWordPaths.NormalizeValues(manifest.Aliases),
                 MinimumConfidence: manifest.MinimumConfidence,
+                // Sensitivity bias is limited to -0.20..+0.20.
                 SensitivityBias: Math.Clamp(manifest.SensitivityBias ?? 0, -0.20, 0.20),
                 PreferredBeamformingProfile: manifest.PreferredBeamformingProfile?.Trim() ?? string.Empty,
                 PreferredHardwareDspProfile: manifest.PreferredHardwareDspProfile?.Trim() ?? string.Empty,
                 PreferredWakeEnginePath: manifest.PreferredWakeEnginePath?.Trim() ?? string.Empty,
-                PreferredVendorDspProfilePath: manifest.PreferredVendorDspProfilePath?.Trim() ?? string.Empty,
-                DeviceKeywords: NormalizeValues(manifest.DeviceKeywords),
-                ExcludedDeviceKeywords: NormalizeValues(manifest.ExcludedDeviceKeywords));
+                DeviceKeywords: WakeWordPaths.NormalizeValues(manifest.DeviceKeywords),
+                ExcludedDeviceKeywords: WakeWordPaths.NormalizeValues(manifest.ExcludedDeviceKeywords));
 
             lock (Sync)
             {
@@ -353,46 +377,11 @@ internal static class WakeWordAssetCatalog
         }
     }
 
-    private static string ResolveAbsolutePath(string path, string baseDirectory)
-    {
-        return System.IO.Path.IsPathRooted(path)
-            ? System.IO.Path.GetFullPath(path)
-            : System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDirectory, path));
-    }
-
-    private static string ToStoredPath(string workspaceRoot, string absolutePath)
-    {
-        if (string.IsNullOrWhiteSpace(workspaceRoot))
-        {
-            return absolutePath;
-        }
-
-        try
-        {
-            return NormalizeStoredPath(System.IO.Path.GetRelativePath(workspaceRoot, absolutePath));
-        }
-        catch
-        {
-            return absolutePath;
-        }
-    }
-
-    private static string[] NormalizeValues(IEnumerable<string>? values)
-    {
-        if (values is null)
-        {
-            return Array.Empty<string>();
-        }
-
-        return values
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
+    // A cache entry: the asset and the file's modification time when it was read.
     private sealed record CachedWakeWordAsset(DateTime LastWriteUtc, WakeWordAssetDescriptor? Asset);
 
+    // Auto-selection score: device keyword score, +22 if the asset's preferred beamforming profile matches, +18 for the DSP profile.
+    // If still not positive, a name containing "desktop", "headset" or "conference/far field" earns +8 when the microphone profile is the same kind.
     private static int ScoreAutoSelection(
         WakeWordAssetDescriptor asset,
         string? deviceName,
@@ -441,6 +430,7 @@ internal static class WakeWordAssetCatalog
         return score;
     }
 
+    // The JSON shape of an asset file. Missing fields get the safe defaults below.
     private sealed record WakeWordAssetManifest
     {
         public string Name { get; init; } = string.Empty;
@@ -463,10 +453,53 @@ internal static class WakeWordAssetCatalog
 
         public string PreferredWakeEnginePath { get; init; } = string.Empty;
 
-        public string PreferredVendorDspProfilePath { get; init; } = string.Empty;
-
         public string[] DeviceKeywords { get; init; } = Array.Empty<string>();
 
         public string[] ExcludedDeviceKeywords { get; init; } = Array.Empty<string>();
+    }
+}
+
+// Path helpers for asset files.
+internal static class WakeWordPaths
+{
+    // Relative paths are resolved against baseDirectory; absolute ones are kept.
+    public static string ResolveAbsolutePath(string path, string baseDirectory)
+    {
+        return System.IO.Path.IsPathRooted(path)
+            ? System.IO.Path.GetFullPath(path)
+            : System.IO.Path.GetFullPath(System.IO.Path.Combine(baseDirectory, path));
+    }
+
+    // Makes a path relative to the workspace for saving in settings, falling back to the absolute path.
+    public static string ToStoredPath(string workspaceRoot, string absolutePath)
+    {
+        if (string.IsNullOrWhiteSpace(workspaceRoot))
+        {
+            return absolutePath;
+        }
+
+        try
+        {
+            return WakeWordAssetCatalog.NormalizeStoredPath(System.IO.Path.GetRelativePath(workspaceRoot, absolutePath));
+        }
+        catch
+        {
+            return absolutePath;
+        }
+    }
+
+    // Removes blanks and duplicates (ignoring case) from a list of strings from JSON.
+    public static string[] NormalizeValues(IEnumerable<string>? values)
+    {
+        if (values is null)
+        {
+            return Array.Empty<string>();
+        }
+
+        return values
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 }

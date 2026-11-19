@@ -1,5 +1,9 @@
+// Shared plain data types (enums and records) that describe how a request is classified, what the assistant is doing
+// (activity events for the UI), and what is saved for a background session. No logic lives here.
 namespace Jarvis.Core;
 
+// The route a request takes: run one tool directly, ask a clarifying question, answer simply,
+// plan with several tool calls, research, look at the screen, or run in the background.
 public enum AgentIntentKind
 {
     DirectTool,
@@ -11,6 +15,7 @@ public enum AgentIntentKind
     Background
 }
 
+// The kind of progress message sent to the UI while a request is being worked on.
 public enum AssistantActivityKind
 {
     Status,
@@ -26,8 +31,10 @@ public enum AssistantActivityKind
     Error
 }
 
+// A source link shown with an answer.
 public sealed record AssistantCitation(string Title, string Url, string Snippet = "");
 
+// Record of one tool run: what was called, with what input, the result, and whether it was checked afterwards.
 public sealed record AssistantToolExecution(
     string ToolName,
     string Input,
@@ -38,54 +45,10 @@ public sealed record AssistantToolExecution(
     string VerificationStatus = "",
     string VerificationSummary = "");
 
+// One step of a plan and its current status.
 public sealed record PlanStepState(string Title, string Status, string Detail);
 
-public sealed record UserStateItem(
-    string Title,
-    string Detail,
-    string Category = "",
-    string DueAt = "",
-    bool IsUnread = false);
-
-public sealed record UserStateSnapshot(
-    string Summary,
-    UserStateItem[] EmailItems,
-    UserStateItem[] TaskItems)
-{
-    public static UserStateSnapshot Empty { get; } = new(
-        "No email or task state is available.",
-        Array.Empty<UserStateItem>(),
-        Array.Empty<UserStateItem>());
-
-    public string ToPromptText()
-    {
-        static string RenderSection(string title, IReadOnlyList<UserStateItem> items)
-        {
-            if (items.Count == 0)
-            {
-                return $"{title}: none";
-            }
-
-            var lines = items
-                .Take(5)
-                .Select(item =>
-                {
-                    var dueText = string.IsNullOrWhiteSpace(item.DueAt) ? string.Empty : $" | due {item.DueAt}";
-                    var unreadText = item.IsUnread ? " | unread" : string.Empty;
-                    return $"- {item.Title}: {item.Detail}{dueText}{unreadText}";
-                });
-
-            return title + ":" + Environment.NewLine + string.Join(Environment.NewLine, lines);
-        }
-
-        return string.Join(
-            Environment.NewLine,
-            $"Summary: {Summary}",
-            RenderSection("Email", EmailItems),
-            RenderSection("Tasks", TaskItems));
-    }
-}
-
+// Everything saved about a long-running or resumable session so it can be shown or continued later.
 public sealed record PersistedAgentSession(
     string SessionId,
     string Status,
@@ -101,6 +64,7 @@ public sealed record PersistedAgentSession(
     AssistantToolExecution[] ToolResults,
     AssistantCitation[] Citations);
 
+// One progress message for the UI. IsTransient means it can be replaced by the next message rather than kept in the log.
 public sealed record AssistantActivityEvent(
     AssistantActivityKind Kind,
     string Message,
@@ -108,6 +72,7 @@ public sealed record AssistantActivityEvent(
     bool IsTransient = false,
     string Detail = "");
 
+// Event payload wrapper so progress messages can travel through a normal C# event.
 public sealed class AssistantActivityEventArgs : EventArgs
 {
     public AssistantActivityEventArgs(AssistantActivityEvent activity)

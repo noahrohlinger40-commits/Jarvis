@@ -1,11 +1,17 @@
+// AudioDeviceResolver.cs: finds which microphone to record from. Settings store a device name, but NAudio's WaveIn API
+// (the older Windows multimedia interface used for recording) wants a numeric index and reports names slightly differently
+// from what the user sees, so the name is matched loosely with a score. Falls back to the Windows default microphones.
+// Called by the voice runtimes (OpenAiCompatibleVoiceRuntime, VoiceRuntime.cs) and the calibration service.
 using System.Text;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
 namespace Jarvis.App;
 
+// Static helpers for choosing the recording device.
 internal static class AudioDeviceResolver
 {
+    // Returns the device number to record from: the matching device, else the first device (0), else -1 when no microphone exists.
     public static int GetPreferredInputDeviceIndex(string? preferredDeviceName)
     {
         if (TryResolveMicrophoneDevice(preferredDeviceName, out var deviceNumber))
@@ -16,6 +22,7 @@ internal static class AudioDeviceResolver
         return WaveInEvent.DeviceCount > 0 ? 0 : -1;
     }
 
+    // Tries the configured name first, then the names of the Windows default capture devices; false if nothing matches.
     public static bool TryResolveMicrophoneDevice(string? preferredDeviceName, out int deviceNumber)
     {
         deviceNumber = -1;
@@ -42,6 +49,7 @@ internal static class AudioDeviceResolver
         return false;
     }
 
+    // Picks the device whose name scores highest against the wanted name; false if nothing scores above zero.
     private static bool TryMatchWaveInDevice(string candidateName, out int deviceNumber)
     {
         deviceNumber = -1;
@@ -64,6 +72,8 @@ internal static class AudioDeviceResolver
         return bestScore > 0 && deviceNumber >= 0;
     }
 
+    // Similarity score between two names: exact 1000; same without spaces 900; one contains the other 700 / 600 (plus the matching
+    // length); otherwise 100 per shared word plus word lengths; 0 for nothing in common.
     private static int ComputeMatchScore(string? candidateName, string? productName)
     {
         var normalizedCandidate = Normalize(candidateName);
@@ -107,6 +117,7 @@ internal static class AudioDeviceResolver
         return (sharedTokens.Length * 100) + sharedTokens.Sum(token => Math.Min(token.Length, 18));
     }
 
+    // Lower-cases and removes null characters and double spaces so names compare cleanly.
     private static string Normalize(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -121,6 +132,7 @@ internal static class AudioDeviceResolver
             .ToLowerInvariant();
     }
 
+    // Removes all spaces so "Mic Array" equals "MicArray".
     private static string RemoveWhitespace(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -141,6 +153,7 @@ internal static class AudioDeviceResolver
         return builder.ToString();
     }
 
+    // Splits a name into unique words, breaking at spaces, dashes, brackets, slashes, commas and dots.
     private static string[] Tokenize(string value)
     {
         return value
@@ -149,6 +162,8 @@ internal static class AudioDeviceResolver
             .ToArray();
     }
 
+    // Asks Windows for the friendly names of the default recording device for each role (communications, console, multimedia).
+    // Each role can point to a different device, and a role with no device is skipped.
     private static IEnumerable<string> GetDefaultCaptureEndpointNames()
     {
         using var enumerator = new MMDeviceEnumerator();

@@ -1,3 +1,7 @@
+// UiaBrowserPageReader.cs: reads the web page currently on screen in Chrome, Edge, Brave, Vivaldi or Opera
+// by asking Windows UI Automation (the accessibility system) for the browser's element tree. Implements
+// IBrowserPageReader (defined in Jarvis.Core); callers ask for the active page and get a BrowserPage back:
+// title, address and a tree of PageNodes (headings, links, text...). Nothing is injected into the browser.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -13,6 +17,7 @@ namespace Jarvis.App;
 /// </summary>
 internal sealed class UiaBrowserPageReader : IBrowserPageReader
 {
+    // The process names (without .exe) treated as browsers.
     private static readonly HashSet<string> BrowserProcesses = new(StringComparer.OrdinalIgnoreCase)
     {
         "chrome", "msedge", "brave", "vivaldi", "opera"
@@ -26,8 +31,10 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
         // Off the UI thread: UI Automation calls into another process and must not block the form.
         Task.Run(() => Read(cancellationToken), cancellationToken);
 
+    // Find the page to read. Runs on a worker thread (see ReadActivePageAsync).
     private static BrowserPage? Read(CancellationToken cancellationToken)
     {
+        // UI Automation represents the web page itself as a control of type "Document".
         var documentCondition = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document);
         BrowserPage? page = null;
 
@@ -51,6 +58,7 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
 
                 page = Capture(document, window);
 
+                // A page with fewer than 20 accessibility nodes is treated as still loading; 20 is a rough "has real content" cutoff.
                 if (CountNodes(page.Document) >= 20)
                 {
                     return page;
@@ -60,16 +68,19 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
                 break;
             }
 
+            // Wait 400 ms before trying again (8 tries, so up to about 3 seconds).
             Thread.Sleep(400);
         }
 
         return page;
     }
 
+    // Copy the page's accessibility tree into our own PageNode tree, plus its title and address.
     private static BrowserPage Capture(AutomationElement document, AutomationElement window)
     {
         // One cross-process request for the whole tree instead of one per element: about 0.1 to 0.3 s even
         // for a long article.
+        // Cache request: fetch these properties for the whole subtree in one go, as plain data (AutomationElementMode.None means no live element handles are kept).
         var cache = new CacheRequest
         {
             TreeScope = TreeScope.Subtree,
@@ -86,6 +97,7 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
 
         AutomationElement root;
 
+        // Activating the cache makes GetUpdatedCache download the subtree with the properties listed above.
         using (cache.Activate())
         {
             root = document.GetUpdatedCache(cache);
@@ -94,6 +106,7 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
         return new BrowserPage(root.Cached.Name, ReadAddress(window), ToNode(root));
     }
 
+    // Convert one cached UI Automation element, and all its children, into a PageNode.
     private static PageNode ToNode(AutomationElement element)
     {
         var children = new List<PageNode>();
@@ -103,6 +116,7 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
             children.Add(ToNode(child));
         }
 
+        // Heading level is 0 for "not a heading". UIA reports heading levels as 80051..80059 (H1..H9), so subtract 80050.
         var headingLevel = 0;
 
         if (HeadingLevelProperty is not null
@@ -116,6 +130,7 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
         return new PageNode(cached.LocalizedControlType ?? string.Empty, cached.Name ?? string.Empty, cached.ClassName ?? string.Empty, headingLevel, children);
     }
 
+    // Total number of nodes in a tree: this node plus all descendants.
     private static int CountNodes(PageNode node) => 1 + node.Children.Sum(CountNodes);
 
     // The address bar is Chromium's omnibox; its class name is the same in Chrome, Edge, and Brave.
@@ -142,13 +157,16 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
         var visible = new List<IntPtr>();
         var minimized = new List<IntPtr>();
 
+        // EnumWindows calls this lambda once per top-level window, front to back; returning true means "keep going".
         EnumWindows((handle, parameter) =>
         {
+            // Skip hidden windows, windows with no title, and anything that is not a Chromium-based window.
             if (!IsWindowVisible(handle) || GetWindowTextLength(handle) == 0 || !IsChromiumWindow(handle))
             {
                 return true;
             }
 
+            // Look up which process owns the window, to check it is a known browser (not, say, an Electron app that shares the window class).
             _ = GetWindowThreadProcessId(handle, out var processId);
 
             try
@@ -165,13 +183,16 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
                 return true;
             }
 
+            // Minimized browsers go on the second list.
             (IsIconic(handle) ? minimized : visible).Add(handle);
             return true;
         }, IntPtr.Zero);
 
+        // Visible windows first, then minimized ones.
         return [.. visible, .. minimized];
     }
 
+    // Chrome, Edge, Brave and other Chromium browsers all use the window class "Chrome_WidgetWin_1" for their frames.
     private static bool IsChromiumWindow(IntPtr handle)
     {
         var className = new StringBuilder(64);
@@ -179,8 +200,10 @@ internal sealed class UiaBrowserPageReader : IBrowserPageReader
         return className.ToString() == "Chrome_WidgetWin_1";
     }
 
+    // Signature of the callback that EnumWindows expects.
     private delegate bool EnumWindowsProc(IntPtr handle, IntPtr parameter);
 
+    // Win32 calls from user32.dll (the Windows window manager): list windows, check visible/minimized, read title length and class name, find the owning process.
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
 

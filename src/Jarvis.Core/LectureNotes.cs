@@ -1,3 +1,8 @@
+// Lecture / meeting note-taker. 'lecture notes start <name>' records the microphone and the PC's own audio; 'lecture notes stop' saves
+// the recording, writes a Markdown note into the Lecture Notes Obsidian vault (JarvisOptions.LectureNotesFolder, default
+// %USERPROFILE%\Lecture Notes), and asks the LOCAL language model for a summary, key points and due dates.
+// The recording itself and speech-to-text are done by an ILectureRecorder supplied by the app (Jarvis.App); this file only controls it.
+// LectureNoteText holds the text work: formatting the note, splitting the transcript for the model, and checking the model's output.
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -5,12 +10,15 @@ using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
+// One transcribed sentence with its time from the start of the recording.
 /// <param name="At">Time from the start of the recording.</param>
 public sealed record TranscriptLine(TimeSpan At, string Text);
 
+// A finished recording: transcript lines, total length and the saved audio file.
 /// <param name="AudioPath">The saved recording: an MP3, or the WAV if it could not be converted.</param>
 public sealed record LectureRecording(IReadOnlyList<TranscriptLine> Lines, TimeSpan Duration, string AudioPath);
 
+// What the app must provide for recording: start, stop, and the finished result.
 /// <summary>Records the microphone and the computer's own audio, transcribing as it goes.</summary>
 public interface ILectureRecorder
 {
@@ -23,20 +31,27 @@ public interface ILectureRecorder
     Task<LectureRecording> StopAsync(CancellationToken cancellationToken);
 }
 
+// The tool the planner calls. It remembers the recording in progress (title, file name, start time) in fields, so it handles one recording at a time.
 public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? modelGateway) : IAssistantTool
 {
+    // Cleaned name of the current recording.
     private string _title = string.Empty;
+    // File name (without extension) shared by the note and its audio, e.g. '2026-09-29 IT Professions'.
     private string _fileName = string.Empty;
+    // Local start time of the current recording.
     private DateTime _startedAt;
 
+    // Name the planner uses to pick this tool.
     public string Name => "lecture notes";
 
     public string Description =>
         "Record a lecture or meeting (microphone and computer audio) and turn it into notes in the Lecture Notes vault. "
         + "`lecture notes start <course or meeting name>` begins; `lecture notes stop` ends it and writes the notes.";
 
+    // True for input beginning with 'lecture notes'.
     public bool CanHandle(string input) => ToolInputHelper.StartsWithCommand(input, "lecture notes");
 
+    // Routes 'stop' and 'start <name>'; anything else reports whether a recording is in progress.
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
         if (recorder is null)
@@ -45,6 +60,7 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
         }
 
         var tail = ToolInputHelper.GetCommandTail(input, "lecture notes").Trim();
+        // Expands %USERPROFILE% in the configured folder.
         var vault = Environment.ExpandEnvironmentVariables(context.Options.LectureNotesFolder);
 
         if (tail.StartsWith("stop", StringComparison.OrdinalIgnoreCase))
@@ -61,6 +77,7 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
             recorder.IsRecording ? $"I'm recording {_title}, started at {_startedAt:h:mm tt}." : "I'm not recording anything.");
     }
 
+    // Begins recording: picks unique file names, creates the Recordings folder and starts the recorder.
     private ToolResult Start(string vault, string name)
     {
         if (recorder!.IsRecording)
@@ -68,6 +85,7 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
             return new ToolResult($"I'm already recording {_title}. Say \"stop lecture notes\" to finish.");
         }
 
+        // A name that is safe for file names and Obsidian links.
         _title = LectureNoteText.CleanTitle(name);
         _startedAt = DateTime.Now;
         var recordings = Path.Combine(vault, "Recordings");
@@ -95,6 +113,8 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
         return new ToolResult($"Recording {_title}.");
     }
 
+    // Ends the recording and produces the note in three steps: (1) save the transcript note immediately, (2) open it in Obsidian, (3) ask the
+    // local model for notes and rewrite the note with them. Each step is separate so a failure later never loses what was saved earlier.
     private async Task<ToolResult> StopAsync(string vault, CancellationToken cancellationToken)
     {
         if (!recorder!.IsRecording)
@@ -102,6 +122,7 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
             return new ToolResult("I'm not recording anything.", Succeeded: false);
         }
 
+        // CancellationToken.None on purpose: once stopped, the audio must be finished and saved even if the request is cancelled.
         var recording = await recorder.StopAsync(CancellationToken.None);
         recording = recording with { Lines = LectureNoteText.JoinIntoSentences(recording.Lines) };
         var notePath = NotePath(vault);
@@ -126,6 +147,7 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
             return new ToolResult($"I saved the {_title} recording, but I couldn't make out any speech in it.");
         }
 
+        // Step 3: model-written notes (null if the local model is not running).
         var notes = await LectureNoteText.WriteNotesAsync(modelGateway, _title, recording.Lines, cancellationToken);
 
         if (notes is null)
@@ -136,6 +158,7 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
         }
 
         await File.WriteAllTextAsync(notePath, LectureNoteText.Render(_title, _startedAt, recording, audioFile, notes), cancellationToken);
+        // Wording for how many due dates / to-dos were found, appended to the spoken reply.
         var dueItems = notes.DueItems.Count switch
         {
             0 => string.Empty,
@@ -149,27 +172,34 @@ public sealed class LectureNotesTool(ILectureRecorder? recorder, IModelGateway? 
             SpeakInFull: true);
     }
 
+    // Where the note goes: <vault>/<title>/<file name>.md.
     private string NotePath(string vault) => Path.Combine(vault, _title, _fileName + ".md");
 }
 
+// The finished notes: a short summary, due dates/to-dos, and key points for each time stretch.
 /// <param name="Sections">Key points per stretch of the recording, with where each stretch starts and ends.</param>
 public sealed record LectureNotes(string Summary, IReadOnlyList<string> DueItems, IReadOnlyList<(TimeSpan Start, TimeSpan End, IReadOnlyList<string> Points)> Sections);
 
+// Text helpers. 'partial' because the [GeneratedRegex] methods at the bottom are completed by the compiler.
 public static partial class LectureNoteText
 {
-    // About 3,000 tokens (roughly 15 minutes of speech), inside the local model's 8K context with room to answer.
+    // Largest chunk of transcript sent to the model at once: about 3,000 tokens (roughly 15 minutes of speech),
+    // inside the local model's 8K context with room to answer.
     private const int SectionCharacters = 12_000;
 
+    // Prompt: turn one chunk of transcript into 3 to 8 bullet points, using only what was said.
     private const string KeyPointsInstructions =
         "You take notes from part of a lecture or meeting transcript. Write the key points as 3 to 8 short bullet points, "
         + "each on its own line starting with \"- \". Keep names, terms, numbers, and examples exactly as said. "
         + "Use only what the transcript says. Write nothing else: no heading, no introduction.";
 
+    // Prompt: list assignments, deadlines, exams and tasks in one chunk; answer 'none' if there are none.
     private const string DueItemsInstructions =
         "From this part of a lecture or meeting transcript, list every assignment, due date, exam, quiz, deadline, and task "
         + "someone must do, and anything the speaker says will be on a test. One per line starting with \"- \", with dates "
         + "and times exactly as said. If there are none, reply with only the word: none";
 
+    // Prompt: a short plain-text summary that can be read aloud.
     private const string SummaryInstructions =
         "These are notes from a lecture or meeting. Summarize it in 2 or 3 plain sentences, under 60 words, for someone "
         + "who missed it. The summary is read aloud: no lists, headings, markdown, or emoji.";
@@ -177,6 +207,7 @@ public static partial class LectureNoteText
     /// <summary>"it professions" stays as said; characters that files or Obsidian links can't hold are dropped.</summary>
     public static string CleanTitle(string name)
     {
+        // Replace characters that file names or Obsidian links cannot hold (\ / : * ? " < > | # ^ [ ]) with spaces.
         var cleaned = Regex.Replace(name, @"[\\/:*?""<>|#^\[\]]", " ");
         cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim(' ', '.');
 
@@ -189,17 +220,22 @@ public static partial class LectureNoteText
         return cleaned.Length == 0 ? "Lecture" : cleaned;
     }
 
-    /// <summary>"05:07", or "1:05:07" past an hour: the formats the Audio Timestamp Player plugin reads.</summary>
+    /// <summary>"05:07", or "01:05:07" past an hour: the formats the Audio Timestamp Player plugin reads.</summary>
     public static string FormatTime(TimeSpan time) =>
         time.TotalHours >= 1 ? time.ToString(@"hh\:mm\:ss", CultureInfo.InvariantCulture) : time.ToString(@"mm\:ss", CultureInfo.InvariantCulture);
 
     /// <summary>A clickable time: with the plugin it plays the recording from there, without it it's a plain link.</summary>
+    // Markdown link whose '#audio-time=' part tells the plugin where to start playing.
     private static string TimeLink(TimeSpan time) => $"[{FormatTime(time)}](#audio-time={FormatTime(time)})";
 
     /// <summary>The whole note. Without <paramref name="notes"/> it holds the recording and transcript only.</summary>
+    // Builds the whole Markdown note: a front-matter header (date, time, duration, tags), the embedded audio, then either a 'no notes yet'
+    // line or Summary / Due dates / Notes sections, and finally the timestamped transcript.
     public static string Render(string title, DateTime startedAt, LectureRecording recording, string audioFile, LectureNotes? notes)
     {
+        // Tag as 'meeting' if the name says so, otherwise 'lecture'.
         var kind = title.Contains("meeting", StringComparison.OrdinalIgnoreCase) ? "meeting" : "lecture";
+        // Turns the title into a tag: lower-case letters and digits with dashes ('IT Professions' becomes 'it-professions').
         var tag = Regex.Replace(title.ToLowerInvariant(), @"[^a-z0-9]+", "-").Trim('-');
         var note = new StringBuilder();
 
@@ -255,6 +291,8 @@ public static partial class LectureNoteText
     }
 
     /// <summary>Notes from the local model, or null when it is off or fails.</summary>
+    // Asks the model for notes. Per transcript chunk: key points and due items; then one summary built from all the key points.
+    // Returns null if the model is off or any step fails (unless the user cancelled, which propagates).
     public static async Task<LectureNotes?> WriteNotesAsync(
         IModelGateway? gateway,
         string title,
@@ -281,6 +319,7 @@ public static partial class LectureNoteText
             }
 
             var allPoints = string.Join("\n", sections.SelectMany(section => section.Points).Select(point => $"- {point}"));
+            // Flatten the summary to plain text: drop markdown symbols and collapse whitespace so it reads well aloud.
             var summary = Regex.Replace(await CompleteAsync(gateway, SummaryInstructions, $"Title: {title}\n\nNotes:\n{allPoints}", cancellationToken), @"[*#_`]+|\s+", " ").Trim();
             return new LectureNotes(summary, dueItems.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), sections);
         }
@@ -294,6 +333,7 @@ public static partial class LectureNoteText
     /// Whisper's segments break mid-sentence ("...in seven" / "layers."), so a segment that doesn't end a
     /// sentence is joined to the next, keeping the first one's time. Capped so unpunctuated speech still breaks.
     /// </summary>
+    // Rejoins transcript fragments (see the note above); the regex tests whether the text ends with . ? ! or ), and a fragment is only joined while under 250 characters.
     public static List<TranscriptLine> JoinIntoSentences(IReadOnlyList<TranscriptLine> lines)
     {
         var joined = new List<TranscriptLine>();
@@ -314,6 +354,7 @@ public static partial class LectureNoteText
     }
 
     /// <summary>Consecutive transcript lines grouped into sections the model can take in one pass.</summary>
+    // Groups lines into chunks of at most about 12,000 characters, recording each chunk's start and end time.
     public static List<(TimeSpan Start, TimeSpan End, string Text)> SplitIntoSections(IReadOnlyList<TranscriptLine> lines)
     {
         var sections = new List<(TimeSpan, TimeSpan, string)>();
@@ -344,18 +385,23 @@ public static partial class LectureNoteText
     /// The small local model sometimes changes a number (it once wrote port 447 for 443). These notes are
     /// studied from, so a point with a number the transcript doesn't have is flagged rather than trusted.
     /// </summary>
+    // Finds every run of digits in the model's point and checks it also appears as a whole number in the transcript (the lookarounds
+    // (?<!\d) and (?!\d) stop '44' matching inside '443'). Numbers the transcript spells out as words would also be flagged.
     public static string FlagUnheardNumbers(string point, string transcript) =>
         Regex.Matches(point, @"\d+").Any(number => !Regex.IsMatch(transcript, $@"(?<!\d){number.Value}(?!\d)"))
             ? $"{point} ⚠️ *check the recording: a number here isn't in the transcript*"
             : point;
 
     /// <summary>The model's list items, without markers, headings, or "none".</summary>
+    // Cleans the model's reply into plain items. The regex removes a leading '-', '*', a bullet or '1.' / '1)', and bold '**' marks;
+    // lines ending in ':' (headings) and 'nothing found' answers are dropped.
     public static List<string> Bullets(string reply) =>
         reply.Split('\n')
             .Select(line => Regex.Replace(line, @"^\s*(?:[-*•]|\d+[.)])\s*|\*\*", string.Empty).Trim())
             .Where(line => line.Length > 0 && !line.EndsWith(':') && !NothingFoundRegex().IsMatch(line))
             .ToList();
 
+    // Sends one prompt to the local model with a 90-second limit and removes any <think> block from the reply.
     private static async Task<string> CompleteAsync(IModelGateway gateway, string instructions, string input, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -368,16 +414,18 @@ public static partial class LectureNoteText
                 ],
                 // 0, not the usual 0.2: notes should repeat the facts, not vary them.
                 Temperature: 0),
-            // Reasoning allows 384 tokens on the local model; Fast's 128 would cut the notes off.
+            // Reasoning allows 384 tokens on the local model; Fast's 256 could cut the notes off.
             ModelRoute.Reasoning,
             timeout.Token);
 
         return ThinkBlockRegex().Replace(response.Content ?? string.Empty, string.Empty);
     }
 
+    // Matches a '<think>...</think>' block, the reasoning text some local models print before the answer.
     [GeneratedRegex(@"<think>[\s\S]*?</think>", RegexOptions.IgnoreCase)]
     private static partial Regex ThinkBlockRegex();
 
+    // Matches a reply that means 'nothing found': 'none', 'n/a', 'there are/were/is no ...', or 'no <up to 3 words> mentioned/found/given/listed'.
     // "none", "There are no deadlines.", "No assignments were mentioned."
     [GeneratedRegex(@"^(?:none|n/a)\b|^there (?:are|were|is) no\b|^no\s+(?:\w+\s+){0,3}(?:mentioned|found|given|listed)\b", RegexOptions.IgnoreCase)]
     private static partial Regex NothingFoundRegex();

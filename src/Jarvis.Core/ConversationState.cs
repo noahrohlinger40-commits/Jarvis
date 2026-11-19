@@ -1,15 +1,26 @@
+// Short-term memory of the current session (last few turns), kept only in RAM. JarvisAssistant adds each finished turn
+// and the planner asks for a snapshot to put into the model prompt so follow-ups like "open it" make sense.
+// Long-term memory is separate (MemoryNote).
 using System.Text;
 
 namespace Jarvis.Core;
 
+// One remembered turn of the current session.
 public sealed record ConversationStateEntry(
     DateTimeOffset TimestampUtc,
     string UserInput,
     string ResponseText,
     string Intent,
     string Privacy,
-    AssistantToolExecution[] ToolResults);
+    AssistantToolExecution[] ToolResults)
+{
+    // True for turns marked private, so callers can avoid saving or quoting them.
+    public bool IsPrivate =>
+        string.Equals(Privacy, "off-the-record", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(Privacy, "sensitive", StringComparison.OrdinalIgnoreCase);
+}
 
+// Read-only view of recent turns, plus a guess at what the conversation is currently about.
 public sealed record ConversationStateSnapshot(
     ConversationStateEntry[] Entries,
     string CurrentFocus,
@@ -17,6 +28,7 @@ public sealed record ConversationStateSnapshot(
 {
     public static ConversationStateSnapshot Empty { get; } = new(Array.Empty<ConversationStateEntry>(), string.Empty, false);
 
+    // Renders the last 6 turns as compact text lines for the model prompt, with user text and tool summaries clipped short.
     public string ToPromptText()
     {
         if (Entries.Length == 0)
@@ -58,18 +70,10 @@ public sealed record ConversationStateSnapshot(
         return string.IsNullOrWhiteSpace(value) ? "none" : value.Trim();
     }
 
-    private static string Trim(string value, int maxLength)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var flattened = value.ReplaceLineEndings(" ").Trim();
-        return flattened.Length <= maxLength ? flattened : flattened[..maxLength] + "...";
-    }
+    private static string Trim(string value, int maxLength) => value.Clip(maxLength);
 }
 
+// Thread-safe rolling buffer of recent turns (oldest are dropped past the capacity).
 public sealed class ShortTermConversationState
 {
     private readonly int _capacity;
@@ -78,6 +82,7 @@ public sealed class ShortTermConversationState
 
     public ShortTermConversationState(int capacity = 18)
     {
+        // Never smaller than 6, because the prompt text above shows the last 6.
         _capacity = Math.Max(6, capacity);
     }
 
@@ -85,6 +90,7 @@ public sealed class ShortTermConversationState
     {
         ArgumentNullException.ThrowIfNull(turn);
 
+        // The lock is needed because turns can be added from background work while the planner reads a snapshot.
         lock (_gate)
         {
             _entries.Add(new ConversationStateEntry(
@@ -114,6 +120,7 @@ public sealed class ShortTermConversationState
             var entries = _entries
                 .TakeLast(Math.Max(1, maxResults))
                 .ToArray();
+            // Focus is the newest tool result's summary if there is one, otherwise what the user last said.
             var latest = entries.Last();
             var currentFocus = latest.ToolResults.LastOrDefault()?.Summary;
 
@@ -122,9 +129,7 @@ public sealed class ShortTermConversationState
                 currentFocus = latest.UserInput;
             }
 
-            var containsOffRecordTurns = entries.Any(entry =>
-                string.Equals(entry.Privacy, "off-the-record", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(entry.Privacy, "sensitive", StringComparison.OrdinalIgnoreCase));
+            var containsOffRecordTurns = entries.Any(entry => entry.IsPrivate);
 
             return new ConversationStateSnapshot(entries, currentFocus ?? string.Empty, containsOffRecordTurns);
         }

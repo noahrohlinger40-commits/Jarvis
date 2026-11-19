@@ -1,3 +1,9 @@
+// OpenAiCompatibleVoiceRuntime.cs: Jarvis's main microphone pipeline. See the step-by-step path in VoiceRuntime.cs.
+// It records the microphone, cuts the audio into utterances, sends each one to a local whisper server (an "OpenAI-compatible"
+// /audio/transcriptions endpoint, normally 127.0.0.1:8178), and raises CommandRecognized with the cleaned text.
+// Also contains OpenAiCompatibleTranscriptionClient (the HTTP call) and Pcm16WavWriter (wraps raw audio as a WAV file).
+// Audio basics used throughout: samples are 16-bit whole numbers (-32768..32767), two bytes each; "level" is a sample divided
+// by 32768 so it falls between -1 and 1; sample rate 16,000 means 16,000 samples (32,000 bytes) per second.
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -6,8 +12,10 @@ using NAudio.Wave;
 
 namespace Jarvis.App;
 
+// Listens continuously, detects when someone is speaking, and turns each spoken piece into a command via whisper.
 internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
 {
+    // Upper limit on one utterance (15 s) so the buffer cannot grow forever.
     // A single spoken command is far shorter than this; the cap only matters for steady background sound.
     private const int MaximumUtteranceMilliseconds = 15_000;
 
@@ -16,41 +24,53 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
     // the pre-roll overlap keeps a wake word cut at a boundary whole.
     private const int PlaybackUtteranceMilliseconds = 3_000;
 
+    // Protects the fields below: audio callbacks, timers and transcription tasks all run on different threads.
     private readonly object _sync = new();
     private readonly JarvisOptions _options;
     private readonly OpenAiCompatibleTranscriptionClient _client;
+    // Only one transcription request at a time, so the local whisper server is not flooded and results arrive in order.
     private readonly SemaphoreSlim _transcriptionGate = new(1, 1);
-    private readonly ClapDetector? _clapDetector;
+    // The openWakeWord "hey jarvis" detector, or null when no such engine is configured.
     private readonly WakeWordDetector? _wakeWordDetector;
     private readonly ResolvedMicrophoneProcessingProfile _audioProcessing;
-    private readonly VendorDspControlSession? _vendorDspControl;
+    // Decides whether quiet or Jarvis-like sound is Jarvis's own reply leaking from the speakers.
     private readonly VoiceAcousticEchoSuppressor _echoSuppressor;
+    // Rolling window of the most recent audio chunks (pre-roll), so the start of a sentence is not cut off.
     private readonly Queue<byte[]> _preRollChunks = new();
+    // Size limits in bytes, converted from milliseconds in the constructor: pre-roll, shortest utterance worth sending,
+    // longest utterance, and longest utterance while Jarvis is speaking.
     private readonly int _preRollByteLimit;
     private readonly int _minimumUtteranceBytes;
     private readonly int _maximumUtteranceBytes;
     private readonly int _playbackUtteranceBytes;
+    // The live microphone recording (NAudio).
     private WaveInEvent? _capture;
+    // Cancelled on stop so in-flight transcriptions give up.
     private CancellationTokenSource? _lifetimeCts;
+    // Audio of the sentence being recorded right now; null while nobody is speaking.
     private MemoryStream? _activeSpeechBuffer;
+    // Closes the listening window if no command arrives in time.
     private System.Threading.Timer? _wakeWindowTimer;
+    // When speech was last heard; used to detect the end of an utterance.
     private DateTimeOffset _lastVoiceDetectedUtc;
     private int _preRollBytes;
+    // Number of utterances sent for transcription but not finished yet.
     private int _pendingUtterances;
     private bool _isListening;
+    // True while the listening window is open (wake word heard, next sentence is a command).
     private bool _isArmed;
+    // Running estimate of background noise level (RMS, 0..1). The speech threshold is set relative to it.
     private double _noiseFloor;
+    // Smoothed automatic gain (volume multiplier) applied to quiet microphones.
     private double _smoothedInputGain = 1.0;
-    private string _vendorDspWarning = string.Empty;
 
+    // Converts the millisecond settings into byte sizes and builds the wake word detector and echo suppressor.
     public OpenAiCompatibleVoiceRuntime(JarvisOptions options, OpenAiCompatibleTranscriptionClient client)
     {
         _options = options;
         _client = client;
-        _clapDetector = options.ClapShortcutEnabled ? new ClapDetector(options) : null;
         _audioProcessing = MicrophoneProcessingProfileResolver.Resolve(options);
         _wakeWordDetector = WakeWordDetector.Create(options, _audioProcessing);
-        _vendorDspControl = VendorDspControlSession.Create(options, _audioProcessing);
         _echoSuppressor = new VoiceAcousticEchoSuppressor(options, _audioProcessing);
         _preRollByteLimit = BytesForMilliseconds(Math.Max(0, options.SpeechRecognitionPreRollMilliseconds), options.SpeechRecognitionSampleRateHz);
         _minimumUtteranceBytes = BytesForMilliseconds(Math.Max(0, options.SpeechRecognitionMinimumUtteranceMilliseconds), options.SpeechRecognitionSampleRateHz);
@@ -63,7 +83,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             IsListening: false,
             IsArmed: false,
             StatusText: BuildIdleStatusText());
-        CurrentSignal = new VoiceSignalSnapshot(0, 0, false, false, false, DateTimeOffset.UtcNow);
+        CurrentSignal = new VoiceSignalSnapshot(0, 0, false, false, DateTimeOffset.UtcNow);
     }
 
     public event EventHandler<VoiceStatusChangedEventArgs>? StatusChanged;
@@ -72,19 +92,20 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
 
     public event EventHandler<VoiceCommandRecognizedEventArgs>? CommandRecognized;
 
-    public event EventHandler<VoiceActivationRequestedEventArgs>? ActivationRequested;
-
     public event EventHandler<VoiceBargeInEventArgs>? BargeInRequested;
 
     public VoiceStatusSnapshot CurrentStatus { get; private set; }
 
     public VoiceSignalSnapshot CurrentSignal { get; private set; }
 
+    // Forwarded to the echo suppressor; it needs to know when Jarvis is talking.
     public void SetPlaybackState(bool isSpeaking)
     {
         _echoSuppressor.SetPlaybackState(isSpeaking);
     }
 
+    // Checks settings and builds the runtime; returns false with a plain-language reason when it cannot run
+    // (no model set, bad URL, remote endpoint blocked by local-only mode, or a missing API key for a non-local server).
     public static bool TryCreate(JarvisOptions options, out IVoiceRuntime? runtime, out string status)
     {
         runtime = null;
@@ -101,12 +122,14 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return false;
         }
 
+        // Local-only mode refuses to send voice to anything but a loopback (this computer) address.
         if (options.LocalAiOnly && !LocalAiPolicy.IsLoopbackHttpEndpoint(options.SpeechRecognitionBaseUrl))
         {
             status = "Local-only AI mode blocked remote transcription. Configure a local speech endpoint or Windows speech.";
             return false;
         }
 
+        // Local servers do not need an API key; remote ones do.
         var apiKey = ResolveApiKey(options);
 
         if (string.IsNullOrWhiteSpace(apiKey)
@@ -131,7 +154,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return true;
     }
 
-    public async Task StartAsync(CancellationToken cancellationToken)
+    // Starts recording from the microphone. Failures are reported as status text rather than thrown.
+    public Task StartAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -140,18 +164,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             if (_isListening)
             {
                 PublishStatus(_isArmed, CurrentStatus.StatusText);
-                return;
-            }
-        }
-
-        _vendorDspWarning = await EnsureVendorDspAppliedAsync(cancellationToken).ConfigureAwait(false);
-
-        lock (_sync)
-        {
-            if (_isListening)
-            {
-                PublishStatus(_isArmed, CurrentStatus.StatusText);
-                return;
+                return Task.CompletedTask;
             }
 
             try
@@ -163,7 +176,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
                 _capture.StartRecording();
 
                 _isListening = true;
-                PublishSignal(0, 0, false, false);
+                PublishSignal(0, 0, false);
                 PublishStatus(
                     isArmed: false,
                     statusText: BuildIdleStatusText());
@@ -179,13 +192,11 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             }
         }
 
-        if (!CurrentStatus.IsAvailable)
-        {
-            await ReleaseVendorDspAsync().ConfigureAwait(false);
-        }
+        return Task.CompletedTask;
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    // Stops recording and discards any half-finished audio.
+    public Task StopAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -193,7 +204,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         {
             if (!_isListening)
             {
-                return;
+                return Task.CompletedTask;
             }
 
             _isListening = false;
@@ -204,19 +215,20 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             _lifetimeCts?.Cancel();
             _lifetimeCts?.Dispose();
             _lifetimeCts = null;
-            PublishSignal(0, 0, false, false);
+            PublishSignal(0, 0, false);
             PublishStatus(isArmed: false, statusText: "Microphone listening paused.");
         }
 
-        _vendorDspWarning = string.Empty;
-        await ReleaseVendorDspAsync().ConfigureAwait(false);
+        return Task.CompletedTask;
     }
 
+    // Stops the runtime and releases the transcription lock and wake word detector.
     public void Dispose()
     {
         try
         {
-            StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+            // Off the UI thread and bounded, so a capture that won't stop can't hang shutdown.
+            Task.Run(() => StopAsync(CancellationToken.None)).Wait(TimeSpan.FromSeconds(5));
         }
         catch
         {
@@ -226,6 +238,9 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         _wakeWordDetector?.Dispose();
     }
 
+    // Called by NAudio for every small chunk of microphone audio. Per chunk: measure loudness, ask the echo suppressor if this is
+    // Jarvis's own voice, apply gain, decide speech or silence, grow or finish the current utterance, and hand finished utterances
+    // to a background task so this audio thread never blocks.
     private void OnDataAvailable(object? sender, WaveInEventArgs eventArgs)
     {
         if (eventArgs.BytesRecorded <= 0)
@@ -233,16 +248,17 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return;
         }
 
+        // Copy the chunk; NAudio reuses its buffer for the next callback.
         var chunk = new byte[eventArgs.BytesRecorded];
         Buffer.BlockCopy(eventArgs.Buffer, 0, chunk, 0, eventArgs.BytesRecorded);
 
+        // Measure the raw level before any gain, so the echo check sees the real input.
         byte[]? utterance = null;
         var originalLevel = CalculateRootMeanSquareLevel(chunk);
         var originalPeak = CalculatePeakLevel(chunk);
         double level = 0;
         double peakLevel = 0;
         bool detectedSpeech = false;
-        bool clapDetected = false;
         bool wakeWindowOpen = false;
         bool isCapturingSpeech;
 
@@ -257,6 +273,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             isCapturingSpeech = _activeSpeechBuffer is not null;
         }
 
+        // Ask the echo suppressor whether this chunk should be ignored as Jarvis's own voice, or counts as the user interrupting.
         var echoControl = _echoSuppressor.Process(originalLevel, originalPeak, isCapturingSpeech, DateTimeOffset.UtcNow);
 
         if (echoControl.ShouldRequestBargeIn)
@@ -264,6 +281,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             BargeInRequested?.Invoke(this, new VoiceBargeInEventArgs("speech-over-playback"));
         }
 
+        // Echo: pretend it is silence. An utterance already in progress is still closed after the usual quiet period.
         if (echoControl.ShouldSuppress)
         {
             if (isCapturingSpeech)
@@ -278,7 +296,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
                 }
             }
 
-            PublishSignal(0, 0, false, false, wakeWindowOpen);
+            PublishSignal(0, 0, false, wakeWindowOpen);
 
             if (utterance is not null)
             {
@@ -295,6 +313,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
                 return;
             }
 
+            // Boost quiet microphones up to a target volume (modifies the chunk in place), then store the chunk in the pre-roll history.
             ApplyInputGain(chunk, originalLevel, originalPeak);
 
             AppendToPreRoll(chunk);
@@ -304,13 +323,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             detectedSpeech = IsSpeechChunk(level, peakLevel);
             wakeWindowOpen = _isArmed;
 
-            if (_clapDetector is not null
-                && _clapDetector.ProcessSample(peakLevel, DateTimeOffset.UtcNow))
-            {
-                clapDetected = true;
-                ActivationRequested?.Invoke(this, new VoiceActivationRequestedEventArgs("double-clap"));
-            }
-
+            // Speech: remember the time. When a new utterance starts, begin it with the pre-roll audio so the first word is not lost.
             if (detectedSpeech)
             {
                 _lastVoiceDetectedUtc = DateTimeOffset.UtcNow;
@@ -333,6 +346,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
                     utterance = FinalizeSpeechBuffer();
                 }
             }
+            // Silence after speech: keep the quiet audio (natural pauses) and finish the utterance once the silence lasts long enough
+            // (850 ms by default).
             else if (_activeSpeechBuffer is not null)
             {
                 _activeSpeechBuffer.Write(chunk, 0, chunk.Length);
@@ -346,7 +361,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             }
         }
 
-        PublishSignal(level, peakLevel, detectedSpeech, clapDetected, wakeWindowOpen);
+        PublishSignal(level, peakLevel, detectedSpeech, wakeWindowOpen);
 
         if (utterance is not null)
         {
@@ -354,6 +369,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // The microphone stopped by itself (e.g. device unplugged); reset everything and tell the UI.
     private void OnRecordingStopped(object? sender, StoppedEventArgs eventArgs)
     {
         lock (_sync)
@@ -372,17 +388,15 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             _lifetimeCts = null;
         }
 
-        _vendorDspWarning = string.Empty;
-        _ = ReleaseVendorDspAsync();
-
         var statusText = eventArgs.Exception is null
             ? "Rolling speech recognition stopped."
             : $"Rolling speech recognition stopped: {TrimStatus(eventArgs.Exception.Message)}";
 
-        PublishSignal(0, 0, false, false);
+        PublishSignal(0, 0, false);
         PublishStatus(isArmed: false, statusText: statusText, isAvailable: eventArgs.Exception is null);
     }
 
+    // Runs one utterance's transcription on a background thread and always decrements the pending counter afterward.
     private async Task ProcessUtteranceAsync(byte[] utteranceBytes)
     {
         try
@@ -395,6 +409,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // Waits for its turn at the transcription lock, sends the audio to whisper, and passes the text on. Errors become status text.
     private async Task TranscribeUtteranceAsync(byte[] utteranceBytes)
     {
         var lifetimeToken = _lifetimeCts?.Token ?? CancellationToken.None;
@@ -411,14 +426,14 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         try
         {
             var transcript = await _client.TranscribeAsync(utteranceBytes, _options.SpeechRecognitionSampleRateHz, lifetimeToken);
-            HandleRecognizedText(transcript.Text.Trim(), transcript.Confidence);
+            HandleRecognizedText(transcript.Text.Trim(), transcript.Confidence, utteranceBytes);
         }
         catch (OperationCanceledException)
         {
         }
         catch (HttpRequestException) when (IsLocalSpeechEndpoint())
         {
-            // A refused connection to localhost means the bundled speech server is not running.
+            // A refused connection to localhost means the bundled speech server is not running; the message says where to look.
             PublishStatus(
                 isArmed: _isArmed,
                 statusText: "The local speech server is not running, so Jarvis cannot turn your voice into text. "
@@ -436,15 +451,19 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // True when the transcription URL points at this computer.
     private bool IsLocalSpeechEndpoint() =>
         Uri.TryCreate(_options.SpeechRecognitionBaseUrl, UriKind.Absolute, out var uri) && uri.IsLoopback;
 
-    private void HandleRecognizedText(string recognizedText, double? recognitionConfidence)
+    // Decides what a transcript means: a command with the wake name inline, a wake word alone (open the window), the wake
+    // engine hearing the name that whisper misheard, or a plain sentence that counts only while the window is open.
+    private void HandleRecognizedText(string recognizedText, double? recognitionConfidence, byte[]? utteranceBytes = null)
     {
+        // Clean the transcript; keep the raw version separate from one with the user's personal corrections applied.
         var rawRecognizedText = VoiceRecognitionText.NormalizeTranscript(recognizedText, _options, applyPersonalCorrections: false);
         recognizedText = VoiceRecognitionText.ApplyPersonalCorrections(rawRecognizedText, _options);
-        var minimumConfidence = GetMinimumRecognitionConfidence();
 
+        // Wake word turned off: every non-empty transcript is a command.
         if (!_options.WakeWordEnabled)
         {
             if (string.IsNullOrWhiteSpace(recognizedText))
@@ -455,11 +474,11 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             PublishRecognizedCommand(
                 JarvisCommandCatalog.NormalizeVoiceDirective(recognizedText),
                 rawRecognizedText,
-                recognitionConfidence,
-                minimumConfidence);
+                recognitionConfidence);
             return;
         }
 
+        // "Jarvis open notepad" runs "open notepad"; "Jarvis" alone just opens the listening window.
         if (!string.IsNullOrWhiteSpace(recognizedText)
             && VoiceRecognitionText.TryExtractWakeCommand(recognizedText, _options, out var inlineCommand))
         {
@@ -473,8 +492,17 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             PublishRecognizedCommand(
                 JarvisCommandCatalog.NormalizeVoiceDirective(inlineCommand),
                 rawRecognizedText,
-                recognitionConfidence,
-                minimumConfidence);
+                recognitionConfidence);
+            return;
+        }
+
+        // No name in the transcript. A manifest wake engine (openWakeWord) may still hear the name whisper misheard;
+        // it only opens the follow-up window and never runs this text. The recognizer-grammar default is never
+        // consulted here: its misfires ran room speech as commands.
+        if (utteranceBytes is not null && !_isArmed && _wakeWordDetector is { UsesExternalEngine: true }
+            && _wakeWordDetector.Detect(utteranceBytes, _options.SpeechRecognitionSampleRateHz).IsDetected)
+        {
+            ArmWakeWindow();
             return;
         }
 
@@ -500,10 +528,10 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         PublishRecognizedCommand(
             JarvisCommandCatalog.NormalizeVoiceDirective(recognizedText),
             rawRecognizedText,
-            recognitionConfidence,
-            minimumConfidence);
+            recognitionConfidence);
     }
 
+    // Opens the listening window without a wake word, e.g. after Jarvis asked a question.
     public void ListenForFollowUp()
     {
         if (_isListening)
@@ -512,6 +540,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // Opens the listening window and starts a timer to close it (VoiceCommandTimeoutSeconds, at least 2 seconds).
     private void ArmWakeWindow()
     {
         lock (_sync)
@@ -530,6 +559,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             statusText: $"Wake word detected. Listening for the next command for {_options.VoiceCommandTimeoutSeconds} seconds.");
     }
 
+    // Timer callback. Does not close the window while speech is still being recorded or transcribed, so a slow transcription does not lose the command.
     private void OnWakeWindowExpired()
     {
         lock (_sync)
@@ -554,6 +584,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         PublishStatus(isArmed: false, statusText: BuildIdleStatusText());
     }
 
+    // Closes the listening window and goes back to waiting for the wake word.
     private void ResetToIdle()
     {
         lock (_sync)
@@ -565,6 +596,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         PublishStatus(isArmed: false, statusText: BuildIdleStatusText());
     }
 
+    // Builds and broadcasts the current status, and re-sends the signal so the UI sees the listening-window flag.
     private void PublishStatus(bool isArmed, string statusText, bool? isAvailable = null)
     {
         var snapshot = new VoiceStatusSnapshot(
@@ -579,10 +611,10 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             CurrentSignal.RmsLevel,
             CurrentSignal.PeakLevel,
             CurrentSignal.IsSpeechDetected,
-            false,
             isArmed);
     }
 
+    // Plain-language status line describing what is being listened for and with which microphone/tuning.
     private string BuildIdleStatusText()
     {
         var providerLabel = $"rolling transcription fallback ({_options.SpeechRecognitionModel})";
@@ -591,22 +623,23 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             : $"microphone \"{_options.SpeechRecognitionDeviceName}\"";
         var modeLabel = _options.SpeechRecognitionMode?.Trim() ?? "half-duplex";
         var tuningLabel = _audioProcessing.BuildStatusLabel();
-        var vendorWarning = string.IsNullOrWhiteSpace(_vendorDspWarning)
-            ? string.Empty
-            : $" Vendor DSP fallback: {TrimStatus(_vendorDspWarning)}";
 
         if (_options.SpeechRecognitionPushToTalkEnabled)
         {
-            return $"Push-to-talk ready with {providerLabel} on {deviceLabel} ({modeLabel}).{vendorWarning}";
+            return $"Push-to-talk ready with {providerLabel} on {deviceLabel} ({modeLabel}).";
         }
 
         return _options.WakeWordEnabled
             ? _wakeWordDetector is null
-                ? $"Listening for \"{_options.WakePhrase}\" with {providerLabel} on {deviceLabel} ({modeLabel}, {tuningLabel}).{vendorWarning}"
-                : $"Listening for \"{_options.WakePhrase}\" with {_wakeWordDetector.DescriptionLabel} and {providerLabel} on {deviceLabel} ({modeLabel}, {tuningLabel}).{vendorWarning}"
-            : $"Listening for voice directives with {providerLabel} on {deviceLabel} ({modeLabel}, {tuningLabel}).{vendorWarning}";
+                ? $"Listening for \"{_options.WakePhrase}\" with {providerLabel} on {deviceLabel} ({modeLabel}, {tuningLabel})."
+                : $"Listening for \"{_options.WakePhrase}\" with {_wakeWordDetector.DescriptionLabel} and {providerLabel} on {deviceLabel} ({modeLabel}, {tuningLabel})."
+            : $"Listening for voice directives with {providerLabel} on {deviceLabel} ({modeLabel}, {tuningLabel}).";
     }
 
+    // Decides whether this chunk is speech. Two thresholds with hysteresis (hard to start, easier to continue, so natural
+    // dips between words do not end the sentence). Both follow the measured noise floor: about 2.65x the floor to start
+    // speaking, about 1.95x to keep going, clamped around the configured voice-activity threshold. The level used is the
+    // larger of RMS and 42% of the peak, so short sharp sounds count. Quiet chunks update the noise floor estimate.
     private bool IsSpeechChunk(double level, double peakLevel)
     {
         var configuredThreshold = Math.Max(0.0035, _audioProcessing.VoiceActivityThreshold);
@@ -622,6 +655,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return false;
         }
 
+        // Starting speech nudges the noise floor down slightly (x0.94, minimum 0.0022) so one loud burst cannot raise it for good.
         if (!isContinuingSpeech)
         {
             _noiseFloor = Math.Max(0.0022, _noiseFloor * 0.94);
@@ -630,12 +664,14 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return true;
     }
 
+    // Slow moving average of background noise: 92% old value, 8% new level (the level is limited to 0.0005..0.10 so a clap or dead silence does not skew it).
     private void UpdateNoiseFloor(double level)
     {
         var sample = Math.Clamp(level, 0.0005, 0.10);
         _noiseFloor = (_noiseFloor * 0.92) + (sample * 0.08);
     }
 
+    // Keeps the last few hundred milliseconds of audio in a queue, dropping the oldest chunks past the size limit.
     private void AppendToPreRoll(byte[] chunk)
     {
         if (_preRollByteLimit <= 0)
@@ -652,6 +688,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // Closes the current utterance and returns its bytes, or null if it is shorter than the minimum (a click or cough).
     private byte[]? FinalizeSpeechBuffer()
     {
         if (_activeSpeechBuffer is null)
@@ -673,12 +710,14 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return utterance;
     }
 
+    // Stops and forgets the listening-window timer.
     private void ClearWakeWindow()
     {
         _wakeWindowTimer?.Dispose();
         _wakeWindowTimer = null;
     }
 
+    // Throws away the current utterance and pre-roll audio.
     private void ClearSpeechBuffers()
     {
         _activeSpeechBuffer?.Dispose();
@@ -687,6 +726,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         _preRollBytes = 0;
     }
 
+    // Opens the microphone for 16-bit mono recording at the configured sample rate; uses the configured device if found.
     private WaveInEvent BuildWaveIn()
     {
         var waveIn = new WaveInEvent
@@ -705,6 +745,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return waveIn;
     }
 
+    // Automatic gain: scales samples so the peak reaches TargetPeakLevel, never above InputGainCap and never below x1.
+    // Near-silence gets no gain, so room hiss is not boosted. The gain is smoothed (76% old, 24% new) to avoid sudden jumps.
     private void ApplyInputGain(byte[] pcm16MonoChunk, double rmsLevel, double peakLevel)
     {
         if (pcm16MonoChunk.Length < 2)
@@ -730,6 +772,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             return;
         }
 
+        // Multiply each 16-bit sample and clamp so it cannot wrap around (distortion).
         for (var index = 0; index < pcm16MonoChunk.Length - 1; index += 2)
         {
             var sample = BitConverter.ToInt16(pcm16MonoChunk, index);
@@ -742,6 +785,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // Stops and releases the microphone recording.
     private void DisposeCapture()
     {
         if (_capture is null)
@@ -765,11 +809,11 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         }
     }
 
+    // Broadcasts a new level reading to the UI meter, limited to 0..1.
     private void PublishSignal(
         double rmsLevel,
         double peakLevel,
         bool isSpeechDetected,
-        bool isClapDetected,
         bool? isWakeWindowOpen = null)
     {
         CurrentSignal = new VoiceSignalSnapshot(
@@ -777,35 +821,8 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             Math.Clamp(peakLevel, 0, 1),
             isSpeechDetected,
             isWakeWindowOpen ?? _isArmed,
-            isClapDetected,
             DateTimeOffset.UtcNow);
         SignalLevelChanged?.Invoke(this, new VoiceSignalChangedEventArgs(CurrentSignal));
-    }
-
-    private async Task<string> EnsureVendorDspAppliedAsync(CancellationToken cancellationToken)
-    {
-        if (_vendorDspControl is null)
-        {
-            return string.Empty;
-        }
-
-        return await _vendorDspControl.EnsureAppliedAsync(cancellationToken).ConfigureAwait(false) ?? string.Empty;
-    }
-
-    private async Task ReleaseVendorDspAsync()
-    {
-        if (_vendorDspControl is null)
-        {
-            return;
-        }
-
-        try
-        {
-            await _vendorDspControl.ReleaseAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch
-        {
-        }
     }
 
     internal static string ResolveApiKey(JarvisOptions options) =>
@@ -814,12 +831,15 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
             options.SpeechRecognitionApiKeyCredentialTarget,
             options.SpeechRecognitionApiKeyEnvironmentVariable);
 
+    // Milliseconds to byte count: samples = rate x seconds, and each 16-bit sample is 2 bytes.
     private static int BytesForMilliseconds(int milliseconds, int sampleRateHz)
     {
         var samples = (int)Math.Ceiling(sampleRateHz * (milliseconds / 1000d));
         return Math.Max(0, samples * 2);
     }
 
+    // RMS (root mean square): square every sample, average, take the square root. It is the "average loudness" of the chunk,
+    // from 0 (silence) to 1 (full scale). 0.008 is about -42 dB relative to full scale.
     private static double CalculateRootMeanSquareLevel(byte[] pcm16MonoChunk)
     {
         if (pcm16MonoChunk.Length < 2)
@@ -840,6 +860,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return Math.Sqrt(sumSquares / sampleCount);
     }
 
+    // Peak: the single loudest sample in the chunk, 0..1.
     private static double CalculatePeakLevel(byte[] pcm16MonoChunk)
     {
         if (pcm16MonoChunk.Length < 2)
@@ -864,6 +885,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return peak;
     }
 
+    // Shortens long error text for the status bar.
     private static string TrimStatus(string message)
     {
         const int maxLength = 220;
@@ -871,17 +893,19 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
-    private double GetMinimumRecognitionConfidence() =>
-        Math.Max(0.35, _options.SpeechRecognitionConfidenceThreshold - 0.20);
+    // Whisper scores short commands low even when right (measured on small.en: correct 0.52-0.80, misheard
+    // 0.42-0.55), so the shared 0.70 cutoff would ask on most commands. Text is never dropped here, only asked about.
+    internal const double ClarifyBelowConfidence = 0.50;
 
-    private void PublishRecognizedCommand(string text, string rawText, double? confidence, double minimumConfidence)
+    // Raises CommandRecognized; confidence under ClarifyBelowConfidence makes the app ask the user to confirm first.
+    private void PublishRecognizedCommand(string text, string rawText, double? confidence)
     {
-        if (string.IsNullOrWhiteSpace(text) || VoiceRecognitionConfidence.ShouldIgnore(confidence, minimumConfidence))
+        if (string.IsNullOrWhiteSpace(text))
         {
             return;
         }
 
-        var requiresClarification = VoiceRecognitionConfidence.ShouldClarify(_options, confidence, minimumConfidence);
+        var requiresClarification = confidence < ClarifyBelowConfidence;
         var prompt = requiresClarification
             ? VoiceRecognitionConfidence.BuildClarificationPrompt(rawText, confidence)
             : string.Empty;
@@ -892,6 +916,7 @@ internal sealed class OpenAiCompatibleVoiceRuntime : IVoiceRuntime
     }
 }
 
+// Sends audio to a Whisper-style /audio/transcriptions endpoint and parses the JSON reply.
 internal sealed class OpenAiCompatibleTranscriptionClient
 {
     private readonly HttpClient _httpClient;
@@ -917,12 +942,29 @@ internal sealed class OpenAiCompatibleTranscriptionClient
         _httpClient = LocalAiPolicy.CreateHttpClient(localAiOnly, TimeSpan.FromSeconds(45));
     }
 
+    // Plain text plus confidence for one utterance.
     public async Task<VoiceTranscriptResult> TranscribeAsync(byte[] pcm16MonoAudio, int sampleRateHz, CancellationToken cancellationToken)
     {
-        var body = await SendAsync(pcm16MonoAudio, sampleRateHz, "text", cancellationToken);
-        return new VoiceTranscriptResult(body.Trim());
+        var body = await SendAsync(pcm16MonoAudio, sampleRateHz, "verbose_json", cancellationToken);
+        return ParseTranscript(body);
     }
 
+    /// <summary>Text plus a confidence from the segments' avg_logprob; confidence stays null when a server omits it.</summary>
+    internal static VoiceTranscriptResult ParseTranscript(string verboseJson)
+    {
+        using var json = JsonDocument.Parse(verboseJson);
+        var text = json.RootElement.GetProperty("text").GetString()?.Trim() ?? string.Empty;
+        var logProbabilities = json.RootElement.TryGetProperty("segments", out var segments)
+            ? segments.EnumerateArray()
+                .Where(segment => segment.TryGetProperty("avg_logprob", out var value) && value.ValueKind == JsonValueKind.Number)
+                .Select(segment => segment.GetProperty("avg_logprob").GetDouble())
+                .ToArray()
+            : Array.Empty<double>();
+
+        return new VoiceTranscriptResult(text, VoiceRecognitionConfidence.FromLogProbabilities(logProbabilities));
+    }
+
+    // Returns every segment with its start time; used for longer recordings such as lectures.
     /// <summary>The transcript as timed lines, each at its offset into the audio.</summary>
     public async Task<IReadOnlyList<TranscriptLine>> TranscribeLinesAsync(byte[] pcm16MonoAudio, int sampleRateHz, CancellationToken cancellationToken)
     {
@@ -936,6 +978,7 @@ internal sealed class OpenAiCompatibleTranscriptionClient
             .ToList();
     }
 
+    // Builds the multipart form (WAV file, model, language, optional vocabulary prompt) and POSTs it; non-200 replies become errors.
     private async Task<string> SendAsync(byte[] pcm16MonoAudio, int sampleRateHz, string responseFormat, CancellationToken cancellationToken)
     {
         using var form = new MultipartFormDataContent();
@@ -980,6 +1023,7 @@ internal sealed class OpenAiCompatibleTranscriptionClient
         return body;
     }
 
+    // Accepts either a base URL or a full endpoint URL.
     private static string BuildEndpoint(string baseUrl)
     {
         var trimmed = baseUrl.Trim().TrimEnd('/');
@@ -992,6 +1036,7 @@ internal sealed class OpenAiCompatibleTranscriptionClient
         return $"{trimmed}/audio/transcriptions";
     }
 
+    // Shortens error bodies to 500 characters.
     private static string TrimForError(string text)
     {
         const int maxLength = 500;
@@ -1000,6 +1045,7 @@ internal sealed class OpenAiCompatibleTranscriptionClient
     }
 }
 
+// Writes the 44-byte WAV header in front of raw 16-bit mono audio, because the server expects a WAV file, not raw samples.
 internal static class Pcm16WavWriter
 {
     public static byte[] WrapPcm16Mono(byte[] pcm16MonoAudio, int sampleRateHz)
@@ -1012,6 +1058,7 @@ internal static class Pcm16WavWriter
         var byteRate = sampleRateHz * channels * bitsPerSample / 8;
         var blockAlign = (short)(channels * bitsPerSample / 8);
 
+        // Standard WAV layout: RIFF header, "fmt " format block (PCM, 1 channel, sample rate, bytes per second, 16 bits), then the "data" block.
         writer.Write(Encoding.ASCII.GetBytes("RIFF"));
         writer.Write(36 + pcm16MonoAudio.Length);
         writer.Write(Encoding.ASCII.GetBytes("WAVE"));

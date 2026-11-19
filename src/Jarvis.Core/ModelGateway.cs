@@ -1,4 +1,13 @@
-using System.Collections.Concurrent;
+// ModelGateway.cs: how Jarvis talks to its language model. Every "ask the AI" call in the app (the planner,
+// vision, notes, the Brain tool) goes through IModelGateway.CompleteAsync, which turns a request into an
+// OpenAI-style HTTP call: POST {PlannerBaseUrl}/v1/chat/completions. In practice that server is LM Studio on
+// this PC (a localhost URL), but any OpenAI-compatible server works. The URL, model names and API key come from
+// JarvisOptions (the Planner* settings in jarvis.settings.json).
+// Model routes: the caller picks a ModelRoute (Fast, Reasoning, Vision or Deep). Each route maps to a configured
+// model name, with a fallback chain (see GetRouteModels) so a missing model falls back to another one.
+// Queueing: ModelGatewayFactory.Create wraps the real gateway in ScheduledModelGateway (ModelWorkScheduler.cs),
+// so only a few model calls run at once and foreground (user-facing) work goes ahead of background work.
+// If the planner is disabled or no allowed provider exists, DisabledModelGateway is returned instead.
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -6,13 +15,18 @@ using System.Text.Json;
 
 namespace Jarvis.Core;
 
+// Which kind of model a call wants; the gateway maps each to a model name from the settings:
+// Fast = quick small model for short replies, Reasoning = the main model, Vision = reads images, Deep = slow off-turn thinking.
 public enum ModelRoute
 {
     Fast,
     Reasoning,
-    Vision
+    Vision,
+    /// <summary>Slow, off-turn thinking (brain think): a bigger local model when one is configured, else the reasoning model.</summary>
+    Deep
 }
 
+// One piece of a chat message: either plain text (Type "text") or an image given by URL/data URL (Type "image_url").
 public sealed record ChatMessageContentPart(string Type, string Text = "", string Url = "")
 {
     public static ChatMessageContentPart FromText(string text) => new("text", text ?? string.Empty);
@@ -20,21 +34,25 @@ public sealed record ChatMessageContentPart(string Type, string Text = "", strin
     public static ChatMessageContentPart FromImageUrl(string url) => new("image_url", string.Empty, url ?? string.Empty);
 }
 
+// One message in the conversation. Role is "system", "user", "assistant" or "tool". ToolCallId links a "tool"
+// message back to the tool call it answers; ToolCalls holds tool calls the assistant itself asked for.
 public sealed record ChatMessage(
     string Role,
     ChatMessageContentPart[] Content,
     string ToolCallId = "",
     ChatToolCall[]? ToolCalls = null);
 
+// A tool the model may call. Every tool takes a single free-text "input" argument (see SerializeTool).
 public sealed record ChatToolDefinition(
     string Name,
     string Description,
-    string InputDescription = "Optional tool input.",
-    string PurposeDescription = "Why this tool is being used for the current step.",
-    string ExpectedEvidenceDescription = "What concrete result should confirm this tool call succeeded.");
+    string InputDescription = "Optional tool input.");
 
+// A tool call the model asked for: an id, the tool name, and the arguments as a raw JSON string.
 public sealed record ChatToolCall(string Id, string Name, string ArgumentsJson);
 
+// Everything needed for one model call. ModelOverride forces a specific model name instead of the route's default;
+// User is an optional label sent along as the OpenAI "user" field.
 public sealed record ChatCompletionRequest(
     ChatMessage[] Messages,
     ChatToolDefinition[]? Tools = null,
@@ -42,12 +60,15 @@ public sealed record ChatCompletionRequest(
     string ModelOverride = "",
     string User = "");
 
+// The model's answer: reply text, any tool calls, which model name answered, and a "profile/provider" label.
 public sealed record ChatCompletionResponse(
     string Content,
     ChatToolCall[] ToolCalls,
     string Model,
     string ProviderLabel);
 
+// The one door to the language model. Implementations: OpenAiCompatibleModelGateway (real HTTP calls),
+// DisabledModelGateway (always unavailable) and ScheduledModelGateway (adds the queue around another gateway).
 public interface IModelGateway
 {
     bool IsAvailable { get; }
@@ -60,6 +81,7 @@ public interface IModelGateway
         CancellationToken cancellationToken);
 }
 
+// Builds the right gateway from the settings. The app calls this at startup and again when settings change.
 public static class ModelGatewayFactory
 {
     public static IModelGateway Create(string workspaceRoot, JarvisOptions options)
@@ -71,10 +93,11 @@ public static class ModelGatewayFactory
 
         var profiles = BuildProfiles(options);
 
+        // Local-only AI mode: drop any provider that is not a loopback (same-computer) server.
         profiles.RemoveAll(profile => !LocalAiPolicy.AllowsModelProvider(options, profile.Provider, profile.BaseUrl));
 
         if (options.LocalAiOnly && profiles.Count == 0)
-            return new DisabledModelGateway("local-only AI mode requires a local provider on this computer; hosted and OpenClaw routes are blocked");
+            return new DisabledModelGateway("local-only AI mode requires a local provider on this computer; hosted routes are blocked");
 
         if (profiles.Count == 0)
         {
@@ -83,13 +106,16 @@ public static class ModelGatewayFactory
 
         // One inference budget per process: the app rebuilds the gateway on settings changes while earlier requests
         // may still run. ponytail: capacity is fixed at first use, so changing ModelMaxConcurrentRequests takes effect on restart.
+        // Capacity is how many model calls may run at the same moment (1 to 4). The scheduler is shared across rebuilds.
         var capacity = Math.Clamp(options.ModelMaxConcurrentRequests, 1, 4);
         var scheduler = LazyInitializer.EnsureInitialized(ref _sharedScheduler, () => new ModelWorkScheduler(capacity));
         return new ScheduledModelGateway(new OpenAiCompatibleModelGateway(workspaceRoot, options, profiles), capacity, scheduler);
     }
 
+    // The single queue shared by every gateway built in this process.
     private static ModelWorkScheduler? _sharedScheduler;
 
+    // Collects the usable providers. Today there is only one, the "primary" profile built from the Planner* settings.
     private static List<ResolvedProviderProfile> BuildProfiles(JarvisOptions options)
     {
         var profiles = new List<ResolvedProviderProfile>();
@@ -101,25 +127,15 @@ public static class ModelGatewayFactory
             profiles.Add(primary);
         }
 
-        foreach (var fallback in options.PlannerFallbackProviders)
-        {
-            var resolved = BuildResolvedProfile(fallback);
-
-            if (resolved is not null)
-            {
-                profiles.Add(resolved);
-            }
-        }
-
         return profiles;
     }
 
+    // Turns the Planner* settings into one provider profile; returns null when no base URL is set.
     private static ResolvedProviderProfile? BuildPrimaryProfile(JarvisOptions options)
     {
         var provider = NormalizeProvider(options.PlannerProvider);
 
-        if (!AllowsEmptyBaseUrl(provider)
-            && string.IsNullOrWhiteSpace(options.PlannerBaseUrl))
+        if (string.IsNullOrWhiteSpace(options.PlannerBaseUrl))
         {
             return null;
         }
@@ -129,6 +145,7 @@ public static class ModelGatewayFactory
             options.PlannerModel,
             options.PlannerReasoningModel);
 
+        // If no separate reasoning model is configured, the general model is used for reasoning too.
         var reasoningModel = string.IsNullOrWhiteSpace(options.PlannerReasoningModel)
             ? requestModel
             : options.PlannerReasoningModel.Trim();
@@ -141,58 +158,18 @@ public static class ModelGatewayFactory
             options.PlannerFastModel.Trim(),
             reasoningModel,
             options.PlannerVisionModel.Trim(),
-            options.PlannerFastReasoningEffort.Trim(),
-            options.PlannerReasoningEffort.Trim(),
-            options.PlannerVisionReasoningEffort.Trim(),
+            options.PlannerDeepModel.Trim(),
             ResolveApiKey(
                 options.PlannerApiKey,
                 options.PlannerApiKeyCredentialTarget,
-                options.PlannerApiKeyEnvironmentVariable),
-            options.PlannerFallbackModels
-                .Where(model => !string.IsNullOrWhiteSpace(model))
-                .Select(model => model.Trim())
-                .ToArray());
+                options.PlannerApiKeyEnvironmentVariable));
     }
 
-    private static ResolvedProviderProfile? BuildResolvedProfile(PlannerProviderProfile profile)
-    {
-        var provider = NormalizeProvider(profile.Provider);
-
-        if (!AllowsEmptyBaseUrl(provider)
-            && string.IsNullOrWhiteSpace(profile.BaseUrl))
-        {
-            return null;
-        }
-
-        var requestModel = ResolveRequestModel(
-            provider,
-            profile.Model,
-            profile.ReasoningModel);
-
-        return new ResolvedProviderProfile(
-            string.IsNullOrWhiteSpace(profile.Name) ? "fallback" : profile.Name.Trim(),
-            provider,
-            profile.BaseUrl.Trim(),
-            requestModel,
-            profile.FastModel.Trim(),
-            profile.ReasoningModel.Trim(),
-            profile.VisionModel.Trim(),
-            profile.FastReasoningEffort.Trim(),
-            profile.ReasoningEffort.Trim(),
-            profile.VisionReasoningEffort.Trim(),
-            ResolveApiKey(
-                profile.ApiKey,
-                profile.ApiKeyCredentialTarget,
-                profile.ApiKeyEnvironmentVariable),
-            profile.FallbackModels
-                .Where(model => !string.IsNullOrWhiteSpace(model))
-                .Select(model => model.Trim())
-                .ToArray());
-    }
-
+    // Finds the API key from the settings value, Windows Credential Manager, or an environment variable (see ApiKeyResolver).
     private static string ResolveApiKey(string directValue, string credentialTarget, string envVar) =>
         ApiKeyResolver.Resolve(directValue, credentialTarget, envVar);
 
+    // Maps the free-text provider setting to "openai", "local" or the default "openai-compatible".
     private static string NormalizeProvider(string? provider)
     {
         if (string.IsNullOrWhiteSpace(provider))
@@ -205,43 +182,16 @@ public static class ModelGatewayFactory
         {
             "openai" => "openai",
             "local" => "local",
-            "openclaw" => "openclaw",
-            "openclaw-local" => "openclaw-local",
             _ => "openai-compatible"
         };
     }
 
+    // Picks the general model name: PlannerModel if set, otherwise the reasoning model, otherwise empty.
     private static string ResolveRequestModel(
         string provider,
         string configuredModel,
         string reasoningModel)
     {
-        if (string.Equals(provider, "openclaw-local", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!string.IsNullOrWhiteSpace(configuredModel))
-            {
-                return configuredModel.Trim();
-            }
-
-            return string.IsNullOrWhiteSpace(reasoningModel)
-                ? string.Empty
-                : reasoningModel.Trim();
-        }
-
-        if (string.Equals(provider, "openclaw", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!string.IsNullOrWhiteSpace(configuredModel))
-            {
-                var trimmedConfiguredModel = configuredModel.Trim();
-
-                if (LooksLikeOpenClawAgentTarget(trimmedConfiguredModel))
-                {
-                    return trimmedConfiguredModel;
-                }
-            }
-
-            return "openclaw/default";
-        }
 
         if (!string.IsNullOrWhiteSpace(configuredModel))
         {
@@ -252,19 +202,9 @@ public static class ModelGatewayFactory
             ? string.Empty
             : reasoningModel.Trim();
     }
-
-    private static bool LooksLikeOpenClawAgentTarget(string model)
-    {
-        return model.StartsWith("openclaw/", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(model, "openclaw", StringComparison.OrdinalIgnoreCase)
-            || model.StartsWith("openclaw:", StringComparison.OrdinalIgnoreCase)
-            || model.StartsWith("agent:", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool AllowsEmptyBaseUrl(string provider) =>
-        string.Equals(provider, "openclaw-local", StringComparison.OrdinalIgnoreCase);
 }
 
+// Stand-in used when AI is switched off or nothing usable is configured. Status explains why; any call throws.
 internal sealed class DisabledModelGateway : IModelGateway
 {
     public DisabledModelGateway(string reason)
@@ -285,8 +225,10 @@ internal sealed class DisabledModelGateway : IModelGateway
     }
 }
 
+// The real gateway: sends chat requests to an OpenAI-style /chat/completions endpoint and parses the reply.
 internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 {
+    // Web defaults give camelCase names; case-insensitive reading tolerates servers that differ.
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
@@ -296,59 +238,54 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
     private readonly JarvisOptions _options;
     private readonly IReadOnlyList<ResolvedProviderProfile> _profiles;
     private readonly HttpClient _httpClient;
-    private readonly ConcurrentDictionary<string, ResponsesConversationState> _responsesSessions = new(StringComparer.Ordinal);
 
     public OpenAiCompatibleModelGateway(string workspaceRoot, JarvisOptions options, IReadOnlyList<ResolvedProviderProfile> profiles)
     {
         _workspaceRoot = workspaceRoot;
         _options = options;
         _profiles = profiles;
-        _httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, TimeSpan.FromSeconds(45));
+        // Timeouts are per request (see SendHttpAsync): a deep pass may legitimately run for minutes.
+        _httpClient = LocalAiPolicy.CreateHttpClient(options.LocalAiOnly, Timeout.InfiniteTimeSpan);
     }
+
+    // How long to wait for a normal answer before giving up.
+    private static readonly TimeSpan DefaultModelTimeout = TimeSpan.FromSeconds(45);
+    // A CPU-bound deep model produces ~9 tokens/s here and the first call also waits for LM Studio to load it.
+    private static readonly TimeSpan DeepModelTimeout = TimeSpan.FromMinutes(5);
+
+    // Deep gets the long timeout; every other route gets the normal one.
+    private static TimeSpan ModelTimeout(ModelRoute route) => route == ModelRoute.Deep ? DeepModelTimeout : DefaultModelTimeout;
 
     public bool IsAvailable => _profiles.Count > 0;
 
+    // A one-line description of the configured providers and their fast/reasoning models, shown in the UI.
     public string Status =>
         string.Join(
             " | ",
             _profiles.Select(profile =>
             {
-                if (IsOpenClawLocal(profile))
-                {
-                    var defaultModel = string.IsNullOrWhiteSpace(ResolveRequestModel(profile))
-                        ? "config-default"
-                        : ResolveRequestModel(profile);
-                    var localFastModel = string.IsNullOrWhiteSpace(profile.FastModel) ? defaultModel : profile.FastModel;
-                    var localReasoningModel = string.IsNullOrWhiteSpace(profile.ReasoningModel) ? defaultModel : profile.ReasoningModel;
-                    return $"{profile.Name}:{profile.Provider} default={defaultModel} fast={localFastModel} reasoning={localReasoningModel}";
-                }
-
-                if (IsOpenClaw(profile))
-                {
-                    var agent = ResolveRequestModel(profile);
-                    var openClawFastModel = string.IsNullOrWhiteSpace(profile.FastModel) ? "agent-default" : profile.FastModel;
-                    var openClawReasoningModel = string.IsNullOrWhiteSpace(profile.ReasoningModel) ? "agent-default" : profile.ReasoningModel;
-                    return $"{profile.Name}:{profile.Provider} agent={agent} fast={openClawFastModel} reasoning={openClawReasoningModel}";
-                }
-
                 var fastModel = string.IsNullOrWhiteSpace(profile.FastModel) ? "n/a" : profile.FastModel;
                 var reasoningModel = string.IsNullOrWhiteSpace(profile.ReasoningModel) ? "n/a" : profile.ReasoningModel;
                 return $"{profile.Name}:{profile.Provider} fast={fastModel} reasoning={reasoningModel}";
             }));
 
-    // HttpClient.Timeout throws TaskCanceledException; report it as a failure so callers do not mistake it for the user cancelling.
-    private async Task<HttpResponseMessage> SendHttpAsync(HttpRequestMessage message, CancellationToken cancellationToken)
+    // The timeout cancels through a linked token; report it as a failure so callers do not mistake it for the user cancelling.
+    private async Task<HttpResponseMessage> SendHttpAsync(HttpRequestMessage message, CancellationToken cancellationToken, TimeSpan timeout)
     {
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(timeout);
         try
         {
-            return await _httpClient.SendAsync(message, cancellationToken);
+            return await _httpClient.SendAsync(message, timeoutSource.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            throw new TimeoutException($"The local model did not answer within {_httpClient.Timeout.TotalSeconds:0} seconds.");
+            throw new TimeoutException($"The local model did not answer within {timeout.TotalSeconds:0} seconds.");
         }
     }
 
+    // Tries each candidate model for this route in order and returns the first success. Ordinary errors (HTTP
+    // failures, bad JSON) move on to the next candidate; cancellation and timeouts stop immediately.
     public async Task<ChatCompletionResponse> CompleteAsync(
         ChatCompletionRequest request,
         ModelRoute route,
@@ -378,6 +315,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             "All planner model candidates failed. " + string.Join(" | ", failures));
     }
 
+    // Lists the (provider, model) pairs to try, without duplicates. A ModelOverride replaces the route's own list.
     private IEnumerable<ModelCandidate> ResolveCandidates(ModelRoute route, string modelOverride)
     {
         foreach (var profile in _profiles)
@@ -404,38 +342,10 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         }
     }
 
+    // The model fallback chain for each route, first choice first. Fast: fast, then reasoning. Vision: vision, then reasoning.
+    // Reasoning: reasoning, then fast. Deep: deep, then reasoning, then fast (Deep and Reasoning share the default branch below).
     private IEnumerable<string> GetRouteModels(ResolvedProviderProfile profile, ModelRoute route)
     {
-        if (IsOpenClawLocal(profile))
-        {
-            foreach (var model in GetOpenClawLocalRouteModels(profile, route))
-            {
-                yield return model;
-            }
-
-            foreach (var fallbackModel in profile.FallbackModels)
-            {
-                yield return fallbackModel;
-            }
-
-            yield break;
-        }
-
-        if (IsOpenClaw(profile))
-        {
-            foreach (var model in GetOpenClawRouteModels(profile, route))
-            {
-                yield return model;
-            }
-
-            foreach (var fallbackModel in profile.FallbackModels)
-            {
-                yield return fallbackModel;
-            }
-
-            yield break;
-        }
-
         switch (route)
         {
             case ModelRoute.Fast:
@@ -467,6 +377,11 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
                 break;
 
             default:
+                if (route == ModelRoute.Deep && !string.IsNullOrWhiteSpace(profile.DeepModel))
+                {
+                    yield return profile.DeepModel;
+                }
+
                 if (!string.IsNullOrWhiteSpace(profile.ReasoningModel))
                 {
                     yield return profile.ReasoningModel;
@@ -480,126 +395,9 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
                 break;
         }
-
-        foreach (var fallbackModel in profile.FallbackModels)
-        {
-            yield return fallbackModel;
-        }
     }
 
-    private IEnumerable<string> GetOpenClawLocalRouteModels(ResolvedProviderProfile profile, ModelRoute route)
-    {
-        var yielded = false;
-
-        switch (route)
-        {
-            case ModelRoute.Fast:
-                if (!string.IsNullOrWhiteSpace(profile.FastModel))
-                {
-                    yielded = true;
-                    yield return profile.FastModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel)
-                    && !string.Equals(profile.ReasoningModel, profile.FastModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yielded = true;
-                    yield return profile.ReasoningModel;
-                }
-
-                break;
-
-            case ModelRoute.Vision:
-                if (!string.IsNullOrWhiteSpace(profile.VisionModel))
-                {
-                    yielded = true;
-                    yield return profile.VisionModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel)
-                    && !string.Equals(profile.ReasoningModel, profile.VisionModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yielded = true;
-                    yield return profile.ReasoningModel;
-                }
-
-                break;
-
-            default:
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel))
-                {
-                    yielded = true;
-                    yield return profile.ReasoningModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.FastModel)
-                    && !string.Equals(profile.FastModel, profile.ReasoningModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yielded = true;
-                    yield return profile.FastModel;
-                }
-
-                break;
-        }
-
-        if (!yielded || !string.IsNullOrWhiteSpace(profile.RequestModel))
-        {
-            yield return ResolveRequestModel(profile);
-        }
-    }
-
-    private IEnumerable<string> GetOpenClawRouteModels(ResolvedProviderProfile profile, ModelRoute route)
-    {
-        var agentTarget = ResolveRequestModel(profile);
-
-        switch (route)
-        {
-            case ModelRoute.Fast:
-                if (!string.IsNullOrWhiteSpace(profile.FastModel))
-                {
-                    yield return profile.FastModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel)
-                    && !string.Equals(profile.ReasoningModel, profile.FastModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yield return profile.ReasoningModel;
-                }
-
-                break;
-
-            case ModelRoute.Vision:
-                if (!string.IsNullOrWhiteSpace(profile.VisionModel))
-                {
-                    yield return profile.VisionModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel)
-                    && !string.Equals(profile.ReasoningModel, profile.VisionModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yield return profile.ReasoningModel;
-                }
-
-                break;
-
-            default:
-                if (!string.IsNullOrWhiteSpace(profile.ReasoningModel))
-                {
-                    yield return profile.ReasoningModel;
-                }
-
-                if (!string.IsNullOrWhiteSpace(profile.FastModel)
-                    && !string.Equals(profile.FastModel, profile.ReasoningModel, StringComparison.OrdinalIgnoreCase))
-                {
-                    yield return profile.FastModel;
-                }
-
-                break;
-        }
-
-        yield return agentTarget;
-    }
-
+    // Makes one HTTP call to one model: builds the JSON body, sends it, checks the status and parses the reply.
     private async Task<ChatCompletionResponse> SendAsync(
         ModelCandidate candidate,
         ChatCompletionRequest request,
@@ -609,6 +407,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         if (!LocalAiPolicy.AllowsModelProvider(_options, candidate.Profile.Provider, candidate.Profile.BaseUrl))
             throw new InvalidOperationException("Local-only AI mode blocked this model provider.");
 
+        // Privacy guard: if the prompt contains Brain workspace references, only a local loopback "local" provider may see it.
         if (request.Messages.Any(message => message.Content.Any(part => part.Text.Contains(BrainWorkspace.ReferenceMarker, StringComparison.Ordinal))))
         {
             if (!Uri.TryCreate(candidate.Profile.BaseUrl, UriKind.Absolute, out var brainUri) || !brainUri.IsLoopback
@@ -616,42 +415,15 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
                 throw new InvalidOperationException("Brain work references are restricted to local loopback models; remote fallback was skipped.");
         }
 
-        if (IsOpenClawLocal(candidate.Profile))
-        {
-            return await SendViaOpenClawLocalAsync(candidate, request, route, cancellationToken);
-        }
-
-        if (RequiresApiKey(candidate.Profile.BaseUrl, candidate.Profile.Provider)
-            && string.IsNullOrWhiteSpace(candidate.Profile.ApiKey))
-        {
-            throw new InvalidOperationException($"provider {candidate.Profile.Name} has no API key");
-        }
-
-        if (UseResponsesApi(candidate.Profile))
-        {
-            return await SendViaResponsesApiAsync(candidate, request, route, cancellationToken);
-        }
-
+        // Request body in the OpenAI chat format: model, messages, temperature (plus optional fields added below).
         var payload = new Dictionary<string, object?>
         {
-            ["model"] = IsOpenClaw(candidate.Profile)
-                ? ResolveRequestModel(candidate.Profile)
-                : candidate.Model,
-            ["messages"] = request.Messages.Select(SerializeMessage).ToArray()
+            ["model"] = candidate.Model,
+            ["messages"] = request.Messages.Select(SerializeMessage).ToArray(),
+            ["temperature"] = request.Temperature
         };
 
-        var reasoningEffort = ResolveReasoningEffort(candidate.Profile, route);
-
-        if (ShouldSendReasoningEffort(candidate.Profile, reasoningEffort))
-        {
-            payload["reasoning_effort"] = reasoningEffort;
-        }
-
-        if (ShouldIncludeTemperature(candidate.Profile, reasoningEffort))
-        {
-            payload["temperature"] = request.Temperature;
-        }
-
+        // Local servers get a reply-length cap per route; hosted servers get none (0 means "do not send a limit").
         var localMaxTokens = ResolveLocalMaxTokens(candidate.Profile, route);
 
         if (localMaxTokens > 0)
@@ -664,6 +436,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             payload["user"] = request.User.Trim();
         }
 
+        // Tool calling: send the tool list and let the model decide whether to use one ("auto").
         if (request.Tools is { Length: > 0 })
         {
             payload["tools"] = request.Tools.Select(SerializeTool).ToArray();
@@ -684,17 +457,8 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", candidate.Profile.ApiKey);
         }
 
-        if (IsOpenClaw(candidate.Profile))
-        {
-            var agentTarget = ResolveRequestModel(candidate.Profile);
-
-            if (!string.Equals(candidate.Model, agentTarget, StringComparison.OrdinalIgnoreCase))
-            {
-                message.Headers.TryAddWithoutValidation("x-openclaw-model", candidate.Model);
-            }
-        }
-
-        using var response = await SendHttpAsync(message, cancellationToken);
+        // Send with the per-route timeout, then read the whole body as text.
+        using var response = await SendHttpAsync(message, cancellationToken, ModelTimeout(route));
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
 
         if (!response.IsSuccessStatusCode)
@@ -711,8 +475,11 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return completion;
     }
 
+    // Guards the log file so two simultaneous model calls do not write into it at the same time.
     private static readonly object PlannerLogLock = new();
 
+    // Optionally appends one JSON line (time, route, model, first answer, full request) to data/planner-log.jsonl.
+    // Only for local servers and only when PlannerRecordLocalCalls is on. This is training/debugging data.
     private void LogPlannerCall(ModelCandidate candidate, ModelRoute route, string requestJson, JsonElement root)
     {
         try
@@ -741,202 +508,8 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         }
     }
 
-    private async Task<ChatCompletionResponse> SendViaResponsesApiAsync(
-        ModelCandidate candidate,
-        ChatCompletionRequest request,
-        ModelRoute route,
-        CancellationToken cancellationToken)
-    {
-        var reasoningEffort = ResolveReasoningEffort(candidate.Profile, route);
-        var sessionKey = BuildResponsesSessionKey(candidate.Profile, request.User);
-        var state = string.IsNullOrWhiteSpace(sessionKey)
-            ? null
-            : _responsesSessions.TryGetValue(sessionKey, out var existingState)
-                ? existingState
-                : null;
-        var (previousResponseId, inputItems) = BuildResponsesInput(request.Messages, candidate.Model, state);
-        var payload = new Dictionary<string, object?>
-        {
-            ["model"] = candidate.Model,
-            ["input"] = inputItems
-        };
-
-        if (!string.IsNullOrWhiteSpace(previousResponseId))
-        {
-            payload["previous_response_id"] = previousResponseId;
-        }
-
-        if (!string.IsNullOrWhiteSpace(reasoningEffort))
-        {
-            payload["reasoning"] = new Dictionary<string, object?>
-            {
-                ["effort"] = reasoningEffort
-            };
-        }
-
-        if (ShouldIncludeTemperature(candidate.Profile, reasoningEffort))
-        {
-            payload["temperature"] = request.Temperature;
-        }
-
-        if (request.Tools is { Length: > 0 })
-        {
-            payload["tools"] = request.Tools.Select(SerializeResponsesTool).ToArray();
-        }
-
-        using var message = new HttpRequestMessage(
-            HttpMethod.Post,
-            BuildResponsesEndpoint(candidate.Profile.BaseUrl))
-        {
-            Content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8, "application/json")
-        };
-
-        if (!string.IsNullOrWhiteSpace(candidate.Profile.ApiKey))
-        {
-            message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", candidate.Profile.ApiKey);
-        }
-
-        using var response = await SendHttpAsync(message, cancellationToken);
-        var body = await response.Content.ReadAsStringAsync(cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new InvalidOperationException($"HTTP {(int)response.StatusCode}: {TrimError(body)}");
-        }
-
-        using var document = JsonDocument.Parse(body);
-        var completion = ExtractResponsesCompletion(document.RootElement, candidate);
-
-        if (!string.IsNullOrWhiteSpace(sessionKey)
-            && document.RootElement.TryGetProperty("id", out var responseIdElement)
-            && responseIdElement.ValueKind == JsonValueKind.String)
-        {
-            var responseId = responseIdElement.GetString()?.Trim() ?? string.Empty;
-
-            if (!string.IsNullOrWhiteSpace(responseId))
-            {
-                _responsesSessions[sessionKey] = new ResponsesConversationState(
-                    responseId,
-                    request.Messages.Length,
-                    candidate.Model);
-            }
-        }
-
-        return completion;
-    }
-
-    private async Task<ChatCompletionResponse> SendViaOpenClawLocalAsync(
-        ModelCandidate candidate,
-        ChatCompletionRequest request,
-        ModelRoute route,
-        CancellationToken cancellationToken)
-    {
-        if (request.Messages.Any(message =>
-                message.Content.Any(part => string.Equals(part.Type, "image_url", StringComparison.OrdinalIgnoreCase))))
-        {
-            throw new InvalidOperationException("openclaw-local does not support vision prompts.");
-        }
-
-        var helperPath = Path.Combine(_workspaceRoot, "scripts", "openclaw-local.mjs");
-
-        if (!File.Exists(helperPath))
-        {
-            throw new InvalidOperationException($"openclaw-local helper was not found at {helperPath}");
-        }
-
-        var payload = new
-        {
-            workspaceRoot = _workspaceRoot,
-            sessionId = string.IsNullOrWhiteSpace(request.User) ? Guid.NewGuid().ToString("n") : request.User.Trim(),
-            model = candidate.Model,
-            thinking = ResolveOpenClawThinking(route),
-            timeoutMs = ResolveOpenClawTimeout(route),
-            temperature = request.Temperature,
-            messages = request.Messages,
-            tools = request.Tools ?? []
-        };
-
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = ResolveNodeExecutablePath(),
-            WorkingDirectory = _workspaceRoot,
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        startInfo.ArgumentList.Add(helperPath);
-
-        using var process = new Process
-        {
-            StartInfo = startInfo
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException("Failed to start the openclaw-local helper process.");
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
-
-        await process.StandardInput.WriteAsync(JsonSerializer.Serialize(payload, JsonOptions));
-        process.StandardInput.Close();
-
-        try
-        {
-            await process.WaitForExitAsync(cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            TryKillProcess(process);
-            throw;
-        }
-
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"openclaw-local exited with code {process.ExitCode}: {TrimError(string.IsNullOrWhiteSpace(stderr) ? stdout : stderr)}");
-        }
-
-        OpenClawLocalGatewayResponse? response;
-
-        try
-        {
-            response = JsonSerializer.Deserialize<OpenClawLocalGatewayResponse>(stdout, JsonOptions);
-        }
-        catch (JsonException exception)
-        {
-            throw new InvalidOperationException(
-                $"openclaw-local returned invalid JSON: {TrimError(exception.Message)} | output={TrimError(stdout)}");
-        }
-
-        if (response is null)
-        {
-            throw new InvalidOperationException("openclaw-local returned an empty response.");
-        }
-
-        var toolCalls = (response.ToolCalls ?? [])
-            .Where(toolCall => !string.IsNullOrWhiteSpace(toolCall.Name))
-            .Select(toolCall => new ChatToolCall(
-                Guid.NewGuid().ToString("n"),
-                toolCall.Name.Trim(),
-                toolCall.Arguments.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
-                    ? "{}"
-                    : toolCall.Arguments.GetRawText()))
-            .ToArray();
-
-        return new ChatCompletionResponse(
-            response.Content?.Trim() ?? string.Empty,
-            toolCalls,
-            string.IsNullOrWhiteSpace(candidate.Model) ? (response.Model?.Trim() ?? string.Empty) : candidate.Model,
-            $"{candidate.Profile.Name}/{candidate.Profile.Provider}");
-    }
-
+    // Converts a ChatMessage to the OpenAI JSON shape. A single text part is sent as a plain string; anything
+    // else (such as text plus an image) is sent as an array of typed parts.
     private static object SerializeMessage(ChatMessage message)
     {
         object content = message.Content.Length == 1 && string.Equals(message.Content[0].Type, "text", StringComparison.OrdinalIgnoreCase)
@@ -971,6 +544,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return payload;
     }
 
+    // Converts one part to {"type":"image_url","image_url":{"url":...}} or {"type":"text","text":...}.
     private static object SerializeContentPart(ChatMessageContentPart part)
     {
         return string.Equals(part.Type, "image_url", StringComparison.OrdinalIgnoreCase)
@@ -989,6 +563,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             };
     }
 
+    // Describes a tool as an OpenAI "function" whose only parameter is a string called "input".
     private static object SerializeTool(ChatToolDefinition tool)
     {
         return new Dictionary<string, object?>
@@ -1007,16 +582,6 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
                         {
                             ["type"] = "string",
                             ["description"] = tool.InputDescription
-                        },
-                        ["purpose"] = new Dictionary<string, object?>
-                        {
-                            ["type"] = "string",
-                            ["description"] = tool.PurposeDescription
-                        },
-                        ["expectedEvidence"] = new Dictionary<string, object?>
-                        {
-                            ["type"] = "string",
-                            ["description"] = tool.ExpectedEvidenceDescription
                         }
                     },
                     ["additionalProperties"] = false
@@ -1025,40 +590,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         };
     }
 
-    private static object SerializeResponsesTool(ChatToolDefinition tool)
-    {
-        return new Dictionary<string, object?>
-        {
-            ["type"] = "function",
-            ["name"] = tool.Name,
-            ["description"] = tool.Description,
-            ["parameters"] = new Dictionary<string, object?>
-            {
-                ["type"] = "object",
-                ["properties"] = new Dictionary<string, object?>
-                {
-                    ["input"] = new Dictionary<string, object?>
-                    {
-                        ["type"] = "string",
-                        ["description"] = tool.InputDescription
-                    },
-                    ["purpose"] = new Dictionary<string, object?>
-                    {
-                        ["type"] = "string",
-                        ["description"] = tool.PurposeDescription
-                    },
-                    ["expectedEvidence"] = new Dictionary<string, object?>
-                    {
-                        ["type"] = "string",
-                        ["description"] = tool.ExpectedEvidenceDescription
-                    }
-                },
-                ["additionalProperties"] = false
-            },
-            ["strict"] = true
-        };
-    }
-
+    // Reads choices[0].message from the response JSON (text plus tool calls); throws if there are no choices.
     private static ChatCompletionResponse ExtractCompletion(JsonElement root, ModelCandidate candidate)
     {
         if (!root.TryGetProperty("choices", out var choices)
@@ -1079,6 +611,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             $"{candidate.Profile.Name}/{candidate.Profile.Provider}");
     }
 
+    // The reply text can be a plain string or an array of parts with "text" fields; both are handled.
     private static string ExtractMessageContent(JsonElement message)
     {
         if (!message.TryGetProperty("content", out var content))
@@ -1099,6 +632,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         };
     }
 
+    // Reads message.tool_calls. Entries with no function or no name are skipped; a missing id gets a random one.
     private static ChatToolCall[] ExtractToolCalls(JsonElement message)
     {
         if (!message.TryGetProperty("tool_calls", out var toolCalls)
@@ -1134,82 +668,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return results.ToArray();
     }
 
-    private static ChatCompletionResponse ExtractResponsesCompletion(JsonElement root, ModelCandidate candidate)
-    {
-        var contentParts = new List<string>();
-        var toolCalls = new List<ChatToolCall>();
-
-        if (root.TryGetProperty("output", out var output)
-            && output.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in output.EnumerateArray())
-            {
-                var type = GetString(item, "type") ?? string.Empty;
-
-                switch (type)
-                {
-                    case "message":
-                        contentParts.Add(ExtractResponsesMessageContent(item));
-                        break;
-
-                    case "function_call":
-                    {
-                        var name = GetString(item, "name");
-                        var arguments = GetString(item, "arguments") ?? "{}";
-                        var callId = GetString(item, "call_id")
-                            ?? GetString(item, "id")
-                            ?? Guid.NewGuid().ToString("n");
-
-                        if (!string.IsNullOrWhiteSpace(name))
-                        {
-                            toolCalls.Add(new ChatToolCall(callId, name.Trim(), arguments));
-                        }
-
-                        break;
-                    }
-                }
-            }
-        }
-
-        return new ChatCompletionResponse(
-            string.Join(Environment.NewLine, contentParts.Where(part => !string.IsNullOrWhiteSpace(part))).Trim(),
-            toolCalls.ToArray(),
-            candidate.Model,
-            $"{candidate.Profile.Name}/{candidate.Profile.Provider}");
-    }
-
-    private static string ExtractResponsesMessageContent(JsonElement item)
-    {
-        if (!item.TryGetProperty("content", out var content)
-            || content.ValueKind != JsonValueKind.Array)
-        {
-            return string.Empty;
-        }
-
-        var builder = new StringBuilder();
-
-        foreach (var contentItem in content.EnumerateArray())
-        {
-            var type = GetString(contentItem, "type") ?? string.Empty;
-
-            if (string.Equals(type, "output_text", StringComparison.OrdinalIgnoreCase))
-            {
-                builder.Append(GetString(contentItem, "text") ?? string.Empty);
-                continue;
-            }
-
-            if (string.Equals(type, "refusal", StringComparison.OrdinalIgnoreCase))
-            {
-                builder.Append(GetString(contentItem, "refusal") ?? string.Empty);
-                continue;
-            }
-
-            builder.Append(GetString(contentItem, "text") ?? string.Empty);
-        }
-
-        return builder.ToString().Trim();
-    }
-
+    // Turns a base URL into the full chat endpoint, adding /chat/completions unless it is already there.
     private static string BuildEndpoint(string baseUrl)
     {
         var trimmed = NormalizeOpenAiCompatibleBaseUrl(baseUrl);
@@ -1222,23 +681,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return $"{trimmed}/chat/completions";
     }
 
-    private static string BuildResponsesEndpoint(string baseUrl)
-    {
-        var trimmed = NormalizeOpenAiCompatibleBaseUrl(baseUrl);
-
-        if (trimmed.EndsWith("/responses", StringComparison.OrdinalIgnoreCase))
-        {
-            return trimmed;
-        }
-
-        if (trimmed.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase))
-        {
-            return trimmed[..^"/chat/completions".Length] + "/responses";
-        }
-
-        return $"{trimmed}/responses";
-    }
-
+    // A bare host such as http://localhost:1234 gets "/v1" added, because OpenAI-style APIs live under /v1.
     private static string NormalizeOpenAiCompatibleBaseUrl(string baseUrl)
     {
         var trimmed = baseUrl.Trim().TrimEnd('/');
@@ -1258,6 +701,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return trimmed;
     }
 
+    // Reads a property as text; non-string values (for example arguments sent as an object) are converted with ToString.
     private static string? GetString(JsonElement element, string propertyName)
     {
         if (!element.TryGetProperty(propertyName, out var property))
@@ -1270,22 +714,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             : property.ToString();
     }
 
-    private static bool RequiresApiKey(string baseUrl, string provider)
-    {
-        if (string.Equals(provider, "local", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
-        {
-            return true;
-        }
-
-        return !string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase);
-    }
-
+    // Shortens long server error messages so they stay readable in logs and failure lists.
     private static string TrimError(string text)
     {
         const int maxLength = 320;
@@ -1293,75 +722,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
-    private static bool IsOpenClaw(ResolvedProviderProfile profile) =>
-        string.Equals(profile.Provider, "openclaw", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsOpenClawLocal(ResolvedProviderProfile profile) =>
-        string.Equals(profile.Provider, "openclaw-local", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsOpenAi(ResolvedProviderProfile profile) =>
-        string.Equals(profile.Provider, "openai", StringComparison.OrdinalIgnoreCase);
-
-    private static bool UseResponsesApi(ResolvedProviderProfile profile) =>
-        IsOpenAi(profile);
-
-    private static string ResolveReasoningEffort(ResolvedProviderProfile profile, ModelRoute route)
-    {
-        var configuredValue = route switch
-        {
-            ModelRoute.Fast => profile.FastReasoningEffort,
-            ModelRoute.Vision => profile.VisionReasoningEffort,
-            _ => profile.ReasoningEffort
-        };
-
-        return NormalizeReasoningEffort(configuredValue);
-    }
-
-    private static string NormalizeReasoningEffort(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var normalized = value.Trim().ToLowerInvariant();
-
-        return normalized switch
-        {
-            "none" => "none",
-            "minimal" => "minimal",
-            "low" => "low",
-            "medium" => "medium",
-            "high" => "high",
-            "xhigh" => "xhigh",
-            _ => string.Empty
-        };
-    }
-
-    private static bool ShouldSendReasoningEffort(ResolvedProviderProfile profile, string reasoningEffort) =>
-        !string.IsNullOrWhiteSpace(reasoningEffort)
-        && (IsOpenAi(profile) || IsOpenAiHost(profile.BaseUrl));
-
-    private static bool ShouldIncludeTemperature(ResolvedProviderProfile profile, string reasoningEffort)
-    {
-        if (!ShouldSendReasoningEffort(profile, reasoningEffort))
-        {
-            return true;
-        }
-
-        return string.Equals(reasoningEffort, "none", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsOpenAiHost(string baseUrl)
-    {
-        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
-        {
-            return false;
-        }
-
-        return string.Equals(uri.Host, "api.openai.com", StringComparison.OrdinalIgnoreCase);
-    }
-
+    // Maximum reply length (in tokens) for local models only, chosen per route to keep a small local model fast.
     private static int ResolveLocalMaxTokens(ResolvedProviderProfile profile, ModelRoute route)
     {
         if (!IsLocalLoopbackProfile(profile))
@@ -1371,12 +732,16 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
         return route switch
         {
-            ModelRoute.Fast => 128,
+            // Fast also carries spoken replies and the end-of-workflow summary; 128 tokens cut them mid-sentence on the small local model.
+            ModelRoute.Fast => 256,
             ModelRoute.Vision => 192,
+            // Room for a plan plus a reasoning model's thinking tokens; the brain tool keeps ~3,300 characters of plan + critique anyway.
+            ModelRoute.Deep => 600,
             _ => 384
         };
     }
 
+    // True when the provider runs on this computer: provider "local", or a localhost / 127.0.0.1 address.
     private static bool IsLocalLoopbackProfile(ResolvedProviderProfile profile)
     {
         if (string.Equals(profile.Provider, "local", StringComparison.OrdinalIgnoreCase))
@@ -1393,227 +758,11 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
             || string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string BuildResponsesSessionKey(ResolvedProviderProfile profile, string user)
-    {
-        if (string.IsNullOrWhiteSpace(user))
-        {
-            return string.Empty;
-        }
-
-        return $"{profile.Name}:{user.Trim()}";
-    }
-
-    private static (string PreviousResponseId, object[] InputItems) BuildResponsesInput(
-        ChatMessage[] messages,
-        string model,
-        ResponsesConversationState? state)
-    {
-        if (state is null
-            || string.IsNullOrWhiteSpace(state.ResponseId)
-            || !string.Equals(state.Model, model, StringComparison.OrdinalIgnoreCase)
-            || messages.Length < state.MessageCount)
-        {
-            return (string.Empty, SerializeResponsesMessages(messages, includeAssistantMessages: true));
-        }
-
-        var deltaMessages = messages.Skip(state.MessageCount).ToArray();
-        var deltaItems = SerializeResponsesMessages(deltaMessages, includeAssistantMessages: false);
-
-        if (deltaItems.Length == 0)
-        {
-            return (string.Empty, SerializeResponsesMessages(messages, includeAssistantMessages: true));
-        }
-
-        return (state.ResponseId, deltaItems);
-    }
-
-    private static object[] SerializeResponsesMessages(
-        IEnumerable<ChatMessage> messages,
-        bool includeAssistantMessages)
-    {
-        var items = new List<object>();
-
-        foreach (var message in messages)
-        {
-            items.AddRange(SerializeResponsesMessage(message, includeAssistantMessages));
-        }
-
-        return items.ToArray();
-    }
-
-    private static IEnumerable<object> SerializeResponsesMessage(ChatMessage message, bool includeAssistantMessages)
-    {
-        if (string.Equals(message.Role, "tool", StringComparison.OrdinalIgnoreCase))
-        {
-            if (!string.IsNullOrWhiteSpace(message.ToolCallId))
-            {
-                yield return new Dictionary<string, object?>
-                {
-                    ["type"] = "function_call_output",
-                    ["call_id"] = message.ToolCallId,
-                    ["output"] = ExtractPlainText(message.Content)
-                };
-            }
-
-            yield break;
-        }
-
-        if (string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase) && !includeAssistantMessages)
-        {
-            yield break;
-        }
-
-        if (string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase)
-            && message.ToolCalls is { Length: > 0 })
-        {
-            var commentary = ExtractPlainText(message.Content);
-
-            if (!string.IsNullOrWhiteSpace(commentary))
-            {
-                yield return new Dictionary<string, object?>
-                {
-                    ["role"] = "assistant",
-                    ["phase"] = "commentary",
-                    ["content"] = commentary
-                };
-            }
-
-            foreach (var toolCall in message.ToolCalls)
-            {
-                yield return new Dictionary<string, object?>
-                {
-                    ["type"] = "function_call",
-                    ["call_id"] = toolCall.Id,
-                    ["name"] = toolCall.Name,
-                    ["arguments"] = toolCall.ArgumentsJson
-                };
-            }
-
-            yield break;
-        }
-
-        var payload = new Dictionary<string, object?>
-        {
-            ["role"] = message.Role,
-            ["content"] = SerializeResponsesContent(message.Content)
-        };
-
-        if (string.Equals(message.Role, "assistant", StringComparison.OrdinalIgnoreCase))
-        {
-            payload["phase"] = "final_answer";
-        }
-
-        yield return payload;
-    }
-
-    private static object SerializeResponsesContent(ChatMessageContentPart[] parts)
-    {
-        if (parts.Length == 1
-            && string.Equals(parts[0].Type, "text", StringComparison.OrdinalIgnoreCase))
-        {
-            return parts[0].Text;
-        }
-
-        return parts.Select(part =>
-            string.Equals(part.Type, "image_url", StringComparison.OrdinalIgnoreCase)
-                ? new Dictionary<string, object?>
-                {
-                    ["type"] = "input_image",
-                    ["image_url"] = part.Url
-                }
-                : new Dictionary<string, object?>
-                {
-                    ["type"] = "input_text",
-                    ["text"] = part.Text
-                }).ToArray();
-    }
-
-    private static string ExtractPlainText(ChatMessageContentPart[] parts)
-    {
-        return string.Join(
-            Environment.NewLine,
-            parts
-                .Where(part => string.Equals(part.Type, "text", StringComparison.OrdinalIgnoreCase))
-                .Select(part => part.Text))
-            .Trim();
-    }
-
-    private static string ResolveRequestModel(ResolvedProviderProfile profile)
-    {
-        if (!string.IsNullOrWhiteSpace(profile.RequestModel))
-        {
-            return profile.RequestModel;
-        }
-
-        return IsOpenClaw(profile) ? "openclaw/default" : string.Empty;
-    }
-
-    private static string ResolveOpenClawThinking(ModelRoute route) =>
-        route switch
-        {
-            ModelRoute.Fast => "low",
-            ModelRoute.Vision => "medium",
-            _ => "high"
-        };
-
-    private static int ResolveOpenClawTimeout(ModelRoute route) =>
-        route switch
-        {
-            ModelRoute.Fast => 15_000,
-            ModelRoute.Vision => 20_000,
-            _ => 30_000
-        };
-
-    private static string ResolveNodeExecutablePath()
-    {
-        var overridePath = Environment.GetEnvironmentVariable("OPENCLAW_NODE_PATH");
-
-        if (!string.IsNullOrWhiteSpace(overridePath))
-        {
-            return overridePath.Trim();
-        }
-
-        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
-        var candidates = new[]
-        {
-            Path.Combine(programFiles, "nodejs", "node.exe"),
-            Path.Combine(programFilesX86, "nodejs", "node.exe")
-        };
-
-        foreach (var candidate in candidates)
-        {
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-        }
-
-        return "node";
-    }
-
-    private static void TryKillProcess(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-            }
-        }
-        catch
-        {
-        }
-    }
-
+    // One attempt to make: which provider and which model name.
     private sealed record ModelCandidate(ResolvedProviderProfile Profile, string Model);
-
-    private sealed record ResponsesConversationState(
-        string ResponseId,
-        int MessageCount,
-        string Model);
 }
 
+// A fully worked-out provider: name, kind, server URL, the model name for each route and the API key.
 internal sealed record ResolvedProviderProfile(
     string Name,
     string Provider,
@@ -1622,18 +771,5 @@ internal sealed record ResolvedProviderProfile(
     string FastModel,
     string ReasoningModel,
     string VisionModel,
-    string FastReasoningEffort,
-    string ReasoningEffort,
-    string VisionReasoningEffort,
-    string ApiKey,
-    string[] FallbackModels);
-
-internal sealed record OpenClawLocalGatewayResponse(
-    string? Content,
-    OpenClawLocalGatewayToolCall[]? ToolCalls,
-    string? Provider,
-    string? Model);
-
-internal sealed record OpenClawLocalGatewayToolCall(
-    string Name,
-    JsonElement Arguments);
+    string DeepModel,
+    string ApiKey);

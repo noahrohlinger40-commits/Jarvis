@@ -1,7 +1,12 @@
+// UiControlTools.cs: assistant tools for window and control actions (focus, close, minimise/maximise, hotkey, click, type, read text, scroll, wait).
+// Each tool follows the IAssistantTool pattern: CanHandle says whether a typed command is for it, ExecuteAsync parses it with UiCommandParsing
+// (bottom of this file) and calls IDesktopAutomationService, which reaches Win32UiAutomation. Window listing, move/resize/snap, media and clipboard tools are in DesktopAutomationAdvancedTools.cs.
+// Every CanHandle refuses vague targets like "it" or "that one": the tool cannot know which window those mean, so it does not guess.
 using System.Globalization;
 
 namespace Jarvis.Core;
 
+// Tool: bring a named window to the front.
 public sealed class FocusAppTool : IAssistantTool
 {
     public string Name => "focus app";
@@ -34,6 +39,7 @@ public sealed class FocusAppTool : IAssistantTool
     }
 }
 
+// Tool: ask a window to close. The description notes approval may be required, so the safety layer can ask the user first.
 public sealed class CloseAppTool : IAssistantTool
 {
     public string Name => "close app";
@@ -64,6 +70,7 @@ public sealed class CloseAppTool : IAssistantTool
     }
 }
 
+// Tool: minimise, maximise or restore a window.
 public sealed class WindowStateTool : IAssistantTool
 {
     public string Name => "window state";
@@ -98,6 +105,7 @@ public sealed class WindowStateTool : IAssistantTool
     }
 }
 
+// Tool: press a key combination such as ctrl+s in a window. Approval may be required.
 public sealed class SendHotkeyTool : IAssistantTool
 {
     public string Name => "send hotkey";
@@ -129,6 +137,7 @@ public sealed class SendHotkeyTool : IAssistantTool
     }
 }
 
+// Tool: click a window's centre, or a named control inside it ("click element notepad :: save").
 public sealed class ClickElementTool : IAssistantTool
 {
     public string Name => "click element";
@@ -159,6 +168,7 @@ public sealed class ClickElementTool : IAssistantTool
     }
 }
 
+// Tool: type text into a window, or into a named field using "window :: field :: text".
 public sealed class TypeIntoElementTool : IAssistantTool
 {
     public string Name => "type into";
@@ -198,7 +208,7 @@ public sealed class TypeIntoElementTool : IAssistantTool
             for (var attempt = 0; attempt < 20 && result.StartsWith("Window matching", StringComparison.OrdinalIgnoreCase); attempt++)
             {
                 // The first wait is longer: a window can appear before the app has loaded its document,
-                // and keys typed then are lost (Notepad saved an empty file in testing).
+                // and keys typed then are lost (Notepad would save an empty file).
                 // ponytail: fixed settle time; poll the app's readiness if a slow app still drops keys.
                 await Task.Delay(attempt == 0 ? 1500 : 500, cancellationToken);
                 result = await context.DesktopAutomation.TypeIntoElementAsync(target, elementName, text, cancellationToken);
@@ -215,6 +225,7 @@ public sealed class TypeIntoElementTool : IAssistantTool
     }
 }
 
+// Tool: read text from a window or a named control (for example a status bar).
 public sealed class GetElementTextTool : IAssistantTool
 {
     public string Name => "get element text";
@@ -249,6 +260,7 @@ public sealed class GetElementTextTool : IAssistantTool
     }
 }
 
+// Tool: scroll a window up or down, repeated up to 10 times. It stops at the first failure.
 public sealed class ScrollWindowTool : IAssistantTool
 {
     public string Name => "scroll";
@@ -292,16 +304,19 @@ public sealed class ScrollWindowTool : IAssistantTool
     }
 }
 
+// Tool: pause between steps, 0 to 30 seconds.
 public sealed class WaitTool : IAssistantTool
 {
     public string Name => "wait";
 
     public string Description => "Pause execution for a short duration. `wait 2.5`.";
 
+    // Only with a number after it: "wait why are you adding that..." is a complaint, not a pause, and "pause music" is not a wait.
     public bool CanHandle(string input) =>
-        ToolInputHelper.StartsWithCommand(input, Name)
-        || input.StartsWith("pause ", StringComparison.OrdinalIgnoreCase)
-        || input.StartsWith("hold ", StringComparison.OrdinalIgnoreCase);
+        (ToolInputHelper.StartsWithCommand(input, Name)
+            || input.StartsWith("pause ", StringComparison.OrdinalIgnoreCase)
+            || input.StartsWith("hold ", StringComparison.OrdinalIgnoreCase))
+        && UiCommandParsing.TryParseWaitSeconds(input, out _);
 
     public async Task<ToolResult> ExecuteAsync(string input, ToolContext context, CancellationToken cancellationToken)
     {
@@ -315,8 +330,10 @@ public sealed class WaitTool : IAssistantTool
     }
 }
 
+// Text parsing for the commands in this file. Part of UiCommandParsing, which is split over several files.
 internal static partial class UiCommandParsing
 {
+    // Everything after the command word is the window name.
     public static bool TryParseFocusTarget(string input, out string target)
     {
         target = ToolInputHelper.GetCommandTail(input, "focus app", "focus window", "switch to", "activate app", "bring to front");
@@ -329,6 +346,7 @@ internal static partial class UiCommandParsing
         return !string.IsNullOrWhiteSpace(target);
     }
 
+    // Window state commands come in two forms: "minimize app notepad" (the state is the command word) or "window state notepad maximize" (the state is last).
     public static bool TryParseWindowState(string input, out string target, out string state)
     {
         if (TryParseFixedStateTarget(input, "minimize", out target, out state, "minimize app", "minimize window")
@@ -346,6 +364,7 @@ internal static partial class UiCommandParsing
         return TryNormalizeWindowState(state, out state);
     }
 
+    // "send hotkey notepad ctrl+s": first word is the window (or a quoted name), the rest is the key combo.
     public static bool TryParseHotkeyCommand(string input, out string target, out string hotkey)
     {
         return TryParseTargetAndPayload(input, out target, out hotkey, "send hotkey", "press key", "send shortcut", "shortcut");
@@ -356,6 +375,7 @@ internal static partial class UiCommandParsing
         return TryParseClickTarget(input, out target, out _);
     }
 
+    // "click element notepad :: save" or "click save": the part before "::" is the window and the optional part after it is the control.
     public static bool TryParseClickTarget(string input, out string target, out string elementName)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "click element", "click", "tap");
@@ -368,6 +388,7 @@ internal static partial class UiCommandParsing
         return parsed;
     }
 
+    // Type commands have three accepted shapes: "type into window :: field :: text"; "type into window text"; and natural "type hello into notepad" (text first, then " into " and the window).
     public static bool TryParseTypeInto(string input, out string target, out string elementName, out string text)
     {
         var remainder = ToolInputHelper.GetCommandTail(input, "type into", "types into", "enter into", "input into", "write into");
@@ -382,6 +403,7 @@ internal static partial class UiCommandParsing
             return true;
         }
 
+        // Natural form: the LAST " into " splits text from window, so text that itself contains the word "into" still works.
         foreach (var prefix in new[] { "type", "types", "enter", "input", "write" })
         {
             if (!ToolInputHelper.StartsWithCommand(input, prefix))
@@ -425,6 +447,7 @@ internal static partial class UiCommandParsing
         return TryParseTargetAndOptionalElement(remainder, out target, out elementName);
     }
 
+    // Scroll command: "scroll window [up|down] [count]", or "move down/up <window>". The count is limited to 1..10; direction defaults to down.
     public static bool TryParseScrollCommand(string input, out string target, out string direction, out int count)
     {
         direction = "down";
@@ -478,6 +501,7 @@ internal static partial class UiCommandParsing
         return !string.IsNullOrWhiteSpace(target);
     }
 
+    // Wait seconds: accepts a plain number; tries the invariant culture (1.5) and then the PC's own culture (1,5).
     public static bool TryParseWaitSeconds(string input, out double seconds)
     {
         var value = ToolInputHelper.GetCommandTail(input, "wait", "pause", "hold");
@@ -486,21 +510,29 @@ internal static partial class UiCommandParsing
             || double.TryParse(value, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out seconds);
     }
 
+    // Jarvis's own "not found" failures all start with one of these. Only the start counts, so text a tool reads back (the
+    // clipboard, a control's text) that happens to say "command not found" is not a failure. Also used by JarvisAssistant.InferToolError.
+    internal static readonly string[] NotFoundPrefixes =
+        ["path not found", "file not found", "directory not found", "image file not found", "document not found", "selector not found", "window matching '", "element matching '"];
+
+    // Decides whether a tool reply means failure: blank, starting with a "not found" prefix above, or starting with "usage:", "unable " or "unsupported ". Tools use this to set success or failure.
     public static bool LooksLikeFailure(string responseText)
     {
         return string.IsNullOrWhiteSpace(responseText)
-            || responseText.Contains("not found", StringComparison.OrdinalIgnoreCase)
+            || NotFoundPrefixes.Any(prefix => responseText.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             || responseText.StartsWith("usage:", StringComparison.OrdinalIgnoreCase)
             || responseText.StartsWith("unable ", StringComparison.OrdinalIgnoreCase)
             || responseText.StartsWith("unsupported ", StringComparison.OrdinalIgnoreCase);
     }
 
+    // True when the target (or the control name) is a vague reference such as "it" or "that one" that the tool cannot resolve.
     public static bool LooksLikeContextualReferenceTarget(string target, string elementName = "")
     {
         return LooksLikeContextualSelector(target)
             || (!string.IsNullOrWhiteSpace(elementName) && LooksLikeContextualSelector(elementName));
     }
 
+    // Finds which of the command prefixes the input starts with, then splits the rest into window and payload.
     public static bool TryParseTargetAndPayload(string input, out string target, out string payload, params string[] prefixes)
     {
         foreach (var prefix in prefixes)
@@ -519,6 +551,7 @@ internal static partial class UiCommandParsing
         return false;
     }
 
+    // For commands where the state is built into the command word (minimize app X), the window is the tail and the state is fixed.
     private static bool TryParseFixedStateTarget(string input, string fixedState, out string target, out string state, params string[] prefixes)
     {
         target = ToolInputHelper.GetCommandTail(input, prefixes);
@@ -526,6 +559,7 @@ internal static partial class UiCommandParsing
         return !string.IsNullOrWhiteSpace(target);
     }
 
+    // Maps minimize/maximize/restore and their past forms to one standard word.
     private static bool TryNormalizeWindowState(string value, out string state)
     {
         state = value.Trim().ToLowerInvariant();
@@ -551,6 +585,7 @@ internal static partial class UiCommandParsing
         return false;
     }
 
+    // Splits "target payload". A quoted first part ("my window" text) may contain spaces; otherwise the first word is the target and the rest the payload. Both must be non-empty.
     private static bool TrySplitTargetAndPayload(string remainder, out string target, out string payload)
     {
         target = string.Empty;
@@ -590,6 +625,7 @@ internal static partial class UiCommandParsing
         return !string.IsNullOrWhiteSpace(target) && !string.IsNullOrWhiteSpace(payload);
     }
 
+    // Splits "window :: element" (at most two parts); the element is optional.
     private static bool TryParseTargetAndOptionalElement(string remainder, out string target, out string elementName)
     {
         target = string.Empty;
@@ -610,6 +646,7 @@ internal static partial class UiCommandParsing
         return !string.IsNullOrWhiteSpace(target);
     }
 
+    // Detects references to something said earlier instead of a real name: "it", "that one", "the second one", "the last", prefixes like "that " or "the latest ", or a short phrase (4 words or fewer) containing it/that/this.
     private static bool LooksLikeContextualSelector(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -680,6 +717,7 @@ internal static partial class UiCommandParsing
                 || normalized.Contains(" this", StringComparison.OrdinalIgnoreCase));
     }
 
+    // Splits "window :: element :: text" (three parts, every part required). Quotes around parts are removed.
     private static bool TryParseStructuredElementPayload(string remainder, out string target, out string elementName, out string payload)
     {
         target = string.Empty;

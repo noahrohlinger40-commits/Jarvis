@@ -1,17 +1,14 @@
+// One slice of the StructuredAssistantPlanner class (see AssistantPlanner.cs): helpers that turn the model's tool call
+// into a PlannerToolCall, and that describe how a tool run went (verified, failed, waiting for approval) for the
+// plan-step list shown in the UI. Static helpers only; the real tool runs elsewhere.
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace Jarvis.Core;
 
 internal sealed partial class StructuredAssistantPlanner
 {
-    private static readonly HashSet<string> VerificationStopWords = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "i", "if", "in", "into",
-        "is", "it", "of", "on", "or", "so", "that", "the", "this", "to", "up", "was", "what", "when",
-        "which", "with", "would", "your"
-    };
-
+    // Reads the arguments the model sent for a tool call. The expected shape is {"input": "..."}, but a bare JSON string
+    // or even invalid JSON is accepted and used as the input text, because small local models are sloppy about format.
     private static PlannerToolCall ParsePlannerToolCall(ChatToolCall toolCall)
     {
         if (string.IsNullOrWhiteSpace(toolCall.ArgumentsJson))
@@ -26,11 +23,7 @@ internal sealed partial class StructuredAssistantPlanner
 
             if (root.ValueKind == JsonValueKind.Object)
             {
-                return new PlannerToolCall(
-                    toolCall.Name,
-                    ReadToolArgument(root, "input"),
-                    ReadToolArgument(root, "purpose"),
-                    ReadToolArgument(root, "expectedEvidence"));
+                return new PlannerToolCall(toolCall.Name, ReadToolArgument(root, "input"));
             }
 
             if (root.ValueKind == JsonValueKind.String)
@@ -38,6 +31,7 @@ internal sealed partial class StructuredAssistantPlanner
                 return new PlannerToolCall(toolCall.Name, root.GetString()?.Trim() ?? string.Empty);
             }
         }
+        // Malformed JSON is not an error here; fall through to using the raw text as the input.
         catch (JsonException)
         {
         }
@@ -45,6 +39,7 @@ internal sealed partial class StructuredAssistantPlanner
         return new PlannerToolCall(toolCall.Name, toolCall.ArgumentsJson.Trim());
     }
 
+    // Reads one property as trimmed text; a missing or null property gives an empty string, and numbers/objects are shown as their JSON text.
     private static string ReadToolArgument(JsonElement root, string propertyName)
     {
         if (!root.TryGetProperty(propertyName, out var property))
@@ -60,119 +55,49 @@ internal sealed partial class StructuredAssistantPlanner
         };
     }
 
+    // Text shown next to a plan step in the UI.
     private static string BuildToolStepDetail(PlannerToolCall toolCall)
     {
-        var parts = new List<string>();
-
-        if (!string.IsNullOrWhiteSpace(toolCall.Purpose))
-        {
-            parts.Add($"purpose: {toolCall.Purpose.Trim()}");
-        }
-
-        if (!string.IsNullOrWhiteSpace(toolCall.Input))
-        {
-            parts.Add($"input: {TrimForFeed(toolCall.Input)}");
-        }
-
-        if (!string.IsNullOrWhiteSpace(toolCall.ExpectedEvidence))
-        {
-            parts.Add($"expect: {TrimForFeed(toolCall.ExpectedEvidence)}");
-        }
-
-        if (parts.Count == 0)
-        {
-            parts.Add("tool selected without additional planner metadata.");
-        }
-
-        return string.Join(" | ", parts);
+        return string.IsNullOrWhiteSpace(toolCall.Input)
+            ? "tool selected without additional planner metadata."
+            : $"input: {TrimForFeed(toolCall.Input)}";
     }
 
-    private static ToolVerificationReport BuildToolVerificationReport(PlannerToolCall toolCall, PlannerToolResult result)
+    // Classifies a tool result for the UI: waiting for approval, failed, "observed" (ran, but the tool gave only a generic
+    // success message) or "verified" (the tool gave a specific check of its own).
+    private static ToolVerificationReport BuildToolVerificationReport(PlannerToolResult result)
     {
-        if (result.IsError)
-        {
-            return new ToolVerificationReport(
-                "failed",
-                "failed",
-                "The tool reported a failure, so the expected evidence was not confirmed.",
-                BuildVerificationDetail(toolCall, result, "The tool reported a failure before the expected evidence could be confirmed."));
-        }
-
         if (LooksLikeApprovalGate(result))
         {
             return new ToolVerificationReport(
                 "awaiting_approval",
                 "needs_review",
-                "The tool reached an approval gate, so the expected evidence is still pending.",
-                BuildVerificationDetail(toolCall, result, "The tool paused behind an approval gate before the requested evidence could be observed."));
+                "The tool reached an approval gate.",
+                BuildVerificationDetail(result, "The tool reached an approval gate."));
         }
 
-        var expectedEvidence = toolCall.ExpectedEvidence.Trim();
-        var verificationText = result.Verification.Trim();
-        var verificationIsGeneric = IsGenericVerificationText(verificationText);
-        var observedEvidence = BuildObservedEvidence(result);
-        var evidenceScore = ComputeEvidenceMatchScore(expectedEvidence, observedEvidence);
-
-        if (string.IsNullOrWhiteSpace(expectedEvidence))
+        if (result.IsError)
         {
-            var summary = verificationIsGeneric
-                ? "The tool returned a success signal, but no explicit expected evidence was supplied for this step."
-                : "The tool returned concrete evidence for this step.";
-            var status = verificationIsGeneric ? "observed" : "verified";
             return new ToolVerificationReport(
-                status,
-                "completed",
-                summary,
-                BuildVerificationDetail(toolCall, result, summary));
+                "failed",
+                "failed",
+                "The tool reported a failure.",
+                BuildVerificationDetail(result, "The tool reported a failure."));
         }
 
-        if (evidenceScore >= 0.55 || (!verificationIsGeneric && evidenceScore >= 0.25))
-        {
-            var summary = $"Verified expected evidence: {TrimForFeed(expectedEvidence)}";
-            return new ToolVerificationReport(
-                "verified",
-                "completed",
-                summary,
-                BuildVerificationDetail(toolCall, result, summary));
-        }
-
-        if (!verificationIsGeneric && !string.IsNullOrWhiteSpace(verificationText))
-        {
-            var summary = $"The tool returned concrete evidence, but it only partially confirmed the expected signal: {TrimForFeed(expectedEvidence)}";
-            return new ToolVerificationReport(
-                "observed",
-                "completed",
-                summary,
-                BuildVerificationDetail(toolCall, result, summary));
-        }
-
-        var unconfirmedSummary = $"The tool returned output, but the expected evidence was not clearly confirmed: {TrimForFeed(expectedEvidence)}";
         return new ToolVerificationReport(
-            "unconfirmed",
-            "needs_review",
-            unconfirmedSummary,
-            BuildVerificationDetail(toolCall, result, unconfirmedSummary));
+            IsGenericVerificationText(result.Verification.Trim()) ? "observed" : "verified",
+            "completed",
+            result.Summary,
+            BuildVerificationDetail(result, result.Summary));
     }
 
-    private static string BuildObservedEvidence(PlannerToolResult result)
-    {
-        return string.Join(
-            " ",
-            new[]
-            {
-                result.Verification,
-                result.Summary,
-                TrimForFeed(result.Output)
-            }.Where(value => !string.IsNullOrWhiteSpace(value)));
-    }
+    // Only the safety gate writes this summary on a result that did not succeed. Checking the verification text for "approval" would also match a tool's
+    // input (a search for "approval form" would look like a gate).
+    private static bool LooksLikeApprovalGate(PlannerToolResult result) =>
+        result.IsError && result.Summary.StartsWith("Approval required", StringComparison.OrdinalIgnoreCase);
 
-    private static bool LooksLikeApprovalGate(PlannerToolResult result)
-    {
-        return result.Output.StartsWith("Approval required", StringComparison.OrdinalIgnoreCase)
-            || result.Summary.Contains("approval required", StringComparison.OrdinalIgnoreCase)
-            || result.Verification.Contains("approval", StringComparison.OrdinalIgnoreCase);
-    }
-
+    // Some tools just say "returned a success signal"; that proves little, so it is treated as no real verification.
     private static bool IsGenericVerificationText(string verificationText)
     {
         if (string.IsNullOrWhiteSpace(verificationText))
@@ -191,50 +116,10 @@ internal sealed partial class StructuredAssistantPlanner
         return genericPhrases.Any(phrase => verificationText.Contains(phrase, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static double ComputeEvidenceMatchScore(string expectedEvidence, string observedEvidence)
-    {
-        var expectedTokens = TokenizeForVerification(expectedEvidence);
-
-        if (expectedTokens.Count == 0)
-        {
-            return 0;
-        }
-
-        var observedTokens = TokenizeForVerification(observedEvidence);
-
-        if (observedTokens.Count == 0)
-        {
-            return 0;
-        }
-
-        var matches = expectedTokens.Count(token => observedTokens.Contains(token));
-        return matches / (double)expectedTokens.Count;
-    }
-
-    private static HashSet<string> TokenizeForVerification(string value)
-    {
-        var tokens = Regex
-            .Split(value ?? string.Empty, "[^A-Za-z0-9]+")
-            .Select(token => token.Trim().ToLowerInvariant())
-            .Where(token => token.Length >= 3 && !VerificationStopWords.Contains(token))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        return tokens;
-    }
-
-    private static string BuildVerificationDetail(PlannerToolCall toolCall, PlannerToolResult result, string headline)
+    // Builds the one-line detail text from the best available source: verification, then summary, then raw output.
+    private static string BuildVerificationDetail(PlannerToolResult result, string headline)
     {
         var parts = new List<string> { headline };
-
-        if (!string.IsNullOrWhiteSpace(toolCall.Purpose))
-        {
-            parts.Add($"Purpose: {toolCall.Purpose.Trim()}");
-        }
-
-        if (!string.IsNullOrWhiteSpace(toolCall.ExpectedEvidence))
-        {
-            parts.Add($"Expected evidence: {toolCall.ExpectedEvidence.Trim()}");
-        }
 
         if (!string.IsNullOrWhiteSpace(result.Verification))
         {
@@ -252,6 +137,7 @@ internal sealed partial class StructuredAssistantPlanner
         return string.Join(" ", parts);
     }
 
+    // Status text for one tool result, in the shape the plan-step list needs.
     private sealed record ToolVerificationReport(
         string Status,
         string PlanStepStatus,

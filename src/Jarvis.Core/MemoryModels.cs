@@ -1,7 +1,12 @@
+// Plain data shapes for Jarvis's memory system. Nothing here touches disk.
+// JsonMemoryStore.cs stores them, MemoryPolicies.cs and MemorySemanticSearch.cs read them, and the prompt builders call the
+// ToPromptText/ToInlineText methods to turn them into text for the language model. MemoryNote itself lives in AssistantTurn.cs.
+// The 'Safe...' properties exist because records read from an older memory.json can have null arrays.
 using System.Text;
 
 namespace Jarvis.Core;
 
+// A snapshot of Noah's situation when something happened: time of day, location, the active app and window, and recent activity.
 public sealed record InteractionContextSnapshot(
     DateTimeOffset ObservedAtUtc,
     string TimeOfDay = "",
@@ -11,12 +16,16 @@ public sealed record InteractionContextSnapshot(
     string[]? VisibleApps = null,
     string[]? RecentActivity = null)
 {
+    // A shared 'no context' value (its time is when the type was first used).
     public static InteractionContextSnapshot Empty { get; } = new(DateTimeOffset.UtcNow);
 
+    // VisibleApps, or an empty array if it is null.
     public string[] SafeVisibleApps => VisibleApps ?? Array.Empty<string>();
 
+    // RecentActivity, or an empty array if it is null.
     public string[] SafeRecentActivity => RecentActivity ?? Array.Empty<string>();
 
+    // Multi-line version of the context for the language model prompt.
     public string ToPromptText()
     {
         var lines = new List<string>
@@ -33,6 +42,7 @@ public sealed record InteractionContextSnapshot(
         return string.Join(Environment.NewLine, lines);
     }
 
+    // One-line version of the context for logs and tool output; shows at most 3 recent activities.
     public string ToInlineText()
     {
         var parts = new List<string>();
@@ -50,6 +60,7 @@ public sealed record InteractionContextSnapshot(
         return parts.Count == 0 ? "No contextual cues." : string.Join(" | ", parts);
     }
 
+    // Adds 'label value' to the list unless the value is blank.
     private static void AddIfPresent(ICollection<string> parts, string value, string label)
     {
         if (!string.IsNullOrWhiteSpace(value))
@@ -69,10 +80,12 @@ public sealed record InteractionContextSnapshot(
     }
 }
 
+// One key/value fact about an entity, for example label=gym or deviceType=laptop.
 public sealed record MemoryAttribute(
     string Key,
     string Value);
 
+// An 'entity' mentioned in a note (a person, device, project, place...) with alternative names and attributes.
 public sealed record StructuredMemoryReference(
     string Kind,
     string Name,
@@ -80,10 +93,13 @@ public sealed record StructuredMemoryReference(
     string[]? Aliases = null,
     MemoryAttribute[]? Attributes = null)
 {
+    // Aliases, or an empty array if null.
     public string[] SafeAliases => Aliases ?? Array.Empty<string>();
 
+    // Attributes, or an empty array if null.
     public MemoryAttribute[] SafeAttributes => Attributes ?? Array.Empty<MemoryAttribute>();
 
+    // One-line description such as '[Device] Atlas | aliases my laptop | deviceType: laptop'.
     public string ToInlineText()
     {
         var parts = new List<string>
@@ -109,6 +125,7 @@ public sealed record StructuredMemoryReference(
         return string.Join(" | ", parts);
     }
 
+    // Capitalizes the kind for display, or 'Entity' if it is blank.
     private static string NormalizeKind(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -121,6 +138,7 @@ public sealed record StructuredMemoryReference(
     }
 }
 
+// A reminder as shown in the profile: id, text, due time and status.
 public sealed record ReminderSnapshot(
     string Id,
     string Text,
@@ -128,6 +146,7 @@ public sealed record ReminderSnapshot(
     string Status,
     string SourceMemoryId);
 
+// One entity as shown in the profile, with how many times it was seen.
 public sealed record StructuredMemorySummary(
     string Kind,
     string Name,
@@ -135,6 +154,8 @@ public sealed record StructuredMemorySummary(
     int ObservationCount,
     DateTimeOffset LastObservedAtUtc);
 
+// A request to remember something. Only Content is required; JsonMemoryStore and MemoryPolicies fill in the rest
+// (importance, retention, expiry) when they are left empty.
 public sealed record MemoryWriteRequest(
     string Content,
     string Kind = "note",
@@ -155,6 +176,7 @@ public sealed record MemoryWriteRequest(
     string ReminderText = "",
     string ReminderStatus = "");
 
+// A request to change an existing note by id. Unlike a write request, every editable field is supplied (the caller copies the current values).
 public sealed record MemoryUpdateRequest(
     string Id,
     string Content,
@@ -171,6 +193,7 @@ public sealed record MemoryUpdateRequest(
     string ReminderStatus,
     StructuredMemoryReference[]? Entities = null);
 
+// What Jarvis knows about the present moment when it searches memory, so notes learned in a similar situation rank higher.
 public sealed record MemoryQueryContext(
     string Query,
     string TimeOfDay = "",
@@ -182,12 +205,14 @@ public sealed record MemoryQueryContext(
     public string[] SafeRecentActivity => RecentActivity ?? Array.Empty<string>();
 }
 
+// One preference Jarvis has learned, with how often it was seen.
 public sealed record LearnedPreference(
     string Category,
     string Value,
     int ObservationCount,
     DateTimeOffset LastObservedAtUtc);
 
+// The summary of everything Jarvis has learned about Noah: counts plus the top preferences, entities and reminders.
 public sealed record MemoryProfileSnapshot(
     int TotalMemories,
     int PreferenceCount,
@@ -198,6 +223,7 @@ public sealed record MemoryProfileSnapshot(
     StructuredMemorySummary[] StructuredMemories,
     ReminderSnapshot[] PendingReminders)
 {
+    // A profile with nothing in it.
     public static MemoryProfileSnapshot Empty { get; } = new(
         0,
         0,
@@ -208,6 +234,7 @@ public sealed record MemoryProfileSnapshot(
         Array.Empty<StructuredMemorySummary>(),
         Array.Empty<ReminderSnapshot>());
 
+    // Compact profile for the language model: counts, up to 3 items per preference category, per entity kind, and up to 4 reminders.
     public string ToPromptText()
     {
         var builder = new StringBuilder();
@@ -254,6 +281,7 @@ public sealed record MemoryProfileSnapshot(
         return builder.ToString().TrimEnd();
     }
 
+    // Longer profile for showing to the user: up to 4 items per category and 6 reminders; empty categories are left out.
     public string ToDisplayText()
     {
         var lines = new List<string>
@@ -312,11 +340,13 @@ public sealed record MemoryProfileSnapshot(
         return string.Join(Environment.NewLine, lines);
     }
 
+    // One bullet line for a preference.
     private static string RenderPreference(LearnedPreference preference)
     {
         return $"- {preference.Value} | seen {preference.ObservationCount} time(s) | last observed {preference.LastObservedAtUtc:yyyy-MM-dd HH:mm}Z";
     }
 
+    // One bullet line for an entity.
     private static string RenderStructuredMemory(StructuredMemorySummary summary)
     {
         var content = string.IsNullOrWhiteSpace(summary.Summary)
@@ -325,16 +355,19 @@ public sealed record MemoryProfileSnapshot(
         return $"- {content} | seen {summary.ObservationCount} time(s) | last observed {summary.LastObservedAtUtc:yyyy-MM-dd HH:mm}Z";
     }
 
+    // One bullet line for a reminder, with the due time in local time.
     private static string RenderReminder(ReminderSnapshot reminder)
     {
         return $"- {reminder.Text} | due {reminder.ReminderAtUtc.ToLocalTime():yyyy-MM-dd h:mm tt} | status {NormalizeStatus(reminder.Status)}";
     }
 
+    // Lower-cases the reminder status, defaulting to 'pending'.
     private static string NormalizeStatus(string value)
     {
         return string.IsNullOrWhiteSpace(value) ? "pending" : value.Trim().ToLowerInvariant();
     }
 
+    // Capitalizes the first letter and lower-cases the rest.
     private static string TitleCase(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -346,6 +379,7 @@ public sealed record MemoryProfileSnapshot(
         return char.ToUpperInvariant(trimmed[0]) + trimmed[1..];
     }
 
+    // The order in which preference categories appear in the profile text.
     private static readonly string[] OrderedPreferenceCategories =
     [
         "tone",
@@ -362,6 +396,7 @@ public sealed record MemoryProfileSnapshot(
         "other"
     ];
 
+    // The order in which entity kinds appear in the profile text.
     private static readonly string[] OrderedStructuredKinds =
     [
         "relationship",
@@ -375,13 +410,3 @@ public sealed record MemoryProfileSnapshot(
         "other"
     ];
 }
-
-public sealed record MemoryImportResult(
-    int ImportedCount,
-    int SkippedCount,
-    string SummaryText);
-
-public sealed record TranscriptImportResult(
-    int ImportedCount,
-    int SkippedCount,
-    string SummaryText);

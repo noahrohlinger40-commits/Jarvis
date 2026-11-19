@@ -1,3 +1,6 @@
+// Win32UiAutomation.Advanced.cs: second slice of Win32UiAutomation. It lists windows, moves/resizes/snaps them, sends media keys
+// (play, volume...) and reads/writes the Windows clipboard. Called from DesktopAutomationService (DesktopAutomation.cs); it reuses the
+// window matching, key-sending and name helpers from Win32UiAutomation.cs. The clipboard code talks to the raw Windows clipboard API.
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -6,10 +9,15 @@ namespace Jarvis.Core;
 
 internal static partial class Win32UiAutomation
 {
+    // MonitorFromWindow flag 2 = "if the window is on no screen, use the nearest one".
     private const uint MonitorDefaultToNearest = 2;
+    // Clipboard format number 13 = CF_UNICODETEXT, plain Unicode text.
     private const uint CfUnicodeText = 13;
+    // GlobalAlloc flag 0x0002 = GMEM_MOVEABLE; the clipboard requires memory allocated this way.
     private const uint GmemMoveable = 0x0002;
+    // Longest clipboard text returned to the model, so a huge copy cannot flood it.
     private const int ClipboardPreviewLimit = 4000;
+    // Virtual-key codes for the keyboard's media keys (0xAD mute, 0xAE volume down, 0xAF volume up, 0xB0 next, 0xB1 previous, 0xB2 stop, 0xB3 play/pause).
     private const ushort VkVolumeMute = 0xAD;
     private const ushort VkVolumeDown = 0xAE;
     private const ushort VkVolumeUp = 0xAF;
@@ -18,56 +26,72 @@ internal static partial class Win32UiAutomation
     private const ushort VkMediaStop = 0xB2;
     private const ushort VkMediaPlayPause = 0xB3;
 
+    // P/Invoke declarations (Windows API calls). EnumWindows: calls our function once for every top-level window on the desktop.
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
+    // IsWindowVisible: true if the window is shown (not hidden).
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
+    // GetWindowRect: the window's position and size on screen, as left/top/right/bottom.
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
+    // MoveWindow: sets a window's position and size in one call; the last argument asks it to repaint.
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool MoveWindow(IntPtr hWnd, int x, int y, int nWidth, int nHeight, [MarshalAs(UnmanagedType.Bool)] bool bRepaint);
 
+    // GetForegroundWindow: the window the user is currently using.
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
+    // GetWindowThreadProcessId: given a window, returns the id of the process that owns it.
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+    // MonitorFromWindow: which screen (monitor) a window is on.
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint dwFlags);
 
+    // GetMonitorInfo: size of a screen, including its "work area" (the part not covered by the taskbar).
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 
+    // The clipboard calls: OpenClipboard takes exclusive use of the clipboard (only one program may at a time) and CloseClipboard releases it.
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool OpenClipboard(IntPtr hWndNewOwner);
 
+    // CloseClipboard: gives the clipboard back to other programs.
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseClipboard();
 
+    // EmptyClipboard: removes everything on the clipboard and makes us its owner.
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EmptyClipboard();
 
+    // GetClipboardData: gets a handle to the clipboard contents in the given format.
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetClipboardData(uint uFormat);
 
+    // SetClipboardData: puts our memory block on the clipboard; Windows owns the memory afterwards.
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
 
+    // IsClipboardFormatAvailable: true if the clipboard currently holds that kind of data (here: text).
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsClipboardFormatAvailable(uint format);
 
+    // GlobalAlloc / GlobalLock / GlobalUnlock / GlobalFree: the old Windows memory calls the clipboard uses. Alloc reserves a block, Lock gives a usable pointer to it,
+    // Unlock hands it back, Free releases it (only needed if the clipboard did not take ownership).
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
 
@@ -81,6 +105,7 @@ internal static partial class Win32UiAutomation
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GlobalFree(IntPtr hMem);
 
+    // Windows' MONITORINFO structure: rcMonitor is the whole screen, rcWork is the usable area without the taskbar. cbSize must be set to the struct's size before the call.
     [StructLayout(LayoutKind.Sequential)]
     private struct MONITORINFO
     {
@@ -90,8 +115,10 @@ internal static partial class Win32UiAutomation
         public uint dwFlags;
     }
 
+    // Callback shape for EnumWindows; returning true keeps the enumeration going.
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
+    // Tool: list visible windows (up to 20) with program name and size/position. With a name, only matching windows, best first; the active window is marked.
     public static Task<string> ListWindowsAsync(string target)
     {
         var windows = EnumerateTopLevelWindows();
@@ -151,6 +178,7 @@ internal static partial class Win32UiAutomation
         return Task.FromResult(string.Join(Environment.NewLine, lines));
     }
 
+    // Tool: move a window to x,y. It is restored first (a maximised window cannot be moved), and the size is kept (at least 120 pixels).
     public static Task<string> MoveWindowAsync(string targetApp, int x, int y)
     {
         if (!TryResolveWindow(targetApp, out var window))
@@ -172,6 +200,7 @@ internal static partial class Win32UiAutomation
         return Task.FromResult($"Moved '{DescribeWindow(window)}' to {x},{y} with size {width}x{height}.");
     }
 
+    // Tool: resize a window, keeping its top-left corner. Sizes are clamped to at least 160 x 120 so a window cannot vanish.
     public static Task<string> ResizeWindowAsync(string targetApp, int width, int height)
     {
         if (!TryResolveWindow(targetApp, out var window))
@@ -193,6 +222,7 @@ internal static partial class Win32UiAutomation
         return Task.FromResult($"Resized '{DescribeWindow(window)}' to {width}x{height}.");
     }
 
+    // Tool: snap a window to a part of the screen of the monitor it is on (halves, corners, centre), like Windows' snap but exact.
     public static Task<string> SnapWindowAsync(string targetApp, string position)
     {
         if (!TryResolveWindow(targetApp, out var window))
@@ -216,6 +246,7 @@ internal static partial class Win32UiAutomation
         return Task.FromResult($"Snapped '{DescribeWindow(window)}' to {normalizedPosition} ({width}x{height} @ {x},{y}).");
     }
 
+    // Tool: press a media key one or more times (up to 10, so "volume up 5" works).
     public static Task<string> ControlMediaAsync(string command)
     {
         if (!TryResolveMediaCommand(command, out var virtualKey, out var count, out var description))
@@ -237,6 +268,7 @@ internal static partial class Win32UiAutomation
         return Task.FromResult(response);
     }
 
+    // Tool: read the clipboard text for the model, truncated at 4000 characters.
     public static Task<string> GetClipboardTextAsync()
     {
         if (!TryReadClipboardText(out var text, out var error))
@@ -255,6 +287,7 @@ internal static partial class Win32UiAutomation
         return Task.FromResult($"Clipboard text ({text.Length} chars):{Environment.NewLine}{preview}");
     }
 
+    // Tool: put text on the clipboard.
     public static Task<string> SetClipboardTextAsync(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -268,6 +301,7 @@ internal static partial class Win32UiAutomation
                 : error);
     }
 
+    // Tool: empty the clipboard.
     public static Task<string> ClearClipboardAsync()
     {
         return Task.FromResult(
@@ -276,11 +310,13 @@ internal static partial class Win32UiAutomation
                 : error);
     }
 
+    // Reads clipboard text for other code in the project (clipboard history), without the wording of the tool reply.
     public static bool TryGetClipboardText(out string text, out string error)
     {
         return TryReadClipboardText(out text, out error);
     }
 
+    // Tool: paste into a window by focusing it and sending Ctrl+V. The 120 ms wait lets focus settle first.
     public static async Task<string> PasteClipboardAsync(string targetApp)
     {
         if (!TryResolveWindow(targetApp, out var window))
@@ -308,11 +344,13 @@ internal static partial class Win32UiAutomation
         return $"Pasted clipboard contents into '{DescribeWindow(window)}'.";
     }
 
+    // Collects all visible top-level windows that have a title and a known program. Windows without a title (hidden helper windows) are skipped.
     private static IReadOnlyList<WindowMatch> EnumerateTopLevelWindows()
     {
         var windows = new List<WindowMatch>();
         var foreground = GetForegroundWindow();
 
+        // EnumWindows calls this lambda for each window; returning true tells Windows to keep going.
         _ = EnumWindows(
             (handle, _) =>
             {
@@ -343,6 +381,7 @@ internal static partial class Win32UiAutomation
         return windows;
     }
 
+    // Looks up which program owns a window; empty when Windows will not tell us (for example, protected system processes).
     private static string TryGetProcessName(IntPtr handle)
     {
         try
@@ -363,6 +402,7 @@ internal static partial class Win32UiAutomation
         }
     }
 
+    // Works out the screen rectangle for a snap position on the window's monitor, using the work area so it never covers the taskbar. Half sizes have minimums so tiny screens still work.
     private static bool TryResolveSnapBounds(
         IntPtr handle,
         string position,
@@ -438,6 +478,7 @@ internal static partial class Win32UiAutomation
                 width = halfWidth;
                 height = halfHeight;
                 return true;
+            // "center" is 80% of the work area (at least 420 x 320) centred on screen.
             case "center":
                 width = Math.Max(420, (int)Math.Round(fullWidth * 0.8));
                 height = Math.Max(320, (int)Math.Round(fullHeight * 0.8));
@@ -449,6 +490,7 @@ internal static partial class Win32UiAutomation
         }
     }
 
+    // Gets the usable area of the monitor the window is on.
     private static bool TryGetMonitorWorkArea(IntPtr handle, out RECT workArea)
     {
         workArea = default;
@@ -473,6 +515,7 @@ internal static partial class Win32UiAutomation
         return true;
     }
 
+    // Accepts spoken variants ("upper left", "dock left", "middle") and returns the standard position name, or empty if unknown.
     private static string NormalizeSnapPosition(string position)
     {
         var normalized = NormalizeForMatching(position);
@@ -492,6 +535,7 @@ internal static partial class Win32UiAutomation
         };
     }
 
+    // Understands media words ("next", "louder", "volume up 3"). A trailing number is the repeat count, limited to 1..10; returns the key code and a description for the reply.
     private static bool TryResolveMediaCommand(string command, out ushort virtualKey, out int count, out string description)
     {
         var normalized = NormalizeForMatching(command);
@@ -567,6 +611,7 @@ internal static partial class Win32UiAutomation
         }
     }
 
+    // Presses and releases one key through SendInput (the real keyboard path, which the media keys need).
     private static bool TrySendVirtualKey(ushort virtualKey, out string error)
     {
         var inputs = new[]
@@ -587,6 +632,8 @@ internal static partial class Win32UiAutomation
         return true;
     }
 
+    // Reads the clipboard text. The clipboard must be opened, the data handle locked to get a real pointer, copied as a Unicode string, then unlocked and the clipboard closed.
+    // If the clipboard has no text, it returns true with empty text rather than an error.
     private static bool TryReadClipboardText(out string text, out string error)
     {
         text = string.Empty;
@@ -635,6 +682,8 @@ internal static partial class Win32UiAutomation
         }
     }
 
+    // Writes text to the clipboard. The text (plus a terminating zero) is copied into a movable global memory block which is then handed to Windows with SetClipboardData.
+    // After a successful hand-over Windows owns the memory, so globalHandle is cleared to avoid freeing it; otherwise the finally block frees it.
     private static bool TryWriteClipboardText(string text, out string error)
     {
         error = string.Empty;
@@ -700,6 +749,7 @@ internal static partial class Win32UiAutomation
         }
     }
 
+    // Empties the clipboard.
     private static bool TryClearClipboard(out string error)
     {
         if (!TryOpenClipboard(out error))
@@ -723,6 +773,7 @@ internal static partial class Win32UiAutomation
         }
     }
 
+    // Opens the clipboard, retrying up to 5 times 40 ms apart, because another program may be using it for a moment.
     private static bool TryOpenClipboard(out string error)
     {
         for (var attempt = 0; attempt < 5; attempt++)
@@ -740,6 +791,7 @@ internal static partial class Win32UiAutomation
         return false;
     }
 
+    // Text like "800x600 @ 100,50" (size @ top-left position).
     private static string DescribeBounds(RECT bounds)
     {
         var width = Math.Max(0, bounds.Right - bounds.Left);
