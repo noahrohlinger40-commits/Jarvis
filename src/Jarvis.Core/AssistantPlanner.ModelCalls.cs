@@ -15,6 +15,8 @@ internal sealed partial class StructuredAssistantPlanner
         ModelRoute route,
         CancellationToken cancellationToken)
     {
+        // The escalation planner sends everything down one route (Deep), whatever the caller asked for.
+        route = _routeOverride ?? route;
         // PlannerRetryCount is the number of extra tries, so the total is that plus the first attempt (never fewer than one).
         var totalAttempts = Math.Max(1, _options.PlannerRetryCount + 1);
         Exception? lastError = null;

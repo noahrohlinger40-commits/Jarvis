@@ -1,6 +1,6 @@
 // ApiKeyResolution.cs: finds an API key (for the model, speech or voice services) without keeping secrets in the
 // settings file. ApiKeyResolver is called from ModelGateway.cs and the speech/voice code; WindowsCredentialStore is
-// the small Windows Credential Manager wrapper it uses. Local LM Studio needs no key, so this often returns empty.
+// the small Windows Credential Manager wrapper it uses. A local llama-server needs no key, so this often returns empty.
 using System.Runtime.InteropServices;
 using System.Text;
 

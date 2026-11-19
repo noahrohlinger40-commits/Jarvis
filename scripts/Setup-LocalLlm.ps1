@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Sets up Jarvis's own language-model engine (llama.cpp's llama-server) so it no longer needs LM Studio.
+  Sets up Jarvis's own language-model engine (llama.cpp's llama-server) as the only local model server Jarvis uses.
 
 .DESCRIPTION
   Downloads the newest llama.cpp Windows CUDA 12 build (plus the matching CUDA runtime DLLs) and puts a
@@ -15,8 +15,8 @@
 
 .PARAMETER ModelPath
   A .gguf file to install as planner.gguf (for example a fine-tuned model). It replaces the current one.
-  Without it, planner.gguf is only created when missing, from the LM Studio copy of Qwen3-4B-Instruct-2507
-  (Q4_K_M) if present, otherwise downloaded from Hugging Face (about 2.5 GB).
+  Without it, planner.gguf is only created when missing, by downloading Qwen3-4B-Instruct-2507 (Q4_K_M)
+  from Hugging Face (about 2.5 GB).
 
 .PARAMETER LlmHome
   Where the engine and model live. Jarvis looks in the default location, so only change this if
@@ -25,7 +25,7 @@
 .PARAMETER Force
   Download the engine again even if llama-server.exe is already installed.
 #>
-# Header: one-time setup for Jarvis's own language-model server, so it no longer needs LM Studio. It installs
+# Header: one-time setup for Jarvis's own language-model server. It installs
 # llama.cpp's llama-server.exe (the program that runs the model) and a planner.gguf model file. Jarvis starts
 # that server itself afterwards; this script only prepares the files. Safe to run again.
 [CmdletBinding()]
@@ -41,9 +41,8 @@ $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is far faster wit
 $binDir = Join-Path $LlmHome 'bin'
 $server = Join-Path $binDir 'llama-server.exe'
 $versionFile = Join-Path $binDir 'version.txt'
-# planner.gguf is the model file Jarvis loads. The LM Studio path is a copy that may already be on this PC (saves a 2.5 GB download); the URL is the fallback.
+# planner.gguf is the model file Jarvis loads. The URL is where a missing model is downloaded from.
 $planner = Join-Path $LlmHome 'planner.gguf'
-$lmStudioModel = Join-Path $env:USERPROFILE '.lmstudio\models\lmstudio-community\Qwen3-4B-Instruct-2507-GGUF\Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
 $modelUrl = 'https://huggingface.co/lmstudio-community/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf'
 
 Write-Host "Installing into $LlmHome"
@@ -90,7 +89,7 @@ else {
     $tag = $release.tag_name
 }
 
-# Step 2: the model file. Order of preference: the file you passed in, one already installed, the LM Studio copy, a fresh download.
+# Step 2: the model file. Order of preference: the file you passed in, one already installed, a fresh download.
 Write-Host '2/2 Model...'
 if ($ModelPath) {
     if (-not (Test-Path $ModelPath -PathType Leaf)) { throw "ModelPath '$ModelPath' is not a file." }
@@ -100,10 +99,6 @@ if ($ModelPath) {
 # A real model is gigabytes; anything under 100 MB is treated as missing or damaged.
 elseif ((Test-Path $planner) -and (Get-Item $planner).Length -gt 100MB) {
     Write-Host '  planner.gguf already present, skipped.'
-}
-elseif (Test-Path $lmStudioModel) {
-    Copy-Item $lmStudioModel $planner -Force
-    Write-Host '  copied the Qwen3-4B-Instruct-2507 model from LM Studio.'
 }
 else {
     Write-Host '  downloading Qwen3-4B-Instruct-2507 Q4_K_M (about 2.5 GB)...'
@@ -125,4 +120,4 @@ Write-Host ''
 Write-Host "engine:  $server"
 Write-Host "model:   $planner ($([math]::Round((Get-Item $planner).Length / 1GB, 2)) GB)"
 Write-Host "version: $tag"
-Write-Host 'Jarvis can now start its own model server; LM Studio is not needed.'
+Write-Host 'Jarvis can now start its own model server.'

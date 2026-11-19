@@ -2,7 +2,7 @@
 // (next to the project) into this type in JarvisSettingsLoader.cs; each property here matches a camelCase JSON key
 // (PlannerBaseUrl is "plannerBaseUrl"). Any key missing from the file keeps the default written below.
 // The defaults are generic (for example the OpenAI URL); the shipped jarvis.settings.json overrides the Planner*
-// settings to use a local LM Studio server. The small records after JarvisOptions are list items stored inside it.
+// settings to use Jarvis's own local llama-server. The small records after JarvisOptions are list items stored inside it.
 namespace Jarvis.Core;
 
 // All settings. "init" means a value is set once when loaded; changing a setting creates a new copy (use "with").
@@ -173,10 +173,10 @@ public sealed record JarvisOptions
     // The "planner" is the language model that decides what Jarvis does. The settings below choose which server and models it uses (see ModelGateway.cs).
     public bool PlannerEnabled { get; init; } = true;
 
-    // "local" is a server on this PC (LM Studio); "openai" or "openai-compatible" is a hosted or other OpenAI-style server.
+    // "local" is a server on this PC (Jarvis's llama-server); "openai" or "openai-compatible" is a hosted or other OpenAI-style server.
     public string PlannerProvider { get; init; } = "openai-compatible";
 
-    // Server address. For LM Studio use http://127.0.0.1:1234 ("/v1" is added automatically).
+    // Server address. For the local engine use http://127.0.0.1:8179 ("/v1" is added automatically).
     public string PlannerBaseUrl { get; init; } = "https://api.openai.com/v1";
 
     // Model names per route: general, fast, reasoning and vision. Empty ones fall back to another route's model.
@@ -190,6 +190,12 @@ public sealed record JarvisOptions
 
     /// <summary>Model for slow, off-turn thinking (brain think). Empty keeps it on the reasoning model.</summary>
     public string PlannerDeepModel { get; init; } = string.Empty;
+
+    /// <summary>Address of the bigger local model server used only when Jarvis's own model gets stuck (LM Studio's default port).</summary>
+    public string PlannerEscalationBaseUrl { get; init; } = "http://127.0.0.1:1234";
+
+    /// <summary>Model asked once when the own model is stuck on a request that changed nothing. Empty turns escalation off.</summary>
+    public string PlannerEscalationModel { get; init; } = string.Empty;
 
     // API key lookup: typed value, then Credential Manager entry, then environment variable. Not needed for local servers.
     public string PlannerApiKey { get; init; } = string.Empty;

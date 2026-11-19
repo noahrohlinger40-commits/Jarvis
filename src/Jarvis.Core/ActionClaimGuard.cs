@@ -60,8 +60,7 @@ public static class ActionClaimGuard
 
     /// <summary>True when any tool this turn actually did something: not read-only (screen, notes, status...) and not an error.</summary>
     public static bool Acted(IEnumerable<PlannerToolResult> toolResults) =>
-        toolResults.Any(result => !result.IsError
-            && (RealWork.Contains(result.ApiName) || !ToolSafetyService.IsReadOnlyCall(result.ApiName, result.Command)));
+        toolResults.Any(result => !result.IsError && (RealWork.Contains(result.ApiName) || ToolSafetyService.ActedSuccessfully(result)));
 
     // True when the reply reads like a claimed action. Normalises curly apostrophes first so "I’ve" matches "I've".
     public static bool IsUnverifiedClaim(string reply)

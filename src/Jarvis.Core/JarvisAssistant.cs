@@ -8,7 +8,7 @@
 // Every tool call goes through ExecuteToolWithSafetyAsync, which asks ToolSafetyService to allow, block or require approval.
 // 4. Otherwise a small social reply ("good morning") may be answered, or the text goes to the planner
 // (HandleWithPlannerAsync -> AssistantPlanner.cs). The planner may classify the request (AssistantPlanner.Intents.cs),
-// build prompts (AssistantPlanner.Formatting.cs), call the language model, a local server such as Jarvis's own llama-server or LM Studio (AssistantPlanner.ModelCalls.cs),
+// build prompts (AssistantPlanner.Formatting.cs), call the language model, a local server such as Jarvis's own llama-server (AssistantPlanner.ModelCalls.cs),
 // and run the tools the model picks by calling back into ExecutePlannerToolAsync here (tool-call parsing is in
 // AssistantPlanner.ToolCalling.cs, multi-part requests in AssistantPlanner.Checklist.cs). ActionClaimGuard.cs catches replies
 // that claim an action no tool performed.

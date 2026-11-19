@@ -4,7 +4,7 @@
 //   2. This file runs: sets up WinForms and installs crash handlers that write to data/startup-error.log.
 //   3. AppBootstrapper.CreateAsync (AppBootstrapper.cs) loads jarvis.settings.json, starts the local speech
 //      (Whisper) server in the background, makes sure the local language model server is answering (Jarvis's own
-//      llama-server if installed, otherwise LM Studio) and sends it a tiny warm-up request, then builds the
+//      llama-server) and sends it a tiny warm-up request, then builds the
 //      assistant, speaker and voice runtime and returns them bundled as a JarvisDesktopContext.
 //   4. Application.Run opens JarvisMainForm (the JarvisMainForm.*.cs files) and blocks until the window closes.
 // If any startup step throws, the error is logged and shown in a message box instead of the window opening.

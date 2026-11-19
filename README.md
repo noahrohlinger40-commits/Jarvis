@@ -75,33 +75,32 @@ Jarvis can now run in two modes:
 - Agent mode: spoken or typed natural language is routed through a structured tool-using runtime that can classify intent, route across fast and reasoning models, call tools directly, reflect on tool results, ask follow-up questions, stream runtime events to the UI, and then reply
 - The runtime is grounded with short-term session state, recent saved memory, learned user preferences, pending reminders, recent turns, recent tool results, local user state, and a live computer-context snapshot so it can reason about what is open, what app you are in, and what is happening in the workspace before it decides which tools to call
 
-Recommended LM Studio planner settings:
+Recommended planner settings (Jarvis's own llama-server on port 8179):
 
 ```json
 {
   "plannerEnabled": true,
   "plannerProvider": "local",
-  "plannerBaseUrl": "http://127.0.0.1:1234",
-  "plannerModel": "qwen3.5-27b-claude-4.6-opus-reasoning-distilled",
-  "plannerFastModel": "qwen3.5-27b-claude-4.6-opus-reasoning-distilled",
-  "plannerReasoningModel": "qwen3.5-27b-claude-4.6-opus-reasoning-distilled",
-  "plannerVisionModel": "qwen3.5-27b-claude-4.6-opus-reasoning-distilled",
-  "plannerLocalContextLength": 16384,
+  "plannerBaseUrl": "http://127.0.0.1:8179",
+  "plannerModel": "qwen/qwen3-4b-2507",
+  "plannerFastModel": "qwen/qwen3-4b-2507",
+  "plannerReasoningModel": "qwen/qwen3-4b-2507",
+  "plannerDeepModel": "",
+  "plannerLocalContextLength": 8192,
   "plannerMaxIterations": 3
 }
 ```
 
 Notes:
 
-- for LM Studio, Jarvis accepts the root server URL like `http://127.0.0.1:1234` and normalizes it to the OpenAI-compatible `/v1` routes internally
-- when LM Studio's `lms.exe` CLI is available, Jarvis starts the local server and loads the configured model automatically during startup
-- on startup, Jarvis now verifies the loaded LM Studio context size and reloads the planner model with `plannerLocalContextLength` if the current load is too small
+- Jarvis accepts the root server URL like `http://127.0.0.1:8179` and normalizes it to the OpenAI-compatible `/v1` routes internally
+- at startup Jarvis starts its own `llama-server` on that address with `plannerLocalContextLength` as the context size (see "Local Language Model" below); if nothing answers and the engine cannot start, startup stops with a message
 - when the planner points at a loopback local model, Jarvis now waits for the model to appear and runs a short warm-up request before the main window opens
 - local loopback planners use smaller route-based `max_tokens` caps to keep thinking-model replies from stalling on long internal reasoning
-- `plannerDeepModel` (optional) is a bigger, slower model used only by `brain think`; every live turn stays on `plannerReasoningModel`. LM Studio loads it on first use and unloads it after an idle hour
+- `plannerDeepModel` (optional) is a bigger, slower model used only by `brain think`; every live turn stays on `plannerReasoningModel`. Left empty, `brain think` runs on the reasoning model (the local 4B), because the engine serves one model
 - `speechRecognitionWakeEnginePath` points at `data\wake-engines\openwakeword-hey-jarvis.json`: each utterance without the name in its transcript is scored by openWakeWord's `hey_jarvis` model through the speech server's `/v1/wake`, and a detection only opens the follow-up window. Clear the setting to go back to transcript-only wake
 - if the local planner cannot warm up, Jarvis stops startup and shows an error instead of opening half-ready
-- local OpenAI-compatible endpoints such as LM Studio and Ollama are supported
+- the planner can also point at another local OpenAI-compatible endpoint, such as Ollama
 - `plannerApiKey` can still be set if your local gateway expects one, but it is optional for most loopback setups
 - when the planner is off or misconfigured, Jarvis falls back to direct commands and heuristic routing only
 - set `defaultWeatherLocation` if you want `Jarvis, what's the weather?` to work without specifying a city
@@ -141,15 +140,25 @@ How it behaves:
 - To use a cloud service instead, set `speechRecognitionBaseUrl` back to `https://api.openai.com/v1` with a key as described below.
 - If the server has not been set up or is not running, the voice status says "The local speech server is not running" and Jarvis cannot turn your voice into text. Check `%LOCALAPPDATA%\Jarvis\data\whisper-server.log` or run the setup script.
 
-## Local Model Without LM Studio
+## Local Language Model
 
-Jarvis can run its own local language model with llama.cpp, so LM Studio is optional.
+Jarvis runs its own local language model with llama.cpp.
 
 ```powershell
 .\scripts\Setup-LocalLlm.ps1
 ```
 
-Run that once. It installs `llama-server.exe` and a model to `%LOCALAPPDATA%\Jarvis\llm`, and from then on Jarvis starts `llama-server` itself on the planner address at launch and stops it when it exits. Output goes to `%LOCALAPPDATA%\Jarvis\data\llm-server.log`. If something is already answering on the planner address, such as LM Studio, Jarvis uses that instead, and it falls back to LM Studio when the setup script has not been run. To swap in a different model, for example a fine-tuned one, run `.\scripts\Setup-LocalLlm.ps1 -ModelPath <file.gguf>`.
+Run that once. It installs `llama-server.exe` and a model to `%LOCALAPPDATA%\Jarvis\llm`, and from then on Jarvis starts `llama-server` itself on the planner address at launch and stops it when it exits. Output goes to `%LOCALAPPDATA%\Jarvis\data\llm-server.log`. If something is already answering on the planner address, such as an engine left over from a crash, Jarvis reuses it. If the setup script has not been run, Jarvis logs that to the same file and stops startup with a message. To swap in a different model, for example a fine-tuned one, run `.\scripts\Setup-LocalLlm.ps1 -ModelPath <file.gguf>`.
+
+### Handing a stuck request to a bigger model
+
+Jarvis's own model always answers first. If a planner turn ends stuck, the same request goes once to a bigger local model, by default `openai/gpt-oss-20b` in LM Studio. A turn counts as stuck when the honesty gate replaced the reply (it claimed an action no tool performed), the planner used all `plannerMaxIterations` without a final answer, or the model gave no usable reply (empty with no tool run, or the call failed after `plannerRetryCount` retries). It does not count when the answer was a correct "found nothing", or when you cancelled. When the model itself says "I can't do that yet", the request is only written to the log, not handed off.
+
+- `plannerEscalationBaseUrl` (default `http://127.0.0.1:1234`) and `plannerEscalationModel` (default `openai/gpt-oss-20b` in `jarvis.settings.json`). Leave the model empty to turn this off. The address must pass the same local-only check as the planner.
+- The bigger model runs the same tools, approval prompts, safety checks and honesty gate. The whole hand-off, server start included, gets 150 seconds; after that you keep the own model's reply (with one line naming anything the bigger model had already done). Each model call also has the Deep route's own 5-minute limit.
+- It is tried only if no tool that changes the computer has already succeeded (so an action is never done twice), no approval is waiting for you, and `brain think` did not run. It happens at most once per request.
+- If nothing answers on that address, Jarvis runs `lms server start` once (up to 20 seconds, and it stops at once if `lms` reports an error) and then waits up to 20 seconds. LM Studio loads the model on demand. If anything fails, you keep the own model's reply.
+- Every stuck turn, handed off or not (with the reason), is appended to `%LOCALAPPDATA%\Jarvis\data\escalations.jsonl`: time, your request, why it was stuck, both replies, the tools each model called, success and seconds. A request that looks sensitive (a password or key) is logged as "(sensitive, not saved)". It is the list of what Jarvis cannot do yet.
 
 ## Where Jarvis Keeps Your Data
 

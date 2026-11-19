@@ -9,7 +9,7 @@ namespace Jarvis.Core;
 public static class LocalAiPolicy
 {
     // True only for an http/https URL with no embedded user:password whose host is localhost or a loopback IP
-    // (127.0.0.1, ::1). Example: "http://localhost:1234/v1" passes, "http://192.168.1.5:1234" does not.
+    // (127.0.0.1, ::1). Example: "http://localhost:8179/v1" passes, "http://192.168.1.5:8179" does not.
     public static bool IsLoopbackHttpEndpoint(string? address)
     {
         if (!Uri.TryCreate(address, UriKind.Absolute, out var uri)

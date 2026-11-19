@@ -90,14 +90,15 @@ public static class AssistantPlannerFactory
         JarvisOptions options,
         IModelGateway modelGateway,
         IAgentStateStore stateStore,
-        IWebResearchService webResearchService)
+        IWebResearchService webResearchService,
+        IModelGateway? escalationGateway = null)
     {
         if (!options.PlannerEnabled)
         {
             return new DisabledAssistantPlanner("disabled in settings");
         }
 
-        return new StructuredAssistantPlanner(options, modelGateway, stateStore, webResearchService);
+        return new StructuredAssistantPlanner(options, modelGateway, stateStore, webResearchService, escalationGateway);
     }
 }
 
@@ -138,6 +139,10 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
     private readonly IModelGateway _modelGateway;
     private readonly IAgentStateStore _stateStore;
     private readonly IWebResearchService _webResearchService;
+    // Only set on the escalation planner: every model call it makes uses this route (Deep: its timeout and token cap).
+    private readonly ModelRoute? _routeOverride;
+    // The planner on the bigger model, or null when escalation is off (see AssistantPlanner.Escalation.cs).
+    private readonly StructuredAssistantPlanner? _escalation;
     // One background budget and task map per process: the app rebuilds the assistant on many settings changes
     // while background jobs keep running. ponytail: capacity is fixed at first use, so changing
     // PlannerMaxConcurrentBackgroundTasks takes effect on restart.
@@ -150,12 +155,19 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
         JarvisOptions options,
         IModelGateway modelGateway,
         IAgentStateStore stateStore,
-        IWebResearchService webResearchService)
+        IWebResearchService webResearchService,
+        IModelGateway? escalationGateway = null,
+        ModelRoute? routeOverride = null)
     {
         _options = options;
         _modelGateway = modelGateway;
         _stateStore = stateStore;
         _webResearchService = webResearchService;
+        _routeOverride = routeOverride;
+        // The second planner is the same class on the escalation gateway; it has no escalation of its own, so a request escalates at most once.
+        _escalation = escalationGateway is null
+            ? null
+            : new StructuredAssistantPlanner(options, escalationGateway, stateStore, webResearchService, null, ModelRoute.Deep);
         _backgroundScheduler = LazyInitializer.EnsureInitialized(ref _sharedBackgroundScheduler,
             () => new ModelWorkScheduler(Math.Clamp(options.PlannerMaxConcurrentBackgroundTasks, 1, 4), maxWaiting: 16));
     }
@@ -365,8 +377,9 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
             intentDecision = intentDecision with { Intent = AgentIntentKind.Planner, Reason = "research found nothing" };
         }
 
-        // Default route: the full ask-model, run-tools, repeat loop.
-        return await ExecutePlannedSessionAsync(
+        // Default route: the full ask-model, run-tools, repeat loop. When it ends stuck, the bigger model may get one try (see AssistantPlanner.Escalation.cs).
+        var stuck = new StuckNotes();
+        var planned = await ExecutePlannedSessionAsync(
             effectiveRequest,
             sessionId,
             intentDecision,
@@ -374,7 +387,12 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
             activity,
             resumedSession,
             false,
-            cancellationToken);
+            cancellationToken,
+            stuck);
+
+        return stuck.Reason is null || resumedSession is not null
+            ? planned
+            : await EscalateIfStuckAsync(effectiveRequest, sessionId, intentDecision, executeToolAsync, activity, planned, stuck.Reason, cancellationToken);
     }
 
     // Replan after a failed direct tool call, except for "write down", whose error message should reach the user as it is.
@@ -569,7 +587,8 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
         IProgress<AssistantActivityEvent> activity,
         PersistedAgentSession? existingSession,
         bool runInBackground,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        StuckNotes? stuck = null)
     {
         // Start from any saved results if this is a resumed workflow.
         var toolResults = existingSession?.ToolResults.Select(ToPlannerToolResult).ToList() ?? new List<PlannerToolResult>();
@@ -644,7 +663,9 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
                 steps[^1] = steps[^1] with { Status = "failed", Detail = TrimError(exception.Message) };
-                return await BuildFallbackPlannedResultAsync(request, sessionId, toolResults, citations, exception.Message, cancellationToken);
+                // Stuck signal (c): the model call failed on every retry.
+                stuck?.Note($"the model call failed ({exception.GetType().Name}): {TrimError(exception.Message)}");
+                return await BuildFallbackPlannedResultAsync(request, sessionId, toolResults, citations, exception.Message, cancellationToken, stuck);
             }
 
             steps[^1] = steps[^1] with
@@ -674,10 +695,17 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
                         continue;
                     }
                     content = ActionClaimGuard.HonestReplyAfter(toolResults);
+                    // Stuck signal (a): the honesty gate replaced the reply. "I searched your files and found nothing" is a correct answer, so it does not count.
+                    if (content == ActionClaimGuard.HonestReply) stuck?.Note("the honesty gate replaced a reply that claimed an action no tool performed");
                 }
+                // Stuck signal (c): the model answered with nothing usable. After tool work an empty reply is not stuck by itself:
+                // the summary call below writes the answer and has its own checks.
+                else if (string.IsNullOrWhiteSpace(content) && toolResults.Count == 0) stuck?.Note("the model returned an empty reply");
+                // Signal (d): the model gave up, in the words the honesty nudge asks for. Logged as something Jarvis can't do yet, never handed off.
+                else if (content.StartsWith(ActionClaimGuard.CannotPrefix, StringComparison.OrdinalIgnoreCase)) stuck?.Note(GaveUpReason);
 
                 var finalResponse = string.IsNullOrWhiteSpace(content)
-                    ? await BuildPlannedSummaryAsync(request.UserInput, toolResults, citations.ToArray(), sessionId, cancellationToken)
+                    ? await BuildPlannedSummaryAsync(request.UserInput, toolResults, citations.ToArray(), sessionId, cancellationToken, stuck)
                     : AppendCitations(content, citations);
 
                 await _stateStore.RemoveSessionAsync(sessionId, cancellationToken);
@@ -824,10 +852,12 @@ internal sealed partial class StructuredAssistantPlanner : IAssistantPlanner
         }
 
         // Ran out of iterations: summarize what was done instead of looping forever.
+        // Stuck signal (b): every iteration was used without a final answer.
+        stuck?.Note($"the planner used all {maxIterations} iterations without a final answer");
         await _stateStore.RemoveSessionAsync(sessionId, cancellationToken);
 
         return new AssistantPlanningResult(
-            await BuildPlannedSummaryAsync(request.UserInput, toolResults, citations.ToArray(), sessionId, cancellationToken),
+            await BuildPlannedSummaryAsync(request.UserInput, toolResults, citations.ToArray(), sessionId, cancellationToken, stuck),
             toolResults.ToArray(),
             citations.ToArray(),
             intentDecision.Intent,

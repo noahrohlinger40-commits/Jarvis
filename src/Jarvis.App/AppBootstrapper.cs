@@ -1,8 +1,8 @@
 // AppBootstrapper.cs: startup wiring, called once from Program.cs before any window exists.
-// CreateAsync loads settings, makes sure the local model server is up (Jarvis's own llama-server, or LM Studio
-// as a fallback), starts the local speech server, and builds the JarvisAssistant with all of its services.
-// Everything here is "best effort" where it can be: speech and LM Studio CLI failures are logged, not fatal.
-// Only a planner model that never becomes ready aborts startup.
+// CreateAsync loads settings, makes sure the local model server is up (Jarvis's own llama-server),
+// starts the local speech server, and builds the JarvisAssistant with all of its services.
+// Everything here is "best effort" where it can be: speech server failures are logged, not fatal.
+// Only a planner engine that cannot start or never becomes ready aborts startup.
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -56,7 +56,7 @@ internal static class AppBootstrapper
         var modelGateway = ModelGatewayFactory.Create(workspaceRoot, options);
         IVisualContextService visualContextService = new WindowsVisualContextService(workspaceRoot, options, modelGateway);
         var tutor = new TutorService(modelGateway, new WindowsTutorHost(), JarvisDataPaths.Resolve("data/automation/lessons.json"));
-        var planner = AssistantPlannerFactory.Create(options, modelGateway, agentStateStore, webResearchService);
+        var planner = AssistantPlannerFactory.Create(options, modelGateway, agentStateStore, webResearchService, ModelGatewayFactory.CreateEscalation(workspaceRoot, options));
         var toolSafety = new ToolSafetyService(options);
         var assistant = new JarvisAssistant(
             options,
@@ -121,19 +121,11 @@ internal static class AppBootstrapper
         var startedOwnEngine = !await IsLocalApiReachableAsync(options.PlannerBaseUrl, cancellationToken)
             && TryStartOwnLlmEngine(options, model);
 
-        if (!startedOwnEngine)
+        // Nothing answers on the planner port and Jarvis's own engine could not start (the reason is in llm-server.log): stop now with a clear message.
+        if (!startedOwnEngine && !await IsLocalApiReachableAsync(options.PlannerBaseUrl, cancellationToken))
         {
-            // The LM Studio CLI can hang ("Waking up LM Studio service...") even while the server answers.
-            // It only helps with starting the server and raising the context length, so a failure here is
-            // logged and the HTTP check below decides whether the planner is ready.
-            try
-            {
-                await EnsureLmStudioServerAndModelAsync(options, model, cancellationToken);
-            }
-            catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
-            {
-                AppendSpeechServerLog(JarvisDataPaths.Resolve("data/startup-error.log"), $"LM Studio CLI skipped: {exception.Message}");
-            }
+            throw new InvalidOperationException(
+                "The local planner is unavailable: Jarvis's own llama-server did not start. Check %LOCALAPPDATA%\\Jarvis\\data\\llm-server.log or run scripts\\Setup-LocalLlm.ps1 once, then launch Jarvis again.");
         }
 
         // Poll the models endpoint every 0.5 s until the planner model is listed or the deadline passes.
@@ -192,7 +184,7 @@ internal static class AppBootstrapper
         if (!modelFound)
         {
             throw new InvalidOperationException(
-                $"The local planner model `{model}` is not ready at {modelsEndpoint}. Check %LOCALAPPDATA%\\Jarvis\\data\\llm-server.log, run scripts\\Setup-LocalLlm.ps1 once, or start LM Studio and load that model, before launching Jarvis.");
+                $"The local planner model `{model}` is not ready at {modelsEndpoint}. Check %LOCALAPPDATA%\\Jarvis\\data\\llm-server.log or run scripts\\Setup-LocalLlm.ps1 once, then launch Jarvis again.");
         }
 
         // Warm-up: one tiny chat request so the model is loaded into memory now, not on the first real command.
@@ -241,7 +233,7 @@ internal static class AppBootstrapper
 
     /// <summary>
     /// Starts Jarvis's own llama-server when scripts\Setup-LocalLlm.ps1 has installed it.
-    /// Returns false (so the caller falls back to LM Studio) when it is not installed or cannot start.
+    /// Returns false (and logs why) when it is not installed or cannot start.
     /// </summary>
     private static bool TryStartOwnLlmEngine(JarvisOptions options, string model)
     {
@@ -253,6 +245,7 @@ internal static class AppBootstrapper
 
         if (!File.Exists(serverPath) || !File.Exists(modelPath))
         {
+            AppendSpeechServerLog(logPath, $"Jarvis's own llama-server is not installed (needs {serverPath} and {modelPath}). Run scripts\\Setup-LocalLlm.ps1.");
             return false;
         }
 
@@ -325,82 +318,9 @@ internal static class AppBootstrapper
         }
         catch (Exception exception)
         {
-            AppendSpeechServerLog(logPath, $"Could not start Jarvis's own llama-server, falling back to LM Studio: {exception.Message}");
+            AppendSpeechServerLog(logPath, $"Could not start Jarvis's own llama-server: {exception.Message}");
             return false;
         }
-    }
-
-    // Uses the LM Studio command line tool (lms) to start its server, then loads the planner model with the wanted context length.
-    // Does nothing if lms is not installed.
-    private static async Task EnsureLmStudioServerAndModelAsync(
-        JarvisOptions options,
-        string model,
-        CancellationToken cancellationToken)
-    {
-        var cliPath = ResolveLmStudioCliPath();
-
-        if (string.IsNullOrWhiteSpace(cliPath))
-        {
-            return;
-        }
-
-        var plannerUri = new Uri(BuildLocalPlannerEndpoint(options.PlannerBaseUrl, string.Empty).TrimEnd('/'));
-        var host = plannerUri.Host;
-        var port = plannerUri.Port;
-
-        // Starting the server can take many seconds, so skip it when the API is already answering.
-        if (!await IsLocalApiReachableAsync(options.PlannerBaseUrl, cancellationToken))
-        {
-            await RunProcessAsync(
-                cliPath,
-                ["server", "start", "--port", port.ToString(), "--bind", host],
-                20_000,
-                cancellationToken);
-        }
-
-        // Ask LM Studio what is loaded now, so the model is not reloaded when it is already right.
-        var loadedModels = await RunProcessAsync(
-            cliPath,
-            ["ps", "--json"],
-            10_000,
-            cancellationToken);
-
-        // If the right model is already loaded with enough context, nothing more to do.
-        var targetContextLength = Math.Max(4096, options.PlannerLocalContextLength);
-        var matchingModels = ParseLoadedLmStudioModels(loadedModels)
-            .Where(candidate =>
-                string.Equals(candidate.ModelKey, model, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(candidate.Identifier, model, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-
-        if (matchingModels.Any(candidate =>
-                string.Equals(candidate.Identifier, model, StringComparison.OrdinalIgnoreCase)
-                && candidate.ContextLength >= targetContextLength))
-        {
-            return;
-        }
-
-        // Otherwise unload any wrongly configured copy first, then load it again with the wanted context length.
-        foreach (var loadedModel in matchingModels)
-        {
-            if (string.IsNullOrWhiteSpace(loadedModel.Identifier))
-            {
-                continue;
-            }
-
-            await RunProcessAsync(
-                cliPath,
-                ["unload", loadedModel.Identifier],
-                30_000,
-                cancellationToken);
-        }
-
-        await RunProcessAsync(
-            cliPath,
-            // One user, one prediction at a time: extra slots would multiply the KV cache and push it off the 4 GB GPU.
-            ["load", model, "--identifier", model, "--context-length", targetContextLength.ToString(), "--parallel", "1", "-y"],
-            120_000,
-            cancellationToken);
     }
 
     /// <summary>
@@ -502,7 +422,7 @@ internal static class AppBootstrapper
     {
         try
         {
-            // LM Studio's first answer after idling measured 3.4 s; a closed port still refuses instantly.
+            // A server's first answer after idling can take a few seconds; a closed port still refuses instantly.
             using var probeClient = LocalAiPolicy.CreateHttpClient(true, TimeSpan.FromSeconds(10));
 
             // Any HTTP response, even an auth error, proves the server is up.
@@ -549,27 +469,6 @@ internal static class AppBootstrapper
         }
 
         return options.PlannerModel.Trim();
-    }
-
-    // Finds lms.exe, the LM Studio command line tool: LMSTUDIO_CLI_PATH override first, then the default LM Studio folder.
-    private static string ResolveLmStudioCliPath()
-    {
-        var overridePath = Environment.GetEnvironmentVariable("LMSTUDIO_CLI_PATH");
-
-        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath.Trim()))
-        {
-            return overridePath.Trim();
-        }
-
-        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var candidate = Path.Combine(userProfile, ".lmstudio", "bin", "lms.exe");
-
-        if (File.Exists(candidate))
-        {
-            return candidate;
-        }
-
-        return string.Empty;
     }
 
     // Builds a URL like http://host:port/v1/models; adds the "/v1" part when the configured address has no path.
@@ -624,51 +523,6 @@ internal static class AppBootstrapper
         return false;
     }
 
-    // Reads the JSON that "lms ps --json" prints into a list of loaded models.
-    private static IReadOnlyList<LmStudioLoadedModel> ParseLoadedLmStudioModels(string payload)
-    {
-        var models = new List<LmStudioLoadedModel>();
-
-        try
-        {
-            using var document = JsonDocument.Parse(payload);
-
-            if (document.RootElement.ValueKind != JsonValueKind.Array)
-            {
-                return models;
-            }
-
-            foreach (var item in document.RootElement.EnumerateArray())
-            {
-                var modelKey = item.TryGetProperty("modelKey", out var modelKeyElement)
-                    && modelKeyElement.ValueKind == JsonValueKind.String
-                    ? modelKeyElement.GetString() ?? string.Empty
-                    : string.Empty;
-                var identifier = item.TryGetProperty("identifier", out var identifierElement)
-                    && identifierElement.ValueKind == JsonValueKind.String
-                    ? identifierElement.GetString() ?? string.Empty
-                    : string.Empty;
-                var contextLength = item.TryGetProperty("contextLength", out var contextLengthElement)
-                    && contextLengthElement.ValueKind == JsonValueKind.Number
-                    && contextLengthElement.TryGetInt32(out var parsedContextLength)
-                    ? parsedContextLength
-                    : 0;
-
-                if (string.IsNullOrWhiteSpace(modelKey) && string.IsNullOrWhiteSpace(identifier))
-                {
-                    continue;
-                }
-
-                models.Add(new LmStudioLoadedModel(modelKey, identifier, contextLength));
-            }
-        }
-        catch (JsonException)
-        {
-        }
-
-        return models;
-    }
-
     // Shortens long process output so error messages stay readable.
     private static string TrimStartupError(string text)
     {
@@ -676,83 +530,4 @@ internal static class AppBootstrapper
         var value = text.Trim();
         return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
-
-    // Runs a command line program, waits up to timeoutMs, returns its output, and throws if it times out or exits with an error.
-    // Output is read concurrently with the wait so a full output buffer cannot freeze the process.
-    private static async Task<string> RunProcessAsync(
-        string fileName,
-        IReadOnlyList<string> arguments,
-        int timeoutMs,
-        CancellationToken cancellationToken)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = fileName,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
-
-        using var process = new Process
-        {
-            StartInfo = startInfo
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException($"Failed to start `{fileName}`.");
-        }
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        var stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        var waitTask = process.WaitForExitAsync(cancellationToken);
-        var timeoutTask = Task.Delay(timeoutMs, cancellationToken);
-        var completed = await Task.WhenAny(waitTask, timeoutTask);
-
-        if (completed != waitTask)
-        {
-            TryKillProcess(process);
-            throw new InvalidOperationException(
-                $"Timed out while running `{fileName} {string.Join(" ", arguments)}`.");
-        }
-
-        await waitTask;
-        var stdout = await stdoutTask;
-        var stderr = await stderrTask;
-        var combined = string.Join(
-            Environment.NewLine,
-            new[] { stdout.Trim(), stderr.Trim() }.Where(value => !string.IsNullOrWhiteSpace(value)));
-
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"`{fileName} {string.Join(" ", arguments)}` failed: {TrimStartupError(combined)}");
-        }
-
-        return combined;
-    }
-
-    // Kills a process (and its children) if still running, ignoring any failure.
-    private static void TryKillProcess(Process process)
-    {
-        try
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-            }
-        }
-        catch
-        {
-        }
-    }
-
-    // One model as reported by LM Studio: its key, the name it was loaded under, and its context length.
-    private sealed record LmStudioLoadedModel(string ModelKey, string Identifier, int ContextLength);
 }

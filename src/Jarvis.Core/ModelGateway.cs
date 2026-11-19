@@ -1,6 +1,6 @@
 // ModelGateway.cs: how Jarvis talks to its language model. Every "ask the AI" call in the app (the planner,
 // vision, notes, the Brain tool) goes through IModelGateway.CompleteAsync, which turns a request into an
-// OpenAI-style HTTP call: POST {PlannerBaseUrl}/v1/chat/completions. In practice that server is LM Studio on
+// OpenAI-style HTTP call: POST {PlannerBaseUrl}/v1/chat/completions. In practice that server is Jarvis's own llama-server on
 // this PC (a localhost URL), but any OpenAI-compatible server works. The URL, model names and API key come from
 // JarvisOptions (the Planner* settings in jarvis.settings.json).
 // Model routes: the caller picks a ModelRoute (Fast, Reasoning, Vision or Deep). Each route maps to a configured
@@ -103,9 +103,31 @@ public static class ModelGatewayFactory
                 : "no usable model provider is configured");
         }
 
-        // One inference budget per process: the app rebuilds the gateway on settings changes while earlier requests
-        // may still run. ponytail: capacity is fixed at first use, so changing ModelMaxConcurrentRequests takes effect on restart.
-        // Capacity is how many model calls may run at the same moment (1 to 4). The scheduler is shared across rebuilds.
+        return Schedule(workspaceRoot, options, profile);
+    }
+
+    // Gateway for the escalation model (see AssistantPlanner.Escalation.cs): the same gateway class and queue, pointed at
+    // PlannerEscalationBaseUrl with that one model on every route. Null when escalation is off (no model set), the planner is
+    // off, or the address fails the same local-only check as the planner.
+    public static IModelGateway? CreateEscalation(string workspaceRoot, JarvisOptions options)
+    {
+        if (!options.PlannerEnabled
+            || string.IsNullOrWhiteSpace(options.PlannerEscalationModel)
+            || string.IsNullOrWhiteSpace(options.PlannerEscalationBaseUrl)
+            || !LocalAiPolicy.AllowsModelProvider(options, "local", options.PlannerEscalationBaseUrl))
+        {
+            return null;
+        }
+
+        var model = options.PlannerEscalationModel.Trim();
+        return Schedule(workspaceRoot, options, new ResolvedProviderProfile("local", options.PlannerEscalationBaseUrl.Trim(), model, model, string.Empty, model, string.Empty));
+    }
+
+    // One inference budget per process: the app rebuilds the gateway on settings changes while earlier requests
+    // may still run. ponytail: capacity is fixed at first use, so changing ModelMaxConcurrentRequests takes effect on restart.
+    // Capacity is how many model calls may run at the same moment (1 to 4). The scheduler is shared across rebuilds.
+    private static IModelGateway Schedule(string workspaceRoot, JarvisOptions options, ResolvedProviderProfile profile)
+    {
         var capacity = Math.Clamp(options.ModelMaxConcurrentRequests, 1, 4);
         var scheduler = LazyInitializer.EnsureInitialized(ref _sharedScheduler, () => new ModelWorkScheduler(capacity));
         return new ScheduledModelGateway(new OpenAiCompatibleModelGateway(workspaceRoot, options, profile), capacity, scheduler);
@@ -205,7 +227,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
 
     // How long to wait for a normal answer before giving up.
     private static readonly TimeSpan DefaultModelTimeout = TimeSpan.FromSeconds(45);
-    // A CPU-bound deep model produces ~9 tokens/s here and the first call also waits for LM Studio to load it.
+    // A CPU-bound deep model produces ~9 tokens/s here and the first call also waits for the server to load it.
     private static readonly TimeSpan DeepModelTimeout = TimeSpan.FromMinutes(5);
 
     // Deep gets the long timeout; every other route gets the normal one.
@@ -553,7 +575,7 @@ internal sealed class OpenAiCompatibleModelGateway : IModelGateway
         return $"{trimmed}/chat/completions";
     }
 
-    // A bare host such as http://localhost:1234 gets "/v1" added, because OpenAI-style APIs live under /v1.
+    // A bare host such as http://localhost:8179 gets "/v1" added, because OpenAI-style APIs live under /v1.
     private static string NormalizeOpenAiCompatibleBaseUrl(string baseUrl)
     {
         var trimmed = baseUrl.Trim().TrimEnd('/');

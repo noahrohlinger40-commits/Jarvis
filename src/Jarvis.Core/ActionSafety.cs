@@ -406,6 +406,15 @@ public sealed class ToolSafetyService
         }
     }
 
+    // True when a tool result really changed something: it succeeded and its own command is not read-only. PlannerToolResult.Command is only
+    // the tool's name ("calendar"), and IsReadOnlyCall decides by what follows it, so the input is added back:
+    // "calendar add ..." acts, "calendar today" reads. Shared by the honesty gate and the escalation rule.
+    internal static bool ActedSuccessfully(PlannerToolResult result)
+    {
+        var tool = string.IsNullOrWhiteSpace(result.Command) ? result.ApiName : result.Command;
+        return !result.IsError && !IsReadOnlyCall(tool, string.IsNullOrWhiteSpace(result.Input) ? tool : $"{tool} {result.Input}");
+    }
+
     // Builds the approval request used when a read of outside content is followed by an action. See the prompt-injection note above.
     internal static SafetyDecision RequireApprovalAfterOutsideRead(string toolName, string normalizedCommand) =>
         RequireUiApproval(

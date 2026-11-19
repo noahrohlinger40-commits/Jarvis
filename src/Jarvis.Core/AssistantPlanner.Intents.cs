@@ -507,7 +507,8 @@ internal sealed partial class StructuredAssistantPlanner
         IReadOnlyList<PlannerToolResult> toolResults,
         IReadOnlyList<AssistantCitation> citations,
         string errorMessage,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        StuckNotes? stuck = null)
     {
         var contextualFallback = toolResults.Count == 0
             ? await TryBuildContextualFallbackReplyAsync(request, sessionId, cancellationToken)
@@ -519,7 +520,7 @@ internal sealed partial class StructuredAssistantPlanner
                     $"The planner could not complete that request: {TrimError(errorMessage)}",
                     "You can try a more direct command, or rephrase the request once connectivity is available.")
                 : contextualFallback)
-            : await BuildPlannedSummaryAsync(request.UserInput, toolResults, citations.ToArray(), sessionId, cancellationToken);
+            : await BuildPlannedSummaryAsync(request.UserInput, toolResults, citations.ToArray(), sessionId, cancellationToken, stuck);
         var intent = string.IsNullOrWhiteSpace(contextualFallback) ? AgentIntentKind.Planner : AgentIntentKind.SimpleReply;
 
         await _stateStore.RemoveSessionAsync(sessionId, cancellationToken);
@@ -569,7 +570,8 @@ internal sealed partial class StructuredAssistantPlanner
         IReadOnlyList<PlannerToolResult> toolResults,
         AssistantCitation[] citations,
         string sessionId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        StuckNotes? stuck = null)
     {
         if (toolResults.Count == 0)
         {
@@ -616,12 +618,18 @@ internal sealed partial class StructuredAssistantPlanner
 
             // This summary is its own model call, so it can narrate an action just like
             // the planner reply; when nothing acted this turn (reads only), a narrated action is replaced by the honest line.
-            if (!ActionClaimGuard.Acted(toolResults) && ActionClaimGuard.IsUnverifiedClaim(content)) content = ActionClaimGuard.HonestReplyAfter(toolResults);
+            if (!ActionClaimGuard.Acted(toolResults) && ActionClaimGuard.IsUnverifiedClaim(content))
+            {
+                content = ActionClaimGuard.HonestReplyAfter(toolResults);
+                // Stuck signal (a) again, for the summary's reply.
+                if (content == ActionClaimGuard.HonestReply) stuck?.Note("the honesty gate replaced a summary that claimed an action no tool performed");
+            }
 
             return AppendCitations(content, citations);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            stuck?.Note($"the summary model call failed: {TrimError(exception.Message)}");
             return AppendCitations(
                 BuildOfflinePlanSummary(toolResults) + Environment.NewLine + $"Model fallback: {TrimError(exception.Message)}",
                 citations);
