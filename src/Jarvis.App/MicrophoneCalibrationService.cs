@@ -42,9 +42,26 @@ internal sealed class MicrophoneCalibrationService
             cancellationToken);
     }
 
+    // Why a calibration must not be saved, or null when it looks usable: the speech sample is near silent (the clamp floor in
+    // CreateCalibrationProfile is 0.8%), or the voice is not clearly louder (2x) than the room.
+    public static string? FindCalibrationProblem(AudioLevelSampleSnapshot ambient, AudioLevelSampleSnapshot speech)
+    {
+        var ambientFloor = Math.Max(ambient.AverageRms, ambient.Rms90);
+        var speechRms = Math.Max(speech.AverageRms, speech.Rms90 * 0.90);
+
+        if (speechRms < 0.008)
+        {
+            return $"I could barely hear you (speech {speechRms:P1}). Check the microphone is not muted and speak up.";
+        }
+
+        return speechRms < ambientFloor * 2.0
+            ? $"The room ({ambientFloor:P1}) was nearly as loud as your voice ({speechRms:P1}). Find a quieter spot."
+            : null;
+    }
+
     // Turns an ambient (quiet room) sample and a speech sample into a profile. Key numbers: the speech threshold sits between
     // the room level and the speech level (at least 2.6x the room noise, within 0.003 - 0.040); the target peak is a bit lower for
-    // loud speakers and higher for quiet ones (0.28 - 0.44); the maximum gain is target / speech peak (1.25x - 4.8x).
+    // loud speakers and higher for quiet ones (0.28 - 0.44); the maximum gain is target / speech peak, but never under the uncalibrated 4x (4x - 4.8x).
     public SpeechRecognitionCalibrationProfile CreateCalibrationProfile(
         JarvisOptions options,
         AudioLevelSampleSnapshot ambient,
@@ -73,7 +90,10 @@ internal sealed class MicrophoneCalibrationService
             },
             0.28,
             0.44);
-        var gainCap = Math.Clamp(targetPeak / Math.Max(speechPeak, 0.08), 1.25, 4.80);
+        // The cap is only a ceiling for the automatic gain, which already boosts nothing that is loud enough. Never go below the
+        // uncalibrated 4x: the calibration sentence is often louder than everyday talk, and on 2026-11-19 target / speech peak cut
+        // the boost to 1.46x, so soft speech reached the speech server too quiet to be heard.
+        var gainCap = Math.Clamp(targetPeak / Math.Max(speechPeak, 0.08), 4.00, 4.80);
 
         return new SpeechRecognitionCalibrationProfile
         {

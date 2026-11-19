@@ -947,6 +947,15 @@ internal sealed partial class JarvisMainForm
 
             AppendRuntimeMessage("Calibration: capturing speech sample.");
             var speechSample = await _microphoneCalibrationService.CaptureSampleAsync(_currentOptions, 3200, _cancellationTokenSource.Token);
+            var problem = MicrophoneCalibrationService.FindCalibrationProblem(ambientSample, speechSample);
+
+            if (problem is not null)
+            {
+                AppendSystemMessage($"Calibration not saved: {problem}");
+                AppendTimelineEntry("AUDIO", "Microphone calibration not saved.", problem, Color.FromArgb(255, 138, 101));
+                return;
+            }
+
             var resolvedProcessing = ResolveActiveProcessingProfile();
             var calibration = _microphoneCalibrationService.CreateCalibrationProfile(
                 _currentOptions,
